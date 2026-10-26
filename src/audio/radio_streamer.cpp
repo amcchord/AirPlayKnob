@@ -381,6 +381,7 @@ static void raop_sender_task(void *arg) {
     int active_speaker_idx = -1;
     char last_sent_title[128] = {0};
     int16_t chunk_pcm[RAOP_CHUNK_FRAMES * 2];
+    bool prebuffering = true;
 
     uint64_t next_send_us = esp_timer_get_time();
 
@@ -418,6 +419,7 @@ static void raop_sender_task(void *arg) {
                 raop->disconnect();
             }
             active_speaker_idx = -1;
+            prebuffering = true;
             vTaskDelay(pdMS_TO_TICKS(40));
             next_send_us = esp_timer_get_time();
             continue;
@@ -430,6 +432,7 @@ static void raop_sender_task(void *arg) {
             }
             active_speaker_idx = spk_idx;
             last_sent_title[0] = '\0';
+            prebuffering = true;
 
             if (!spk.is_local_dac && spk.ip[0] != '\0') {
                 if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
@@ -455,18 +458,28 @@ static void raop_sender_task(void *arg) {
             raop->setVolume(vol);
         }
 
-        if (raop->isConnected() && cur_title[0] != '\0' && strcmp(cur_title, last_sent_title) != 0) {
+        if (raop->isConnected() && !prebuffering &&
+            cur_title[0] != '\0' && strncmp(cur_title, "Connecting", 10) != 0 &&
+            strcmp(cur_title, last_sent_title) != 0) {
             strncpy(last_sent_title, cur_title, sizeof(last_sent_title) - 1);
             raop->setMetadata(cur_title, cur_station, "SomaFM Radio");
         }
 
         raop->pollControlAndKeepalive();
 
-        // Wait until at least ~0.25s of audio is buffered before starting playback burst
+        // Pre-buffer ~0.4s (17640 frames) before starting burst so RTSP/HTTP jitter never underruns
         uint32_t avail = ring_available_frames();
-        if (avail < RAOP_CHUNK_FRAMES) {
-            vTaskDelay(pdMS_TO_TICKS(4));
+        if (prebuffering) {
+            if (avail < 17640) {
+                vTaskDelay(pdMS_TO_TICKS(5));
+                next_send_us = esp_timer_get_time();
+                continue;
+            }
+            prebuffering = false;
             next_send_us = esp_timer_get_time();
+        } else if (avail < RAOP_CHUNK_FRAMES) {
+            prebuffering = true;
+            vTaskDelay(pdMS_TO_TICKS(5));
             continue;
         }
 
@@ -478,27 +491,34 @@ static void raop_sender_task(void *arg) {
             xSemaphoreGive(g_app.mutex);
         }
 
-        uint64_t now_us = esp_timer_get_time();
-        if (now_us < next_send_us) {
-            uint64_t wait_us = next_send_us - now_us;
-            if (wait_us > 2000) {
-                vTaskDelay(pdMS_TO_TICKS(wait_us / 1000));
+        if (!spk.is_local_dac && raop->isConnected()) {
+            if (!raop->acceptFrames()) {
+                vTaskDelay(pdMS_TO_TICKS(2));
+                continue;
             }
-            continue;
-        }
-
-        if (ring_pop_352(chunk_pcm)) {
-            update_vu_meters(chunk_pcm);
-            if (!spk.is_local_dac && raop->isConnected()) {
+            if (ring_pop_352(chunk_pcm)) {
+                update_vu_meters(chunk_pcm);
                 raop->sendChunk(chunk_pcm);
+                if (also_local) {
+                    local_dac_write_frames(chunk_pcm, RAOP_CHUNK_FRAMES, vol);
+                }
             }
-            if (spk.is_local_dac || also_local) {
+        } else {
+            uint64_t now_us = esp_timer_get_time();
+            if (now_us < next_send_us) {
+                uint64_t wait_us = next_send_us - now_us;
+                if (wait_us > 2000) {
+                    vTaskDelay(pdMS_TO_TICKS(wait_us / 1000));
+                }
+                continue;
+            }
+            if (ring_pop_352(chunk_pcm)) {
+                update_vu_meters(chunk_pcm);
                 local_dac_write_frames(chunk_pcm, RAOP_CHUNK_FRAMES, vol);
-            }
-            // 352 / 44100 = 7981.859 microseconds per chunk
-            next_send_us += 7982ULL;
-            if (now_us > next_send_us + 50000ULL) {
-                next_send_us = now_us;
+                next_send_us += 7982ULL;
+                if (now_us > next_send_us + 50000ULL) {
+                    next_send_us = now_us;
+                }
             }
         }
     }
@@ -515,7 +535,7 @@ void radio_streamer_start(void) {
     StaticTask_t *http_tcb  = (StaticTask_t *)heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     xTaskCreateStaticPinnedToCore(http_decoder_task, "radio_http", 28672 / sizeof(StackType_t), NULL, 3, http_stack, http_tcb, 0);
 
-    StackType_t *raop_stack = (StackType_t *)heap_caps_malloc(16384, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    StackType_t *raop_stack = (StackType_t *)heap_caps_malloc(24576, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     StaticTask_t *raop_tcb  = (StaticTask_t *)heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    xTaskCreateStaticPinnedToCore(raop_sender_task, "raop_tx", 16384 / sizeof(StackType_t), NULL, 6, raop_stack, raop_tcb, 1);
+    xTaskCreateStaticPinnedToCore(raop_sender_task, "raop_tx", 24576 / sizeof(StackType_t), NULL, 6, raop_stack, raop_tcb, 1);
 }

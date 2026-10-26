@@ -282,8 +282,9 @@ static void discover_airplay_speakers(void) {
                 }
             }
         }
-        // Next try saved speaker name from NVS (preferring Tree House HomePod if "Tree House" was saved)
-        if (new_sel < 0 && s_saved_speaker_name[0]) {
+        // Next try saved speaker name from NVS (only if it is Tree House or Local Jack)
+        if (new_sel < 0 && s_saved_speaker_name[0] &&
+            (strcasestr(s_saved_speaker_name, "Tree House") != NULL || strcasestr(s_saved_speaker_name, "Local") != NULL)) {
             if (strcasecmp(s_saved_speaker_name, "Tree House") == 0) {
                 strncpy(s_saved_speaker_name, "Tree House (HomePod)", sizeof(s_saved_speaker_name) - 1);
             }
@@ -551,10 +552,26 @@ static void poll_serial_debug(void) {
                     int d = atoi(s_cmd + 7);
                     knob_ui_on_rotate(d);
                     Serial.printf("[DBG] Rotate delta=%d\n", d);
+                } else if (strncasecmp(s_cmd, "SPEAKER ", 8) == 0) {
+                    int idx = atoi(s_cmd + 8);
+                    app_select_speaker(idx);
+                    Serial.printf("[DBG] Selected speaker %d\n", idx);
+                } else if (strncasecmp(s_cmd, "VOL ", 4) == 0) {
+                    int v = atoi(s_cmd + 4);
+                    app_set_volume(v);
+                    Serial.printf("[DBG] Set volume=%d\n", v);
                 } else if (strcasecmp(s_cmd, "STATUS") == 0) {
-                    Serial.printf("[DBG] Tab=%d Preset=%d Speaker=%d Vol=%d FreeHeap=%u FreePSRAM=%u\n",
-                                  knob_ui_get_tab(), g_app.current_preset, g_app.current_speaker,
-                                  g_app.volume, (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
+                    const char *spk_name = (g_app.current_speaker >= 0 && g_app.current_speaker < g_app.speaker_count)
+                                           ? g_app.speakers[g_app.current_speaker].name : "?";
+                    Serial.printf("[DBG] Tab=%d Preset=%d Speaker=%d ('%s') Vol=%d Status='%s' FreeHeap=%u FreePSRAM=%u\n",
+                                  knob_ui_get_tab(), g_app.current_preset, g_app.current_speaker, spk_name,
+                                  g_app.volume, g_app.status_text,
+                                  (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
+                    for (int i = 0; i < g_app.speaker_count; i++) {
+                        Serial.printf("  [SPK %d] '%s' %s:%u am=%s et=%s\n",
+                                      i, g_app.speakers[i].name, g_app.speakers[i].ip,
+                                      g_app.speakers[i].port, g_app.speakers[i].am, g_app.speakers[i].et);
+                    }
                 }
             }
         } else if (s_len < (int)sizeof(s_cmd) - 1) {
