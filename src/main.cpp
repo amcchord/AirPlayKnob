@@ -146,7 +146,10 @@ void app_state_init(void) {
         g_app.current_preset = 0;
     }
     g_app.preview_preset = g_app.current_preset;
-    g_app.volume = s_prefs.getInt("volume", 65);
+    g_app.volume = s_prefs.getInt("volume", 18);
+    if (g_app.volume > 20) {
+        g_app.volume = 18; // Always start at a safe low volume on boot
+    }
     g_app.playing = true;
     g_app.knob_mode = KNOB_MODE_VOLUME;
     g_app.also_local_dac = true;
@@ -179,6 +182,11 @@ static void discover_airplay_speakers(void) {
     Serial.println("[MDNS] Querying _raop._tcp.local for AirPlay speakers...");
     mdns_result_t *results = NULL;
     esp_err_t err = mdns_query_ptr("_raop", "_tcp", 3000, 32, &results);
+    if (err == ESP_OK && results == NULL) {
+        // Retry once if multicast response arrived late right after Wi-Fi association
+        vTaskDelay(pdMS_TO_TICKS(300));
+        err = mdns_query_ptr("_raop", "_tcp", 3000, 32, &results);
+    }
     if (err != ESP_OK) {
         Serial.printf("[MDNS] Query failed: %d\n", err);
     }
@@ -236,6 +244,11 @@ static void discover_airplay_speakers(void) {
             else if (strcasecmp(k, "am") == 0) strncpy(sp.am, v, sizeof(sp.am) - 1);
         }
 
+        // Disambiguate HomePod vs Sonos when rooms have both
+        if (strcasestr(sp.am, "AudioAccessory") != NULL && strcasestr(sp.name, "HomePod") == NULL && strcasestr(sp.name, "Home Pod") == NULL) {
+            strncat(sp.name, " (HomePod)", sizeof(sp.name) - strlen(sp.name) - 1);
+        }
+
         Serial.printf("[MDNS] Found AirPlay speaker: '%s' at %s:%u (am=%s et=%s)\n",
                       sp.name, sp.ip, sp.port, sp.am, sp.et);
         count++;
@@ -269,8 +282,11 @@ static void discover_airplay_speakers(void) {
                 }
             }
         }
-        // Next try saved speaker name from NVS
+        // Next try saved speaker name from NVS (preferring Tree House HomePod if "Tree House" was saved)
         if (new_sel < 0 && s_saved_speaker_name[0]) {
+            if (strcasecmp(s_saved_speaker_name, "Tree House") == 0) {
+                strncpy(s_saved_speaker_name, "Tree House (HomePod)", sizeof(s_saved_speaker_name) - 1);
+            }
             for (int i = 0; i < count; i++) {
                 if (strcasecmp(g_app.speakers[i].name, s_saved_speaker_name) == 0) {
                     new_sel = i;
@@ -278,9 +294,18 @@ static void discover_airplay_speakers(void) {
                 }
             }
         }
-        // Otherwise default to first discovered network AirPlay speaker (or Local 3.5mm if none)
+        // Default exclusively to Tree House HomePod (or Local 3.5mm Jack if not found)
         if (new_sel < 0) {
-            new_sel = 0;
+            for (int i = 0; i < count; i++) {
+                if (strcasestr(g_app.speakers[i].name, "Tree House") != NULL &&
+                    strcasestr(g_app.speakers[i].am, "AudioAccessory") != NULL) {
+                    new_sel = i;
+                    break;
+                }
+            }
+        }
+        if (new_sel < 0) {
+            new_sel = count - 1; // Local 3.5mm Jack
         }
         g_app.current_speaker = new_sel;
         g_app.preview_speaker = new_sel;
@@ -394,7 +419,8 @@ static void network_manager_task(void *arg) {
             ArduinoOTA.handle();
         }
 
-        if (connected && (do_spk_scan || (last_mdns_scan_ms == 0))) {
+        if (connected && (do_spk_scan || (last_mdns_scan_ms == 0) ||
+                          (g_app.speaker_count <= 1 && (millis() - last_mdns_scan_ms >= 8000)))) {
             last_mdns_scan_ms = millis();
             discover_airplay_speakers();
         }
@@ -470,6 +496,73 @@ void setup() {
     radio_streamer_start();
 }
 
+static void dump_serial_screenshot(void) {
+    const uint16_t *fb = bsp_get_screen_fb();
+    if (!fb) {
+        Serial.println("[DBG] No screen framebuffer");
+        return;
+    }
+    static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    // Stream 180x180 downsampled RGB565 (big-endian) in base64 over USB-Serial/JTAG
+    Serial.println("\n===SCREENSHOT_BEGIN 180 180===");
+    uint8_t row_bytes[180 * 2];
+    char b64_line[484];
+    for (int y = 0; y < 180; y++) {
+        const uint16_t *src = &fb[(y * 2) * EXAMPLE_LCD_H_RES];
+        for (int x = 0; x < 180; x++) {
+            uint16_t px = src[x * 2]; // Already byte-swapped (big-endian RGB565)
+            row_bytes[x * 2]     = (uint8_t)(px & 0xFF);
+            row_bytes[x * 2 + 1] = (uint8_t)(px >> 8);
+        }
+        int out_i = 0;
+        for (int i = 0; i < 360; i += 3) {
+            uint32_t v = ((uint32_t)row_bytes[i] << 16) | ((uint32_t)row_bytes[i + 1] << 8) | row_bytes[i + 2];
+            b64_line[out_i++] = B64[(v >> 18) & 0x3F];
+            b64_line[out_i++] = B64[(v >> 12) & 0x3F];
+            b64_line[out_i++] = B64[(v >> 6)  & 0x3F];
+            b64_line[out_i++] = B64[ v        & 0x3F];
+        }
+        b64_line[out_i] = '\0';
+        Serial.println(b64_line);
+    }
+    Serial.println("===SCREENSHOT_END===");
+}
+
+static void poll_serial_debug(void) {
+    static char s_cmd[64];
+    static int s_len = 0;
+    while (Serial.available()) {
+        char c = (char)Serial.read();
+        if (c == '\r' || c == '\n') {
+            if (s_len > 0) {
+                s_cmd[s_len] = '\0';
+                s_len = 0;
+                if (strcasecmp(s_cmd, "SCREENSHOT") == 0) {
+                    dump_serial_screenshot();
+                } else if (strncasecmp(s_cmd, "TAB ", 4) == 0) {
+                    int t = atoi(s_cmd + 4);
+                    knob_ui_set_tab(t);
+                    Serial.printf("[DBG] Switched to TAB %d\n", t);
+                } else if (strncasecmp(s_cmd, "WHITECAP ", 9) == 0) {
+                    int w = atoi(s_cmd + 9);
+                    knob_ui_set_whitecap(w != 0);
+                    Serial.printf("[DBG] WhiteCap=%d\n", w != 0);
+                } else if (strncasecmp(s_cmd, "ROTATE ", 7) == 0) {
+                    int d = atoi(s_cmd + 7);
+                    knob_ui_on_rotate(d);
+                    Serial.printf("[DBG] Rotate delta=%d\n", d);
+                } else if (strcasecmp(s_cmd, "STATUS") == 0) {
+                    Serial.printf("[DBG] Tab=%d Preset=%d Speaker=%d Vol=%d FreeHeap=%u FreePSRAM=%u\n",
+                                  knob_ui_get_tab(), g_app.current_preset, g_app.current_speaker,
+                                  g_app.volume, (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
+                }
+            }
+        } else if (s_len < (int)sizeof(s_cmd) - 1) {
+            s_cmd[s_len++] = c;
+        }
+    }
+}
+
 void loop() {
     int32_t delta = 0;
     portENTER_CRITICAL(&s_knob_mux);
@@ -481,7 +574,8 @@ void loop() {
         knob_ui_on_rotate(delta);
     }
 
+    poll_serial_debug();
     knob_ui_tick();
     web_portal_poll();
-    delay(15);
+    delay(5);
 }

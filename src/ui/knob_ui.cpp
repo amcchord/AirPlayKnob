@@ -34,18 +34,31 @@ static lv_obj_t *s_btn_dock_stations = NULL;
 static lv_obj_t *s_btn_dock_whitecap = NULL;
 static lv_obj_t *s_btn_dock_speakers = NULL;
 
-// Tab 1: Minimalist Stations Sheet
-static lv_obj_t *s_station_list = NULL;
-static lv_obj_t *s_station_items[MAX_PRESETS] = {NULL};
-static int s_station_cursor = 0;
-static int s_station_rendered_count = 0;
+// =============================================================================
+// 60 FPS Virtualized 5-Slot Dial Wheel for Stations (Tab 1) & Speakers (Tab 2)
+// Zero dynamic allocation or flex-layout recalculation during scrolling!
+// =============================================================================
+#define WHEEL_SLOTS 5
 
-// Tab 2: Minimalist AirPlay Speakers Sheet
-static lv_obj_t *s_speaker_list = NULL;
-static lv_obj_t *s_speaker_items[MAX_SPEAKERS] = {NULL};
+// Tab 1: Virtualized Stations Wheel
+static lv_obj_t *s_lbl_st_hdr = NULL;
+static lv_obj_t *s_st_slots[WHEEL_SLOTS] = {NULL};
+static lv_obj_t *s_st_dots[WHEEL_SLOTS] = {NULL};
+static lv_obj_t *s_st_titles[WHEEL_SLOTS] = {NULL};
+static lv_obj_t *s_st_tags[WHEEL_SLOTS] = {NULL};
+static int s_station_cursor = 0;
+static int s_st_drag_accum = 0;
+static bool s_st_dragging = false;
+
+// Tab 2: Virtualized AirPlay Speakers Wheel
 static lv_obj_t *s_lbl_spkr_hdr = NULL;
+static lv_obj_t *s_sp_slots[WHEEL_SLOTS] = {NULL};
+static lv_obj_t *s_sp_dots[WHEEL_SLOTS] = {NULL};
+static lv_obj_t *s_sp_titles[WHEEL_SLOTS] = {NULL};
+static lv_obj_t *s_sp_tags[WHEEL_SLOTS] = {NULL};
 static int s_speaker_cursor = 0;
-static int s_speaker_rendered_count = 0;
+static int s_sp_drag_accum = 0;
+static bool s_sp_dragging = false;
 
 // Tab 3: Wi-Fi, Web Portal QR & OTA Info Sheet
 static lv_obj_t *s_lbl_wifi_ssid = NULL;
@@ -119,7 +132,6 @@ static void wc_fade_frame(void) {
     for (int i = 0; i < count; i++) {
         uint16_t sw = p[i];
         if (sw == 0) continue;
-        // Unswap to standard RGB565, scale by 3/4 (subtract 1/4), reswap
         uint16_t c = (sw >> 8) | (sw << 8);
         uint16_t q = (c & 0xE79C) >> 2;
         c -= q;
@@ -127,12 +139,6 @@ static void wc_fade_frame(void) {
         if ((c & 0x07E0) <= 0x0040) c &= ~0x07E0;
         if ((c & 0x001F) <= 0x0001) c &= ~0x001F;
         p[i] = (c >> 8) | (c << 8);
-    }
-}
-
-static inline void wc_put_px(int x, int y, lv_color_t col) {
-    if ((unsigned)x < WC_W && (unsigned)y < WC_H) {
-        s_wc_fb[y * WC_W + x] = col;
     }
 }
 
@@ -156,7 +162,6 @@ static void wc_draw_line(int x0, int y0, int x1, int y1, lv_color_t core_col, lv
     }
 }
 
-// HSV (h: 0..360, s: 0..1, v: 0..1) -> lv_color_t
 static lv_color_t wc_hsv(float h, float s, float v) {
     h = fmodf(h, 360.0f);
     if (h < 0) h += 360.0f;
@@ -189,10 +194,6 @@ static void render_whitecap_frame(const int8_t *wl, const int8_t *wr, const uint
     const float cy = 180.0f;
 
     if (preset == 0) {
-        // =====================================================================
-        // PRESET 0: WhiteCap Classic 3D Ribbon Tunnel
-        // Receding perspective wave-ribbons with cross-ribs & roll rotation
-        // =====================================================================
         const int NUM_RIBBONS = 6;
         const int PTS = 36;
         int prev_rx[PTS], prev_ry[PTS];
@@ -213,7 +214,7 @@ static void render_whitecap_frame(const int8_t *wl, const int8_t *wr, const uint
 
             int cur_rx[PTS], cur_ry[PTS];
             for (int i = 0; i < PTS; i++) {
-                float u = ((float)i / (float)(PTS - 1)) * 2.0f - 1.0f; // -1..1
+                float u = ((float)i / (float)(PTS - 1)) * 2.0f - 1.0f;
                 int w_idx = (i * 127) / (PTS - 1);
                 float sample = (r & 1) ? (wr[w_idx] / 127.0f) : (wl[w_idx] / 127.0f);
                 float wave = sample * (48.0f + energy * 42.0f) +
@@ -239,9 +240,6 @@ static void render_whitecap_frame(const int8_t *wl, const int8_t *wr, const uint
             has_prev = true;
         }
     } else if (preset == 1) {
-        // =====================================================================
-        // PRESET 1: Harmonic Coriolis (Stereo Lissajous Spirograph Web)
-        // =====================================================================
         const int RINGS = 3;
         const int N = 72;
         for (int ring = 0; ring < RINGS; ring++) {
@@ -272,9 +270,6 @@ static void render_whitecap_frame(const int8_t *wl, const int8_t *wr, const uint
             wc_draw_line(px, py, first_x, first_y, col_core, col_glow);
         }
     } else if (preset == 2) {
-        // =====================================================================
-        // PRESET 2: Aether Horizon (Dual 3D Stereo Wave Terrain + Core Sun)
-        // =====================================================================
         const int ROWS = 5;
         const int COLS = 32;
         for (int side = -1; side <= 1; side += 2) {
@@ -309,9 +304,6 @@ static void render_whitecap_frame(const int8_t *wl, const int8_t *wr, const uint
             }
         }
     } else {
-        // =====================================================================
-        // PRESET 3: Supernova Halo (Radial Oscilloscope + Velocity Vectors)
-        // =====================================================================
         const int N = 96;
         lv_color_t col_ring = wc_hsv(base_hue, 0.65f, 1.0f);
         lv_color_t col_ray  = wc_hsv(base_hue + 45.0f, 0.85f, 0.85f);
@@ -330,7 +322,6 @@ static void render_whitecap_frame(const int8_t *wl, const int8_t *wr, const uint
             else { wc_draw_line(px, py, x, y, col_ring, col_glow); }
             px = x; py = y;
 
-            // Outward velocity spikes on peaks
             if ((i % 3 == 0) && fabsf(sample) > 12.0f) {
                 float r_out = r + fabsf(sample) * 0.85f;
                 int ox = (int)(cx + r_out * cosf(ang));
@@ -342,13 +333,14 @@ static void render_whitecap_frame(const int8_t *wl, const int8_t *wr, const uint
     }
 }
 
-// Splits ICY "Artist - Track Title" into clean separate strings
 static void split_artist_track(const char *raw, const char *fallback_station,
                                char *artist_out, size_t artist_max,
                                char *track_out, size_t track_max) {
     if (!raw || raw[0] == '\0') {
         strncpy(track_out, fallback_station, track_max - 1);
+        track_out[track_max - 1] = '\0';
         strncpy(artist_out, "SomaFM Radio", artist_max - 1);
+        artist_out[artist_max - 1] = '\0';
         return;
     }
     const char *sep = strstr(raw, " - ");
@@ -368,12 +360,171 @@ static void split_artist_track(const char *raw, const char *fallback_station,
     }
 }
 
+// =============================================================================
+// O(1) 60 FPS Virtualized Wheel Updaters (Zero DOM rebuilds!)
+// =============================================================================
+static void update_station_wheel(bool sync_cursor_to_active) {
+    if (!s_st_slots[0]) return;
+
+    if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(30)) != pdTRUE) return;
+    int count = g_app.preset_count;
+    int active_idx = g_app.current_preset;
+    if (count > MAX_PRESETS) count = MAX_PRESETS;
+    if (count <= 0) {
+        xSemaphoreGive(g_app.mutex);
+        return;
+    }
+
+    if (sync_cursor_to_active || s_station_cursor < 0 || s_station_cursor >= count) {
+        s_station_cursor = active_idx;
+    }
+
+    static const int SLOT_W[WHEEL_SLOTS] = {252, 282, 300, 282, 252};
+    const StationPreset &focused_st = g_app.presets[s_station_cursor];
+    if (s_lbl_st_hdr) {
+        lv_label_set_text_fmt(s_lbl_st_hdr, "%d / %d  •  %s",
+                              s_station_cursor + 1, count,
+                              focused_st.genre[0] ? focused_st.genre : "SomaFM");
+    }
+
+    for (int slot = 0; slot < WHEEL_SLOTS; slot++) {
+        int rel = slot - 2; // -2, -1, 0, +1, +2
+        int idx = (s_station_cursor + rel + count * 4) % count;
+        const StationPreset &st = g_app.presets[idx];
+        bool is_center = (slot == 2);
+        bool is_playing = (idx == active_idx);
+
+        lv_obj_set_user_data(s_st_slots[slot], (void *)(intptr_t)idx);
+        lv_obj_set_style_bg_color(s_st_dots[slot], hex_to_lv(st.color ? st.color : 0x10B981), 0);
+
+        if (is_center) {
+            lv_obj_set_style_bg_color(s_st_slots[slot], hex_to_lv(0x141B28), 0);
+            lv_obj_set_style_border_width(s_st_slots[slot], 2, 0);
+            lv_obj_set_style_border_color(s_st_slots[slot], hex_to_lv(st.color ? st.color : 0x10B981), 0);
+            lv_obj_set_style_text_color(s_st_titles[slot], hex_to_lv(0xFFFFFF), 0);
+        } else {
+            lv_obj_set_style_bg_color(s_st_slots[slot], hex_to_lv(0x0A0E15), 0);
+            lv_obj_set_style_border_width(s_st_slots[slot], 1, 0);
+            lv_obj_set_style_border_color(s_st_slots[slot], hex_to_lv(is_playing ? 0x10B981 : 0x151D2A), 0);
+            lv_obj_set_style_text_color(s_st_titles[slot], hex_to_lv((slot == 1 || slot == 3) ? 0xCBD5E1 : 0x64748B), 0);
+        }
+
+        lv_label_set_text(s_st_titles[slot], st.name);
+        if (is_playing) {
+            lv_obj_set_width(s_st_titles[slot], SLOT_W[slot] - 102);
+            lv_label_set_text(s_st_tags[slot], "PLAYING");
+            lv_obj_set_style_text_color(s_st_tags[slot], hex_to_lv(0x10B981), 0);
+        } else {
+            lv_obj_set_width(s_st_titles[slot], SLOT_W[slot] - 38);
+            lv_label_set_text(s_st_tags[slot], "");
+        }
+    }
+    xSemaphoreGive(g_app.mutex);
+
+    if (s_outer_arc) {
+        lv_arc_set_range(s_outer_arc, 0, count > 1 ? count - 1 : 1);
+        lv_arc_set_value(s_outer_arc, s_station_cursor);
+    }
+}
+
+static void update_speaker_wheel(bool sync_cursor_to_active) {
+    if (!s_sp_slots[0]) return;
+
+    if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(30)) != pdTRUE) return;
+    int count = g_app.speaker_count;
+    int active_idx = g_app.current_speaker;
+    bool scanning = g_app.speaker_scanning;
+    if (count > MAX_SPEAKERS) count = MAX_SPEAKERS;
+    if (count <= 0) {
+        xSemaphoreGive(g_app.mutex);
+        return;
+    }
+
+    if (sync_cursor_to_active || s_speaker_cursor < 0 || s_speaker_cursor >= count) {
+        s_speaker_cursor = active_idx;
+    }
+
+    if (s_lbl_spkr_hdr) {
+        if (scanning) {
+            lv_label_set_text(s_lbl_spkr_hdr, "SCANNING AIRPLAY...");
+        } else {
+            lv_label_set_text_fmt(s_lbl_spkr_hdr, "AIRPLAY  •  %d / %d", s_speaker_cursor + 1, count);
+        }
+    }
+
+    for (int slot = 0; slot < WHEEL_SLOTS; slot++) {
+        if (slot >= count) {
+            lv_obj_add_flag(s_sp_slots[slot], LV_OBJ_FLAG_HIDDEN);
+            continue;
+        }
+        lv_obj_clear_flag(s_sp_slots[slot], LV_OBJ_FLAG_HIDDEN);
+
+        int rel = (count >= WHEEL_SLOTS) ? (slot - 2) : slot;
+        int idx = (count >= WHEEL_SLOTS)
+                  ? ((s_speaker_cursor + rel + count * 4) % count)
+                  : slot;
+
+        const AirPlaySpeaker &sp = g_app.speakers[idx];
+        bool is_center = (count >= WHEEL_SLOTS) ? (slot == 2) : (idx == s_speaker_cursor);
+        bool is_active = (idx == active_idx);
+
+        lv_obj_set_user_data(s_sp_slots[slot], (void *)(intptr_t)idx);
+        lv_obj_set_style_bg_color(s_sp_dots[slot], hex_to_lv(is_active ? 0x10B981 : (is_center ? 0x38BDF8 : 0x334155)), 0);
+
+        if (is_center) {
+            lv_obj_set_style_bg_color(s_sp_slots[slot], hex_to_lv(0x141B28), 0);
+            lv_obj_set_style_border_width(s_sp_slots[slot], 2, 0);
+            lv_obj_set_style_border_color(s_sp_slots[slot], hex_to_lv(0x38BDF8), 0);
+            lv_obj_set_style_text_color(s_sp_titles[slot], hex_to_lv(0xFFFFFF), 0);
+        } else {
+            lv_obj_set_style_bg_color(s_sp_slots[slot], hex_to_lv(0x0A0E15), 0);
+            lv_obj_set_style_border_width(s_sp_slots[slot], 1, 0);
+            lv_obj_set_style_border_color(s_sp_slots[slot], hex_to_lv(is_active ? 0x10B981 : 0x151D2A), 0);
+            lv_obj_set_style_text_color(s_sp_titles[slot], hex_to_lv((slot == 1 || slot == 3) ? 0xCBD5E1 : 0x64748B), 0);
+        }
+
+        static const int SP_SLOT_W[WHEEL_SLOTS] = {252, 282, 300, 282, 252};
+        lv_label_set_text(s_sp_titles[slot], sp.name);
+        if (is_active) {
+            lv_obj_set_width(s_sp_titles[slot], SP_SLOT_W[slot] - 96);
+            lv_label_set_text(s_sp_tags[slot], "ACTIVE");
+            lv_obj_set_style_text_color(s_sp_tags[slot], hex_to_lv(0x10B981), 0);
+        } else if (is_center) {
+            lv_obj_set_width(s_sp_titles[slot], SP_SLOT_W[slot] - 104);
+            if (sp.is_local_dac) {
+                lv_label_set_text(s_sp_tags[slot], "3.5MM");
+                lv_obj_set_style_text_color(s_sp_tags[slot], hex_to_lv(0x94A3B8), 0);
+            } else if (strcasestr(sp.am, "AudioAccessory") != NULL) {
+                lv_label_set_text(s_sp_tags[slot], "HOMEPOD");
+                lv_obj_set_style_text_color(s_sp_tags[slot], hex_to_lv(0x38BDF8), 0);
+            } else {
+                lv_label_set_text(s_sp_tags[slot], "AIRPLAY");
+                lv_obj_set_style_text_color(s_sp_tags[slot], hex_to_lv(0x64748B), 0);
+            }
+        } else {
+            lv_obj_set_width(s_sp_titles[slot], SP_SLOT_W[slot] - 38);
+            lv_label_set_text(s_sp_tags[slot], "");
+        }
+    }
+    xSemaphoreGive(g_app.mutex);
+
+    if (s_outer_arc) {
+        lv_arc_set_range(s_outer_arc, 0, count > 1 ? count - 1 : 1);
+        lv_arc_set_value(s_outer_arc, s_speaker_cursor);
+    }
+}
+
 static void switch_tab(ActiveTab tab) {
     s_active_tab = tab;
     for (int i = 0; i < 4; i++) {
         if (!s_pages[i]) continue;
         if (i == (int)tab) lv_obj_clear_flag(s_pages[i], LV_OBJ_FLAG_HIDDEN);
         else lv_obj_add_flag(s_pages[i], LV_OBJ_FLAG_HIDDEN);
+    }
+    if (tab == TAB_STATIONS) {
+        update_station_wheel(true);
+    } else if (tab == TAB_SPEAKERS) {
+        update_speaker_wheel(true);
     }
     haptic_play_effect(HAPTIC_SHARP_CLICK);
 }
@@ -398,122 +549,22 @@ static void set_whitecap_visible(bool visible) {
     }
 }
 
-static void rebuild_station_list(void) {
-    if (!s_station_list) return;
-    lv_obj_clean(s_station_list);
-    memset(s_station_items, 0, sizeof(s_station_items));
-
-    int count = 0;
-    int cur_idx = 0;
-    if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-        count = g_app.preset_count;
-        cur_idx = g_app.current_preset;
-        s_station_cursor = cur_idx;
-
-        for (int i = 0; i < count; i++) {
-            const StationPreset &st = g_app.presets[i];
-            lv_obj_t *btn = lv_btn_create(s_station_list);
-            lv_obj_set_size(btn, 276, 48);
-            lv_obj_set_style_radius(btn, 14, 0);
-            lv_obj_set_style_bg_color(btn, (i == cur_idx) ? hex_to_lv(0x161B26) : hex_to_lv(0x0B0E14), 0);
-            lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
-            lv_obj_set_style_border_width(btn, (i == cur_idx) ? 2 : 1, 0);
-            lv_obj_set_style_border_color(btn, (i == cur_idx) ? hex_to_lv(st.color) : hex_to_lv(0x1E293B), 0);
-            lv_obj_set_style_shadow_width(btn, 0, 0);
-
-            lv_obj_t *dot = lv_obj_create(btn);
-            lv_obj_set_size(dot, 8, 24);
-            lv_obj_set_style_radius(dot, 4, 0);
-            lv_obj_set_style_bg_color(dot, hex_to_lv(st.color), 0);
-            lv_obj_set_style_border_width(dot, 0, 0);
-            lv_obj_align(dot, LV_ALIGN_LEFT_MID, -4, 0);
-
-            lv_obj_t *title = lv_label_create(btn);
-            lv_label_set_text(title, st.name);
-            lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
-            lv_obj_set_style_text_color(title, hex_to_lv(0xF8FAFC), 0);
-            lv_obj_align(title, LV_ALIGN_TOP_LEFT, 12, 2);
-
-            lv_obj_t *genre = lv_label_create(btn);
-            lv_label_set_text(genre, st.genre);
-            lv_obj_set_style_text_font(genre, &lv_font_montserrat_12, 0);
-            lv_obj_set_style_text_color(genre, hex_to_lv(0x64748B), 0);
-            lv_obj_align(genre, LV_ALIGN_BOTTOM_LEFT, 12, -1);
-
-            lv_obj_add_event_cb(btn, [](lv_event_t *e) {
-                int idx = (int)(intptr_t)lv_event_get_user_data(e);
-                haptic_play_effect(HAPTIC_DOUBLE_CLICK);
-                app_select_preset(idx, true);
-                switch_tab(TAB_NOW_PLAYING);
-            }, LV_EVENT_CLICKED, (void *)(intptr_t)i);
-
-            s_station_items[i] = btn;
-        }
-        xSemaphoreGive(g_app.mutex);
-    }
-    s_station_rendered_count = count;
-    if (cur_idx >= 0 && cur_idx < count && s_station_items[cur_idx]) {
-        lv_obj_scroll_to_view(s_station_items[cur_idx], LV_ANIM_OFF);
-    }
+void knob_ui_set_tab(int tab) {
+    if (tab < 0 || tab > 3) return;
+    if (!bsp_lvgl_lock(50)) return;
+    set_whitecap_visible(false);
+    switch_tab((ActiveTab)tab);
+    bsp_lvgl_unlock();
 }
 
-static void rebuild_speaker_list(void) {
-    if (!s_speaker_list) return;
-    lv_obj_clean(s_speaker_list);
-    memset(s_speaker_items, 0, sizeof(s_speaker_items));
+int knob_ui_get_tab(void) {
+    return (int)s_active_tab;
+}
 
-    int count = 0;
-    int cur_idx = 0;
-    bool scanning = false;
-    if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-        count = g_app.speaker_count;
-        cur_idx = g_app.current_speaker;
-        scanning = g_app.speaker_scanning;
-        s_speaker_cursor = cur_idx;
-
-        if (s_lbl_spkr_hdr) {
-            lv_label_set_text(s_lbl_spkr_hdr, scanning ? "SCANNING AIRPLAY..." : "AIRPLAY SPEAKERS");
-        }
-
-        for (int i = 0; i < count; i++) {
-            const AirPlaySpeaker &sp = g_app.speakers[i];
-            lv_obj_t *btn = lv_btn_create(s_speaker_list);
-            lv_obj_set_size(btn, 276, 48);
-            lv_obj_set_style_radius(btn, 14, 0);
-            lv_obj_set_style_bg_color(btn, (i == cur_idx) ? hex_to_lv(0x161B26) : hex_to_lv(0x0B0E14), 0);
-            lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
-            lv_obj_set_style_border_width(btn, (i == cur_idx) ? 2 : 1, 0);
-            lv_obj_set_style_border_color(btn, (i == cur_idx) ? hex_to_lv(0x38BDF8) : hex_to_lv(0x1E293B), 0);
-            lv_obj_set_style_shadow_width(btn, 0, 0);
-
-            lv_obj_t *title = lv_label_create(btn);
-            lv_label_set_text_fmt(title, "%s  %s", LV_SYMBOL_AUDIO, sp.name);
-            lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
-            lv_obj_set_style_text_color(title, hex_to_lv(0xF8FAFC), 0);
-            lv_obj_align(title, LV_ALIGN_TOP_LEFT, 4, 2);
-
-            lv_obj_t *sub = lv_label_create(btn);
-            if (sp.is_local_dac) {
-                lv_label_set_text(sub, "3.5mm Stereo Line Out");
-            } else {
-                lv_label_set_text_fmt(sub, "%s  •  AirPlay", sp.ip);
-            }
-            lv_obj_set_style_text_font(sub, &lv_font_montserrat_12, 0);
-            lv_obj_set_style_text_color(sub, hex_to_lv(0x64748B), 0);
-            lv_obj_align(sub, LV_ALIGN_BOTTOM_LEFT, 4, -1);
-
-            lv_obj_add_event_cb(btn, [](lv_event_t *e) {
-                int idx = (int)(intptr_t)lv_event_get_user_data(e);
-                haptic_play_effect(HAPTIC_DOUBLE_CLICK);
-                app_select_speaker(idx);
-                switch_tab(TAB_NOW_PLAYING);
-            }, LV_EVENT_CLICKED, (void *)(intptr_t)i);
-
-            s_speaker_items[i] = btn;
-        }
-        xSemaphoreGive(g_app.mutex);
-    }
-    s_speaker_rendered_count = count;
+void knob_ui_set_whitecap(bool visible) {
+    if (!bsp_lvgl_lock(50)) return;
+    set_whitecap_visible(visible);
+    bsp_lvgl_unlock();
 }
 
 static void wifi_kb_event_cb(lv_event_t *e) {
@@ -582,6 +633,7 @@ static void open_wifi_scan_modal(lv_event_t *e) {
     lv_obj_set_style_radius(s_wifi_modal, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(s_wifi_modal, hex_to_lv(0x050608), 0);
     lv_obj_set_style_border_width(s_wifi_modal, 0, 0);
+    lv_obj_set_style_pad_all(s_wifi_modal, 0, 0);
 
     lv_obj_t *hdr = lv_label_create(s_wifi_modal);
     lv_label_set_text(hdr, "Select Wi-Fi Network");
@@ -606,6 +658,7 @@ static void open_wifi_scan_modal(lv_event_t *e) {
     lv_obj_align(close_btn, LV_ALIGN_BOTTOM_MID, 0, -24);
     lv_obj_set_style_radius(close_btn, 16, 0);
     lv_obj_set_style_bg_color(close_btn, hex_to_lv(0x1E293B), 0);
+    lv_obj_set_style_pad_all(close_btn, 0, 0);
     lv_obj_t *cl = lv_label_create(close_btn);
     lv_label_set_text(cl, "Close");
     lv_obj_center(cl);
@@ -619,12 +672,98 @@ static void open_wifi_scan_modal(lv_event_t *e) {
     }, LV_EVENT_CLICKED, NULL);
 }
 
+// Helper to create a clean zero-padding pill button
+static lv_obj_t *create_pill_btn(lv_obj_t *parent, int w, int h, uint32_t bg_hex, uint32_t border_hex, const char *text, uint32_t text_hex) {
+    lv_obj_t *btn = lv_btn_create(parent);
+    lv_obj_set_size(btn, w, h);
+    lv_obj_set_style_radius(btn, h / 2, 0);
+    lv_obj_set_style_bg_color(btn, hex_to_lv(bg_hex), 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(btn, 1, 0);
+    lv_obj_set_style_border_color(btn, hex_to_lv(border_hex), 0);
+    lv_obj_set_style_shadow_width(btn, 0, 0);
+    lv_obj_set_style_pad_all(btn, 0, 0);
+    lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *lbl = lv_label_create(btn);
+    lv_label_set_text(lbl, text);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(lbl, hex_to_lv(text_hex), 0);
+    lv_obj_center(lbl);
+    return btn;
+}
+
+// Touch drag + tap handlers for 60 FPS virtualized station wheel
+static void station_slot_event_cb(lv_event_t *e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_PRESSED) {
+        s_st_drag_accum = 0;
+        s_st_dragging = false;
+    } else if (code == LV_EVENT_PRESSING) {
+        lv_indev_t *indev = lv_indev_get_act();
+        if (!indev) return;
+        lv_point_t vect;
+        lv_indev_get_vect(indev, &vect);
+        s_st_drag_accum += vect.y;
+        if (abs(s_st_drag_accum) >= 24) {
+            int steps = s_st_drag_accum / 24;
+            s_st_drag_accum -= steps * 24;
+            s_st_dragging = true;
+            int count = g_app.preset_count > 0 ? g_app.preset_count : 1;
+            s_station_cursor = (s_station_cursor - steps + count * 8) % count;
+            haptic_play_effect(HAPTIC_LIGHT_TICK);
+            update_station_wheel(false);
+        }
+    } else if (code == LV_EVENT_CLICKED) {
+        if (s_st_dragging) return;
+        lv_obj_t *target = lv_event_get_current_target(e);
+        int idx = (int)(intptr_t)lv_obj_get_user_data(target);
+        s_station_cursor = idx;
+        haptic_play_effect(HAPTIC_DOUBLE_CLICK);
+        app_select_preset(idx, true);
+        switch_tab(TAB_NOW_PLAYING);
+    }
+}
+
+// Touch drag + tap handlers for 60 FPS virtualized speaker wheel
+static void speaker_slot_event_cb(lv_event_t *e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_PRESSED) {
+        s_sp_drag_accum = 0;
+        s_sp_dragging = false;
+    } else if (code == LV_EVENT_PRESSING) {
+        lv_indev_t *indev = lv_indev_get_act();
+        if (!indev) return;
+        lv_point_t vect;
+        lv_indev_get_vect(indev, &vect);
+        s_sp_drag_accum += vect.y;
+        if (abs(s_sp_drag_accum) >= 24) {
+            int steps = s_sp_drag_accum / 24;
+            s_sp_drag_accum -= steps * 24;
+            s_sp_dragging = true;
+            int count = g_app.speaker_count > 0 ? g_app.speaker_count : 1;
+            s_speaker_cursor = (s_speaker_cursor - steps + count * 8) % count;
+            haptic_play_effect(HAPTIC_LIGHT_TICK);
+            update_speaker_wheel(false);
+        }
+    } else if (code == LV_EVENT_CLICKED) {
+        if (s_sp_dragging) return;
+        lv_obj_t *target = lv_event_get_current_target(e);
+        int idx = (int)(intptr_t)lv_obj_get_user_data(target);
+        s_speaker_cursor = idx;
+        haptic_play_effect(HAPTIC_DOUBLE_CLICK);
+        app_select_speaker(idx);
+        switch_tab(TAB_NOW_PLAYING);
+    }
+}
+
 void knob_ui_init(void) {
     if (!bsp_lvgl_lock(-1)) return;
 
     s_scr = lv_scr_act();
     lv_obj_set_style_bg_color(s_scr, hex_to_lv(0x050608), 0);
     lv_obj_set_style_bg_opa(s_scr, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(s_scr, 0, 0);
     lv_obj_clear_flag(s_scr, LV_OBJ_FLAG_SCROLLABLE);
 
     // Subtle 3px 360-degree bezel progress ring
@@ -634,7 +773,7 @@ void knob_ui_init(void) {
     lv_arc_set_rotation(s_outer_arc, 270);
     lv_arc_set_bg_angles(s_outer_arc, 0, 360);
     lv_arc_set_range(s_outer_arc, 0, 100);
-    lv_arc_set_value(s_outer_arc, 65);
+    lv_arc_set_value(s_outer_arc, 18);
     lv_obj_remove_style(s_outer_arc, NULL, LV_PART_KNOB);
     lv_obj_clear_flag(s_outer_arc, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_style_arc_width(s_outer_arc, 3, LV_PART_MAIN);
@@ -644,7 +783,7 @@ void knob_ui_init(void) {
 
     for (int i = 0; i < 4; i++) {
         s_pages[i] = lv_obj_create(s_scr);
-        lv_obj_set_size(s_pages[i], 344, 344);
+        lv_obj_set_size(s_pages[i], 360, 360);
         lv_obj_center(s_pages[i]);
         lv_obj_set_style_bg_opa(s_pages[i], LV_OPA_TRANSP, 0);
         lv_obj_set_style_border_width(s_pages[i], 0, 0);
@@ -658,17 +797,15 @@ void knob_ui_init(void) {
     // =========================================================================
     lv_obj_t *p0 = s_pages[0];
 
-    // Centerpiece 156x156 Album Art / Stream Art Card
+    // Centerpiece 156x156 Album Art / Stream Art Card (y = 20..176)
     s_art_cont = lv_obj_create(p0);
     lv_obj_set_size(s_art_cont, ARTWORK_SIZE, ARTWORK_SIZE);
-    lv_obj_align(s_art_cont, LV_ALIGN_TOP_MID, 0, 16);
+    lv_obj_align(s_art_cont, LV_ALIGN_TOP_MID, 0, 20);
     lv_obj_set_style_radius(s_art_cont, 22, 0);
     lv_obj_set_style_bg_opa(s_art_cont, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(s_art_cont, 0, 0);
+    lv_obj_set_style_border_width(s_art_cont, 1, 0);
+    lv_obj_set_style_border_color(s_art_cont, hex_to_lv(0x1E293B), 0);
     lv_obj_set_style_pad_all(s_art_cont, 0, 0);
-    lv_obj_set_style_shadow_width(s_art_cont, 28, 0);
-    lv_obj_set_style_shadow_color(s_art_cont, hex_to_lv(0x10B981), 0);
-    lv_obj_set_style_shadow_opa(s_art_cont, LV_OPA_30, 0);
     lv_obj_clear_flag(s_art_cont, LV_OBJ_FLAG_SCROLLABLE);
 
     s_art_img = lv_img_create(s_art_cont);
@@ -687,9 +824,10 @@ void knob_ui_init(void) {
     lv_obj_center(s_pause_badge);
     lv_obj_set_style_radius(s_pause_badge, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(s_pause_badge, hex_to_lv(0x050608), 0);
-    lv_obj_set_style_bg_opa(s_pause_badge, LV_OPA_70, 0);
+    lv_obj_set_style_bg_opa(s_pause_badge, LV_OPA_80, 0);
     lv_obj_set_style_border_width(s_pause_badge, 1, 0);
     lv_obj_set_style_border_color(s_pause_badge, hex_to_lv(0xF8FAFC), 0);
+    lv_obj_set_style_pad_all(s_pause_badge, 0, 0);
     lv_obj_clear_flag(s_pause_badge, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_t *pl = lv_label_create(s_pause_badge);
     lv_label_set_text(pl, LV_SYMBOL_PLAY);
@@ -698,30 +836,30 @@ void knob_ui_init(void) {
     lv_obj_center(pl);
     lv_obj_add_flag(s_pause_badge, LV_OBJ_FLAG_HIDDEN);
 
-    // Primary Focus: Track Name (Clean bold white)
+    // Primary Focus: Track Name (y = 188..212, single-line ellipsis, never wraps)
     s_lbl_track = lv_label_create(p0);
     lv_label_set_text(s_lbl_track, "Groove Salad");
     lv_obj_set_style_text_font(s_lbl_track, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(s_lbl_track, hex_to_lv(0xFFFFFF), 0);
-    lv_label_set_long_mode(s_lbl_track, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_set_width(s_lbl_track, 286);
+    lv_label_set_long_mode(s_lbl_track, LV_LABEL_LONG_DOT);
+    lv_obj_set_size(s_lbl_track, 284, 24);
     lv_obj_set_style_text_align(s_lbl_track, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(s_lbl_track, LV_ALIGN_TOP_MID, 0, 184);
+    lv_obj_align(s_lbl_track, LV_ALIGN_TOP_MID, 0, 188);
 
-    // Secondary Focus: Artist Name
+    // Secondary Focus: Artist Name (y = 216..234, single-line ellipsis)
     s_lbl_artist = lv_label_create(p0);
     lv_label_set_text(s_lbl_artist, "SomaFM Radio");
     lv_obj_set_style_text_font(s_lbl_artist, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(s_lbl_artist, hex_to_lv(0x94A3B8), 0);
     lv_label_set_long_mode(s_lbl_artist, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(s_lbl_artist, 260);
+    lv_obj_set_size(s_lbl_artist, 256, 18);
     lv_obj_set_style_text_align(s_lbl_artist, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(s_lbl_artist, LV_ALIGN_TOP_MID, 0, 212);
+    lv_obj_align(s_lbl_artist, LV_ALIGN_TOP_MID, 0, 216);
 
-    // Subtle Station • Speaker status line (Tap to cycle Knob Mode VOL -> TUNE -> SPKR)
+    // Subtle Station • Speaker status line (y = 240..260, tap to cycle Knob Mode)
     lv_obj_t *sub_btn = lv_btn_create(p0);
-    lv_obj_set_size(sub_btn, 250, 24);
-    lv_obj_align(sub_btn, LV_ALIGN_TOP_MID, 0, 236);
+    lv_obj_set_size(sub_btn, 244, 20);
+    lv_obj_align(sub_btn, LV_ALIGN_TOP_MID, 0, 240);
     lv_obj_set_style_bg_opa(sub_btn, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(sub_btn, 0, 0);
     lv_obj_set_style_shadow_width(sub_btn, 0, 0);
@@ -743,139 +881,169 @@ void knob_ui_init(void) {
     }, LV_EVENT_CLICKED, NULL);
 
     s_lbl_sub_meta = lv_label_create(sub_btn);
-    lv_label_set_text(s_lbl_sub_meta, "GROOVE SALAD  •  AIRPLAY");
+    lv_label_set_text(s_lbl_sub_meta, "Groove Salad  •  Tree House");
     lv_obj_set_style_text_font(s_lbl_sub_meta, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(s_lbl_sub_meta, hex_to_lv(0x10B981), 0);
     lv_label_set_long_mode(s_lbl_sub_meta, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(s_lbl_sub_meta, 244);
+    lv_obj_set_size(s_lbl_sub_meta, 240, 16);
     lv_obj_set_style_text_align(s_lbl_sub_meta, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_center(s_lbl_sub_meta);
 
-    // Minimalist Bottom Action Dock (Stations  |  WhiteCap  |  AirPlay)
-    s_btn_dock_stations = lv_btn_create(p0);
-    lv_obj_set_size(s_btn_dock_stations, 78, 34);
-    lv_obj_align(s_btn_dock_stations, LV_ALIGN_BOTTOM_MID, -88, -32);
-    lv_obj_set_style_radius(s_btn_dock_stations, 17, 0);
-    lv_obj_set_style_bg_color(s_btn_dock_stations, hex_to_lv(0x0F141D), 0);
-    lv_obj_set_style_border_width(s_btn_dock_stations, 1, 0);
-    lv_obj_set_style_border_color(s_btn_dock_stations, hex_to_lv(0x1E293B), 0);
-    lv_obj_set_style_shadow_width(s_btn_dock_stations, 0, 0);
-    lv_obj_t *l_st = lv_label_create(s_btn_dock_stations);
-    lv_label_set_text(l_st, "Stations");
-    lv_obj_set_style_text_font(l_st, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(l_st, hex_to_lv(0xCBD5E1), 0);
-    lv_obj_center(l_st);
+    // Minimalist Bottom Action Dock (y = 272..304: Stations | WhiteCap | AirPlay)
+    s_btn_dock_stations = create_pill_btn(p0, 74, 32, 0x0F141D, 0x1E293B, "Stations", 0xCBD5E1);
+    lv_obj_align(s_btn_dock_stations, LV_ALIGN_TOP_MID, -78, 272);
     lv_obj_add_event_cb(s_btn_dock_stations, [](lv_event_t *e) {
         (void)e;
-        rebuild_station_list();
         switch_tab(TAB_STATIONS);
     }, LV_EVENT_CLICKED, NULL);
 
-    s_btn_dock_whitecap = lv_btn_create(p0);
-    lv_obj_set_size(s_btn_dock_whitecap, 88, 34);
-    lv_obj_align(s_btn_dock_whitecap, LV_ALIGN_BOTTOM_MID, 0, -32);
-    lv_obj_set_style_radius(s_btn_dock_whitecap, 17, 0);
-    lv_obj_set_style_bg_color(s_btn_dock_whitecap, hex_to_lv(0x131C2E), 0);
-    lv_obj_set_style_border_width(s_btn_dock_whitecap, 1, 0);
-    lv_obj_set_style_border_color(s_btn_dock_whitecap, hex_to_lv(0x334155), 0);
-    lv_obj_set_style_shadow_width(s_btn_dock_whitecap, 0, 0);
-    lv_obj_t *l_wc = lv_label_create(s_btn_dock_whitecap);
-    lv_label_set_text(l_wc, "WhiteCap");
-    lv_obj_set_style_text_font(l_wc, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(l_wc, hex_to_lv(0xF8FAFC), 0);
-    lv_obj_center(l_wc);
+    s_btn_dock_whitecap = create_pill_btn(p0, 78, 32, 0x131C2E, 0x334155, "WhiteCap", 0xF8FAFC);
+    lv_obj_align(s_btn_dock_whitecap, LV_ALIGN_TOP_MID, 0, 272);
     lv_obj_add_event_cb(s_btn_dock_whitecap, [](lv_event_t *e) {
         (void)e;
         set_whitecap_visible(true);
     }, LV_EVENT_CLICKED, NULL);
 
-    s_btn_dock_speakers = lv_btn_create(p0);
-    lv_obj_set_size(s_btn_dock_speakers, 78, 34);
-    lv_obj_align(s_btn_dock_speakers, LV_ALIGN_BOTTOM_MID, 88, -32);
-    lv_obj_set_style_radius(s_btn_dock_speakers, 17, 0);
-    lv_obj_set_style_bg_color(s_btn_dock_speakers, hex_to_lv(0x0F141D), 0);
-    lv_obj_set_style_border_width(s_btn_dock_speakers, 1, 0);
-    lv_obj_set_style_border_color(s_btn_dock_speakers, hex_to_lv(0x1E293B), 0);
-    lv_obj_set_style_shadow_width(s_btn_dock_speakers, 0, 0);
-    lv_obj_t *l_sp = lv_label_create(s_btn_dock_speakers);
-    lv_label_set_text(l_sp, "AirPlay");
-    lv_obj_set_style_text_font(l_sp, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(l_sp, hex_to_lv(0xCBD5E1), 0);
-    lv_obj_center(l_sp);
+    s_btn_dock_speakers = create_pill_btn(p0, 74, 32, 0x0F141D, 0x1E293B, "AirPlay", 0xCBD5E1);
+    lv_obj_align(s_btn_dock_speakers, LV_ALIGN_TOP_MID, 78, 272);
     lv_obj_add_event_cb(s_btn_dock_speakers, [](lv_event_t *e) {
         (void)e;
-        rebuild_speaker_list();
         switch_tab(TAB_SPEAKERS);
     }, LV_EVENT_CLICKED, NULL);
 
     // =========================================================================
-    // PAGE 1: MINIMALIST STATIONS SHEET
+    // PAGE 1: 60 FPS VIRTUALIZED SOMAFM STATIONS WHEEL
     // =========================================================================
     lv_obj_t *p1 = s_pages[1];
 
-    lv_obj_t *st_hdr = lv_label_create(p1);
-    lv_label_set_text(st_hdr, "SOMAFM STATIONS");
-    lv_obj_set_style_text_font(st_hdr, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(st_hdr, hex_to_lv(0x94A3B8), 0);
-    lv_obj_align(st_hdr, LV_ALIGN_TOP_MID, 0, 20);
+    s_lbl_st_hdr = lv_label_create(p1);
+    lv_label_set_text(s_lbl_st_hdr, "SOMAFM  •  1 / 30");
+    lv_obj_set_style_text_font(s_lbl_st_hdr, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_lbl_st_hdr, hex_to_lv(0x94A3B8), 0);
+    lv_obj_align(s_lbl_st_hdr, LV_ALIGN_TOP_MID, 0, 22);
 
-    s_station_list = lv_obj_create(p1);
-    lv_obj_set_size(s_station_list, 290, 232);
-    lv_obj_align(s_station_list, LV_ALIGN_CENTER, 0, -4);
-    lv_obj_set_style_bg_opa(s_station_list, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(s_station_list, 0, 0);
-    lv_obj_set_style_pad_all(s_station_list, 4, 0);
-    lv_obj_set_style_pad_row(s_station_list, 6, 0);
-    lv_obj_set_flex_flow(s_station_list, LV_FLEX_FLOW_COLUMN);
+    static const int SLOT_Y[WHEEL_SLOTS] = {48, 90, 132, 180, 222};
+    static const int SLOT_W[WHEEL_SLOTS] = {252, 282, 300, 282, 252};
+    static const int SLOT_H[WHEEL_SLOTS] = {38, 38, 44, 38, 38};
 
-    lv_obj_t *st_back = lv_btn_create(p1);
-    lv_obj_set_size(st_back, 108, 32);
-    lv_obj_align(st_back, LV_ALIGN_BOTTOM_MID, 0, -18);
-    lv_obj_set_style_radius(st_back, 16, 0);
-    lv_obj_set_style_bg_color(st_back, hex_to_lv(0x161B26), 0);
-    lv_obj_set_style_border_width(st_back, 1, 0);
-    lv_obj_set_style_border_color(st_back, hex_to_lv(0x334155), 0);
-    lv_obj_t *st_bl = lv_label_create(st_back);
-    lv_label_set_text(st_bl, "Done");
-    lv_obj_set_style_text_font(st_bl, &lv_font_montserrat_12, 0);
-    lv_obj_center(st_bl);
+    for (int i = 0; i < WHEEL_SLOTS; i++) {
+        lv_obj_t *row = lv_obj_create(p1);
+        lv_obj_set_size(row, SLOT_W[i], SLOT_H[i]);
+        lv_obj_align(row, LV_ALIGN_TOP_MID, 0, SLOT_Y[i]);
+        lv_obj_set_style_radius(row, SLOT_H[i] / 2, 0);
+        lv_obj_set_style_bg_color(row, hex_to_lv(i == 2 ? 0x141B28 : 0x0A0E15), 0);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(row, i == 2 ? 2 : 1, 0);
+        lv_obj_set_style_border_color(row, hex_to_lv(i == 2 ? 0x10B981 : 0x151D2A), 0);
+        lv_obj_set_style_pad_all(row, 0, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, station_slot_event_cb, LV_EVENT_ALL, NULL);
+
+        lv_obj_t *dot = lv_obj_create(row);
+        lv_obj_set_size(dot, 6, i == 2 ? 22 : 16);
+        lv_obj_set_style_radius(dot, 3, 0);
+        lv_obj_set_style_bg_color(dot, hex_to_lv(0x10B981), 0);
+        lv_obj_set_style_border_width(dot, 0, 0);
+        lv_obj_align(dot, LV_ALIGN_LEFT_MID, 12, 0);
+        lv_obj_clear_flag(dot, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *title = lv_label_create(row);
+        lv_obj_set_style_text_font(title, i == 2 ? &lv_font_montserrat_16 : &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(title, hex_to_lv(0xFFFFFF), 0);
+        lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
+        lv_obj_set_size(title, SLOT_W[i] - 102, i == 2 ? 20 : 18);
+        lv_obj_align(title, LV_ALIGN_LEFT_MID, 26, 0);
+
+        lv_obj_t *tag = lv_label_create(row);
+        lv_obj_set_style_text_font(tag, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(tag, hex_to_lv(0x64748B), 0);
+        lv_label_set_long_mode(tag, LV_LABEL_LONG_CLIP);
+        lv_obj_set_size(tag, 64, 16);
+        lv_obj_set_style_text_align(tag, LV_TEXT_ALIGN_RIGHT, 0);
+        lv_obj_align(tag, LV_ALIGN_RIGHT_MID, -12, 0);
+
+        s_st_slots[i] = row;
+        s_st_dots[i] = dot;
+        s_st_titles[i] = title;
+        s_st_tags[i] = tag;
+    }
+
+    lv_obj_t *st_back = create_pill_btn(p1, 86, 32, 0x0F141D, 0x1E293B, "Back", 0xCBD5E1);
+    lv_obj_align(st_back, LV_ALIGN_TOP_MID, -52, 274);
     lv_obj_add_event_cb(st_back, [](lv_event_t *e) {
         (void)e;
         switch_tab(TAB_NOW_PLAYING);
     }, LV_EVENT_CLICKED, NULL);
 
-    rebuild_station_list();
+    lv_obj_t *st_tune = create_pill_btn(p1, 96, 32, 0x10B981, 0x10B981, "Tune In", 0x050608);
+    lv_obj_align(st_tune, LV_ALIGN_TOP_MID, 50, 274);
+    lv_obj_add_event_cb(st_tune, [](lv_event_t *e) {
+        (void)e;
+        haptic_play_effect(HAPTIC_DOUBLE_CLICK);
+        app_select_preset(s_station_cursor, true);
+        switch_tab(TAB_NOW_PLAYING);
+    }, LV_EVENT_CLICKED, NULL);
+
+    update_station_wheel(true);
 
     // =========================================================================
-    // PAGE 2: MINIMALIST AIRPLAY SPEAKERS SHEET
+    // PAGE 2: 60 FPS VIRTUALIZED AIRPLAY SPEAKERS WHEEL
     // =========================================================================
     lv_obj_t *p2 = s_pages[2];
 
     s_lbl_spkr_hdr = lv_label_create(p2);
     lv_label_set_text(s_lbl_spkr_hdr, "AIRPLAY SPEAKERS");
-    lv_obj_set_style_text_font(s_lbl_spkr_hdr, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(s_lbl_spkr_hdr, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(s_lbl_spkr_hdr, hex_to_lv(0x94A3B8), 0);
-    lv_obj_align(s_lbl_spkr_hdr, LV_ALIGN_TOP_MID, 0, 20);
+    lv_obj_align(s_lbl_spkr_hdr, LV_ALIGN_TOP_MID, 0, 22);
 
-    s_speaker_list = lv_obj_create(p2);
-    lv_obj_set_size(s_speaker_list, 290, 224);
-    lv_obj_align(s_speaker_list, LV_ALIGN_CENTER, 0, -6);
-    lv_obj_set_style_bg_opa(s_speaker_list, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(s_speaker_list, 0, 0);
-    lv_obj_set_style_pad_all(s_speaker_list, 4, 0);
-    lv_obj_set_style_pad_row(s_speaker_list, 6, 0);
-    lv_obj_set_flex_flow(s_speaker_list, LV_FLEX_FLOW_COLUMN);
+    for (int i = 0; i < WHEEL_SLOTS; i++) {
+        lv_obj_t *row = lv_obj_create(p2);
+        lv_obj_set_size(row, SLOT_W[i], SLOT_H[i]);
+        lv_obj_align(row, LV_ALIGN_TOP_MID, 0, SLOT_Y[i]);
+        lv_obj_set_style_radius(row, SLOT_H[i] / 2, 0);
+        lv_obj_set_style_bg_color(row, hex_to_lv(i == 2 ? 0x141B28 : 0x0A0E15), 0);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(row, i == 2 ? 2 : 1, 0);
+        lv_obj_set_style_border_color(row, hex_to_lv(i == 2 ? 0x38BDF8 : 0x151D2A), 0);
+        lv_obj_set_style_pad_all(row, 0, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, speaker_slot_event_cb, LV_EVENT_ALL, NULL);
 
-    // Bottom buttons on Speaker sheet: [Rescan] [Done] [Wi-Fi / Web]
-    lv_obj_t *sp_scan = lv_btn_create(p2);
-    lv_obj_set_size(sp_scan, 76, 30);
-    lv_obj_align(sp_scan, LV_ALIGN_BOTTOM_MID, -82, -22);
-    lv_obj_set_style_radius(sp_scan, 15, 0);
-    lv_obj_set_style_bg_color(sp_scan, hex_to_lv(0x0F141D), 0);
-    lv_obj_t *sl = lv_label_create(sp_scan);
-    lv_label_set_text(sl, "Rescan");
-    lv_obj_set_style_text_font(sl, &lv_font_montserrat_12, 0);
-    lv_obj_center(sl);
+        lv_obj_t *dot = lv_obj_create(row);
+        lv_obj_set_size(dot, 6, i == 2 ? 22 : 16);
+        lv_obj_set_style_radius(dot, 3, 0);
+        lv_obj_set_style_bg_color(dot, hex_to_lv(0x38BDF8), 0);
+        lv_obj_set_style_border_width(dot, 0, 0);
+        lv_obj_align(dot, LV_ALIGN_LEFT_MID, 12, 0);
+        lv_obj_clear_flag(dot, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *title = lv_label_create(row);
+        lv_obj_set_style_text_font(title, i == 2 ? &lv_font_montserrat_16 : &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(title, hex_to_lv(0xFFFFFF), 0);
+        lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
+        lv_obj_set_size(title, SLOT_W[i] - 104, i == 2 ? 20 : 18);
+        lv_obj_align(title, LV_ALIGN_LEFT_MID, 26, 0);
+
+        lv_obj_t *tag = lv_label_create(row);
+        lv_obj_set_style_text_font(tag, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(tag, hex_to_lv(0x38BDF8), 0);
+        lv_label_set_long_mode(tag, LV_LABEL_LONG_CLIP);
+        lv_obj_set_size(tag, 66, 16);
+        lv_obj_set_style_text_align(tag, LV_TEXT_ALIGN_RIGHT, 0);
+        lv_obj_align(tag, LV_ALIGN_RIGHT_MID, -12, 0);
+
+        s_sp_slots[i] = row;
+        s_sp_dots[i] = dot;
+        s_sp_titles[i] = title;
+        s_sp_tags[i] = tag;
+    }
+
+    // Bottom buttons on Speaker sheet (y = 274): [Rescan] [Connect] [Wi-Fi]
+    lv_obj_t *sp_scan = create_pill_btn(p2, 70, 32, 0x0F141D, 0x1E293B, "Rescan", 0xCBD5E1);
+    lv_obj_align(sp_scan, LV_ALIGN_TOP_MID, -78, 274);
     lv_obj_add_event_cb(sp_scan, [](lv_event_t *e) {
         (void)e;
         haptic_play_effect(HAPTIC_SHARP_CLICK);
@@ -887,35 +1055,23 @@ void knob_ui_init(void) {
         if (s_lbl_spkr_hdr) lv_label_set_text(s_lbl_spkr_hdr, "SCANNING AIRPLAY...");
     }, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t *sp_done = lv_btn_create(p2);
-    lv_obj_set_size(sp_done, 76, 30);
-    lv_obj_align(sp_done, LV_ALIGN_BOTTOM_MID, 0, -22);
-    lv_obj_set_style_radius(sp_done, 15, 0);
-    lv_obj_set_style_bg_color(sp_done, hex_to_lv(0x161B26), 0);
-    lv_obj_t *dl = lv_label_create(sp_done);
-    lv_label_set_text(dl, "Done");
-    lv_obj_set_style_text_font(dl, &lv_font_montserrat_12, 0);
-    lv_obj_center(dl);
-    lv_obj_add_event_cb(sp_done, [](lv_event_t *e) {
+    lv_obj_t *sp_conn = create_pill_btn(p2, 78, 32, 0x38BDF8, 0x38BDF8, "Connect", 0x050608);
+    lv_obj_align(sp_conn, LV_ALIGN_TOP_MID, 0, 274);
+    lv_obj_add_event_cb(sp_conn, [](lv_event_t *e) {
         (void)e;
+        haptic_play_effect(HAPTIC_DOUBLE_CLICK);
+        app_select_speaker(s_speaker_cursor);
         switch_tab(TAB_NOW_PLAYING);
     }, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t *sp_wifi = lv_btn_create(p2);
-    lv_obj_set_size(sp_wifi, 76, 30);
-    lv_obj_align(sp_wifi, LV_ALIGN_BOTTOM_MID, 82, -22);
-    lv_obj_set_style_radius(sp_wifi, 15, 0);
-    lv_obj_set_style_bg_color(sp_wifi, hex_to_lv(0x0F141D), 0);
-    lv_obj_t *wl = lv_label_create(sp_wifi);
-    lv_label_set_text(wl, LV_SYMBOL_WIFI " Info");
-    lv_obj_set_style_text_font(wl, &lv_font_montserrat_12, 0);
-    lv_obj_center(wl);
+    lv_obj_t *sp_wifi = create_pill_btn(p2, 70, 32, 0x0F141D, 0x1E293B, LV_SYMBOL_WIFI " Info", 0xCBD5E1);
+    lv_obj_align(sp_wifi, LV_ALIGN_TOP_MID, 78, 274);
     lv_obj_add_event_cb(sp_wifi, [](lv_event_t *e) {
         (void)e;
         switch_tab(TAB_WIFI);
     }, LV_EVENT_CLICKED, NULL);
 
-    rebuild_speaker_list();
+    update_speaker_wheel(true);
 
     // =========================================================================
     // PAGE 3: WI-FI, WEB UI QR & OTA INFO SHEET
@@ -926,21 +1082,21 @@ void knob_ui_init(void) {
     lv_label_set_text(s_lbl_wifi_ssid, LV_SYMBOL_WIFI " SvensHaus");
     lv_obj_set_style_text_font(s_lbl_wifi_ssid, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(s_lbl_wifi_ssid, hex_to_lv(0xF8FAFC), 0);
-    lv_obj_align(s_lbl_wifi_ssid, LV_ALIGN_TOP_MID, 0, 22);
+    lv_obj_align(s_lbl_wifi_ssid, LV_ALIGN_TOP_MID, 0, 26);
 
     s_lbl_wifi_ip = lv_label_create(p3);
     lv_label_set_text(s_lbl_wifi_ip, "http://airplayknob.local/");
     lv_obj_set_style_text_font(s_lbl_wifi_ip, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(s_lbl_wifi_ip, hex_to_lv(0x38BDF8), 0);
-    lv_obj_align(s_lbl_wifi_ip, LV_ALIGN_TOP_MID, 0, 44);
+    lv_obj_align(s_lbl_wifi_ip, LV_ALIGN_TOP_MID, 0, 48);
 
     lv_obj_t *qr_card = lv_obj_create(p3);
-    lv_obj_set_size(qr_card, 128, 128);
-    lv_obj_align(qr_card, LV_ALIGN_TOP_MID, 0, 72);
-    lv_obj_set_style_radius(qr_card, 14, 0);
+    lv_obj_set_size(qr_card, 132, 132);
+    lv_obj_align(qr_card, LV_ALIGN_TOP_MID, 0, 74);
+    lv_obj_set_style_radius(qr_card, 16, 0);
     lv_obj_set_style_bg_color(qr_card, hex_to_lv(0xFFFFFF), 0);
     lv_obj_set_style_border_width(qr_card, 0, 0);
-    lv_obj_set_style_pad_all(qr_card, 6, 0);
+    lv_obj_set_style_pad_all(qr_card, 0, 0);
     lv_obj_clear_flag(qr_card, LV_OBJ_FLAG_SCROLLABLE);
 
     s_qr_code = lv_qrcode_create(qr_card, 114, hex_to_lv(0x050608), hex_to_lv(0xFFFFFF));
@@ -951,28 +1107,14 @@ void knob_ui_init(void) {
     lv_label_set_text(ota_lbl, "Web Presets & OTA Ready");
     lv_obj_set_style_text_font(ota_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(ota_lbl, hex_to_lv(0x64748B), 0);
-    lv_obj_align(ota_lbl, LV_ALIGN_TOP_MID, 0, 212);
+    lv_obj_align(ota_lbl, LV_ALIGN_TOP_MID, 0, 218);
 
-    lv_obj_t *w_scan_btn = lv_btn_create(p3);
-    lv_obj_set_size(w_scan_btn, 108, 30);
-    lv_obj_align(w_scan_btn, LV_ALIGN_BOTTOM_MID, -60, -24);
-    lv_obj_set_style_radius(w_scan_btn, 15, 0);
-    lv_obj_set_style_bg_color(w_scan_btn, hex_to_lv(0x0F141D), 0);
-    lv_obj_t *wsl = lv_label_create(w_scan_btn);
-    lv_label_set_text(wsl, "Wi-Fi Scan");
-    lv_obj_set_style_text_font(wsl, &lv_font_montserrat_12, 0);
-    lv_obj_center(wsl);
+    lv_obj_t *w_scan_btn = create_pill_btn(p3, 98, 32, 0x0F141D, 0x1E293B, "Wi-Fi Scan", 0xCBD5E1);
+    lv_obj_align(w_scan_btn, LV_ALIGN_TOP_MID, -54, 272);
     lv_obj_add_event_cb(w_scan_btn, open_wifi_scan_modal, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t *w_done_btn = lv_btn_create(p3);
-    lv_obj_set_size(w_done_btn, 92, 30);
-    lv_obj_align(w_done_btn, LV_ALIGN_BOTTOM_MID, 54, -24);
-    lv_obj_set_style_radius(w_done_btn, 15, 0);
-    lv_obj_set_style_bg_color(w_done_btn, hex_to_lv(0x161B26), 0);
-    lv_obj_t *wdl = lv_label_create(w_done_btn);
-    lv_label_set_text(wdl, "Done");
-    lv_obj_set_style_text_font(wdl, &lv_font_montserrat_12, 0);
-    lv_obj_center(wdl);
+    lv_obj_t *w_done_btn = create_pill_btn(p3, 88, 32, 0x161B26, 0x334155, "Done", 0xF8FAFC);
+    lv_obj_align(w_done_btn, LV_ALIGN_TOP_MID, 52, 272);
     lv_obj_add_event_cb(w_done_btn, [](lv_event_t *e) {
         (void)e;
         switch_tab(TAB_NOW_PLAYING);
@@ -1006,7 +1148,6 @@ void knob_ui_init(void) {
         (void)e;
         lv_point_t pt;
         lv_indev_get_point(lv_indev_get_act(), &pt);
-        // Tapping top half cycles WhiteCap visual preset; tapping lower half exits to Now Playing
         if (pt.y < 140) {
             int next_p = 0;
             if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
@@ -1023,14 +1164,14 @@ void knob_ui_init(void) {
     }, LV_EVENT_CLICKED, NULL);
 
     s_wc_caption_box = lv_obj_create(s_wc_layer);
-    lv_obj_set_size(s_wc_caption_box, 256, 48);
-    lv_obj_align(s_wc_caption_box, LV_ALIGN_BOTTOM_MID, 0, -24);
-    lv_obj_set_style_radius(s_wc_caption_box, 24, 0);
+    lv_obj_set_size(s_wc_caption_box, 256, 52);
+    lv_obj_align(s_wc_caption_box, LV_ALIGN_TOP_MID, 0, 268);
+    lv_obj_set_style_radius(s_wc_caption_box, 26, 0);
     lv_obj_set_style_bg_color(s_wc_caption_box, hex_to_lv(0x050608), 0);
-    lv_obj_set_style_bg_opa(s_wc_caption_box, LV_OPA_70, 0);
+    lv_obj_set_style_bg_opa(s_wc_caption_box, LV_OPA_90, 0);
     lv_obj_set_style_border_width(s_wc_caption_box, 1, 0);
     lv_obj_set_style_border_color(s_wc_caption_box, hex_to_lv(0x1E293B), 0);
-    lv_obj_set_style_pad_all(s_wc_caption_box, 4, 0);
+    lv_obj_set_style_pad_all(s_wc_caption_box, 0, 0);
     lv_obj_clear_flag(s_wc_caption_box, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
 
     s_wc_lbl_track = lv_label_create(s_wc_caption_box);
@@ -1038,44 +1179,50 @@ void knob_ui_init(void) {
     lv_obj_set_style_text_font(s_wc_lbl_track, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(s_wc_lbl_track, hex_to_lv(0xF8FAFC), 0);
     lv_label_set_long_mode(s_wc_lbl_track, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(s_wc_lbl_track, 232);
+    lv_obj_set_size(s_wc_lbl_track, 228, 18);
     lv_obj_set_style_text_align(s_wc_lbl_track, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(s_wc_lbl_track, LV_ALIGN_TOP_MID, 0, 2);
+    lv_obj_align(s_wc_lbl_track, LV_ALIGN_TOP_MID, 0, 8);
 
     s_wc_lbl_sub = lv_label_create(s_wc_caption_box);
     lv_label_set_text(s_wc_lbl_sub, WHITECAP_PRESET_NAMES[0]);
     lv_obj_set_style_text_font(s_wc_lbl_sub, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(s_wc_lbl_sub, hex_to_lv(0x94A3B8), 0);
-    lv_obj_align(s_wc_lbl_sub, LV_ALIGN_BOTTOM_MID, 0, -2);
+    lv_label_set_long_mode(s_wc_lbl_sub, LV_LABEL_LONG_DOT);
+    lv_obj_set_size(s_wc_lbl_sub, 228, 16);
+    lv_obj_set_style_text_align(s_wc_lbl_sub, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_wc_lbl_sub, LV_ALIGN_TOP_MID, 0, 28);
 
     // =========================================================================
-    // MINIMALIST FLOATING HUD PILL (Volume / Station Scrub / Speaker Scrub)
+    // MINIMALIST FLOATING HUD PILL (Opaque cover over dock area when turning knob)
     // =========================================================================
     s_hud_pill = lv_obj_create(s_scr);
-    lv_obj_set_size(s_hud_pill, 224, 52);
-    lv_obj_align(s_hud_pill, LV_ALIGN_BOTTOM_MID, 0, -24);
-    lv_obj_set_style_radius(s_hud_pill, 26, 0);
+    lv_obj_set_size(s_hud_pill, 232, 54);
+    lv_obj_align(s_hud_pill, LV_ALIGN_TOP_MID, 0, 264);
+    lv_obj_set_style_radius(s_hud_pill, 27, 0);
     lv_obj_set_style_bg_color(s_hud_pill, hex_to_lv(0x0B0F19), 0);
-    lv_obj_set_style_bg_opa(s_hud_pill, LV_OPA_90, 0);
+    lv_obj_set_style_bg_opa(s_hud_pill, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(s_hud_pill, 1, 0);
     lv_obj_set_style_border_color(s_hud_pill, hex_to_lv(0x10B981), 0);
-    lv_obj_set_style_pad_all(s_hud_pill, 4, 0);
+    lv_obj_set_style_pad_all(s_hud_pill, 0, 0);
     lv_obj_clear_flag(s_hud_pill, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
 
     s_lbl_hud_title = lv_label_create(s_hud_pill);
     lv_label_set_text(s_lbl_hud_title, "VOLUME");
     lv_obj_set_style_text_font(s_lbl_hud_title, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(s_lbl_hud_title, hex_to_lv(0x10B981), 0);
-    lv_obj_align(s_lbl_hud_title, LV_ALIGN_TOP_MID, 0, 2);
+    lv_label_set_long_mode(s_lbl_hud_title, LV_LABEL_LONG_DOT);
+    lv_obj_set_size(s_lbl_hud_title, 196, 16);
+    lv_obj_set_style_text_align(s_lbl_hud_title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_lbl_hud_title, LV_ALIGN_TOP_MID, 0, 7);
 
     s_lbl_hud_val = lv_label_create(s_hud_pill);
-    lv_label_set_text(s_lbl_hud_val, "65%");
+    lv_label_set_text(s_lbl_hud_val, "18%");
     lv_obj_set_style_text_font(s_lbl_hud_val, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(s_lbl_hud_val, hex_to_lv(0xFFFFFF), 0);
     lv_label_set_long_mode(s_lbl_hud_val, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(s_lbl_hud_val, 204);
+    lv_obj_set_size(s_lbl_hud_val, 204, 20);
     lv_obj_set_style_text_align(s_lbl_hud_val, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(s_lbl_hud_val, LV_ALIGN_BOTTOM_MID, 0, -2);
+    lv_obj_align(s_lbl_hud_val, LV_ALIGN_TOP_MID, 0, 26);
 
     lv_obj_add_flag(s_hud_pill, LV_OBJ_FLAG_HIDDEN);
 
@@ -1086,51 +1233,29 @@ void knob_ui_on_rotate(int delta) {
     if (delta == 0) return;
     if (!bsp_lvgl_lock(30)) return;
 
-    // If Stations sheet is open, knob scrolls through stations
-    if (s_active_tab == TAB_STATIONS && s_station_rendered_count > 0) {
-        int next = s_station_cursor + (delta > 0 ? 1 : -1);
-        if (next < 0) next = 0;
-        if (next >= s_station_rendered_count) next = s_station_rendered_count - 1;
+    // 60 FPS O(1) Virtualized Station Wheel Scroll
+    if (s_active_tab == TAB_STATIONS) {
+        int count = g_app.preset_count > 0 ? g_app.preset_count : 1;
+        s_station_cursor = (s_station_cursor + (delta > 0 ? 1 : -1) + count * 8) % count;
         haptic_play_effect(HAPTIC_LIGHT_TICK);
-
-        if (s_station_items[s_station_cursor]) {
-            lv_obj_set_style_border_width(s_station_items[s_station_cursor], 1, 0);
-            lv_obj_set_style_border_color(s_station_items[s_station_cursor], hex_to_lv(0x1E293B), 0);
-        }
-        s_station_cursor = next;
-        if (s_station_items[s_station_cursor]) {
-            lv_obj_set_style_border_width(s_station_items[s_station_cursor], 2, 0);
-            lv_obj_set_style_border_color(s_station_items[s_station_cursor], hex_to_lv(0x10B981), 0);
-            lv_obj_scroll_to_view(s_station_items[s_station_cursor], LV_ANIM_ON);
-        }
+        update_station_wheel(false);
         bsp_lvgl_unlock();
         return;
     }
 
-    // If Speakers sheet is open, knob scrolls through speakers
-    if (s_active_tab == TAB_SPEAKERS && s_speaker_rendered_count > 0) {
-        int next = s_speaker_cursor + (delta > 0 ? 1 : -1);
-        if (next < 0) next = 0;
-        if (next >= s_speaker_rendered_count) next = s_speaker_rendered_count - 1;
+    // 60 FPS O(1) Virtualized AirPlay Speaker Wheel Scroll
+    if (s_active_tab == TAB_SPEAKERS) {
+        int count = g_app.speaker_count > 0 ? g_app.speaker_count : 1;
+        s_speaker_cursor = (s_speaker_cursor + (delta > 0 ? 1 : -1) + count * 8) % count;
         haptic_play_effect(HAPTIC_LIGHT_TICK);
-
-        if (s_speaker_items[s_speaker_cursor]) {
-            lv_obj_set_style_border_width(s_speaker_items[s_speaker_cursor], 1, 0);
-            lv_obj_set_style_border_color(s_speaker_items[s_speaker_cursor], hex_to_lv(0x1E293B), 0);
-        }
-        s_speaker_cursor = next;
-        if (s_speaker_items[s_speaker_cursor]) {
-            lv_obj_set_style_border_width(s_speaker_items[s_speaker_cursor], 2, 0);
-            lv_obj_set_style_border_color(s_speaker_items[s_speaker_cursor], hex_to_lv(0x38BDF8), 0);
-            lv_obj_scroll_to_view(s_speaker_items[s_speaker_cursor], LV_ANIM_ON);
-        }
+        update_speaker_wheel(false);
         bsp_lvgl_unlock();
         return;
     }
 
     // Now Playing or WhiteCap Visualizer: Volume / Station Tuner / Speaker Selector
     KnobMode mode = KNOB_MODE_VOLUME;
-    int vol = 65;
+    int vol = 18;
     int p_cnt = 1, p_preview = 0;
     int s_cnt = 1, s_preview = 0;
     StationPreset preview_st = {};
@@ -1230,7 +1355,7 @@ void knob_ui_tick(void) {
     StationPreset cur_st = {};
     AirPlaySpeaker cur_sp = {};
     bool playing = false;
-    int vol = 65;
+    int vol = 18;
     char raw_track[128] = {0};
     uint8_t vu[12] = {0};
     uint8_t peak = 0;
@@ -1282,14 +1407,14 @@ void knob_ui_tick(void) {
         return;
     }
 
-    // Refresh Speakers list automatically when mDNS scan finishes
+    // Refresh Speakers wheel automatically when mDNS scan finishes
     static bool prev_spk_scanning = false;
     static int prev_spk_count = 1;
-    if ((prev_spk_scanning && !spk_scanning) || (spk_count != prev_spk_count)) {
+    if ((prev_spk_scanning != spk_scanning) || (spk_count != prev_spk_count)) {
         prev_spk_scanning = spk_scanning;
         prev_spk_count = spk_count;
         if (s_active_tab == TAB_SPEAKERS) {
-            rebuild_speaker_list();
+            update_speaker_wheel(false);
         }
     }
 
@@ -1303,7 +1428,7 @@ void knob_ui_tick(void) {
 
     uint32_t theme_col = cur_st.color ? cur_st.color : 0x10B981;
     lv_obj_set_style_arc_color(s_outer_arc, hex_to_lv(theme_col), LV_PART_INDICATOR);
-    lv_obj_set_style_shadow_color(s_art_cont, hex_to_lv(theme_col), 0);
+    lv_obj_set_style_border_color(s_art_cont, hex_to_lv(theme_col), 0);
 
     if (playing) lv_obj_add_flag(s_pause_badge, LV_OBJ_FLAG_HIDDEN);
     else         lv_obj_clear_flag(s_pause_badge, LV_OBJ_FLAG_HIDDEN);
@@ -1333,18 +1458,17 @@ void knob_ui_tick(void) {
         lv_obj_set_style_text_color(s_lbl_sub_meta, hex_to_lv(theme_col), 0);
     }
 
-    if (s_hud_hide_ms == 0) {
+    if (s_active_tab == TAB_NOW_PLAYING && s_hud_hide_ms == 0) {
         lv_arc_set_range(s_outer_arc, 0, 100);
         lv_arc_set_value(s_outer_arc, vol);
     }
 
-    // Update Full-Screen WhiteCap Visualizer if active
+    // Update Full-Screen WhiteCap Visualizer if active (~50 FPS)
     if (wc_active && s_wc_layer) {
         if (lv_obj_has_flag(s_wc_layer, LV_OBJ_FLAG_HIDDEN)) {
             lv_obj_clear_flag(s_wc_layer, LV_OBJ_FLAG_HIDDEN);
             lv_obj_move_foreground(s_wc_layer);
         }
-        // Auto-morph WhiteCap preset every 16 seconds
         if (now_ms - s_wc_last_morph_ms >= 16000) {
             s_wc_last_morph_ms = now_ms;
             if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -1353,7 +1477,7 @@ void knob_ui_tick(void) {
                 xSemaphoreGive(g_app.mutex);
             }
         }
-        if (now_ms - s_wc_last_frame_ms >= 28) {
+        if (now_ms - s_wc_last_frame_ms >= 20) {
             s_wc_last_frame_ms = now_ms;
             render_whitecap_frame(wl, wr, vu, peak, wc_preset);
             lv_obj_invalidate(s_wc_img);
@@ -1393,11 +1517,12 @@ void knob_ui_tick(void) {
                 lv_obj_t *b = lv_btn_create(s_wifi_list);
                 lv_obj_set_size(b, 256, 36);
                 lv_obj_set_style_bg_color(b, hex_to_lv(0x161B26), 0);
+                lv_obj_set_style_pad_all(b, 0, 0);
                 lv_obj_add_event_cb(b, wifi_ssid_click_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
                 lv_obj_t *l = lv_label_create(b);
                 lv_label_set_text_fmt(l, "%s (%ld dBm)", items[i].ssid, (long)items[i].rssi);
                 lv_obj_set_style_text_font(l, &lv_font_montserrat_12, 0);
-                lv_obj_align(l, LV_ALIGN_LEFT_MID, 6, 0);
+                lv_obj_align(l, LV_ALIGN_LEFT_MID, 10, 0);
             }
         }
         last_scanning = cur_scanning;

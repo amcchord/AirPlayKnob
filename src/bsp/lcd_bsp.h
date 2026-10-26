@@ -23,6 +23,7 @@ extern "C" {
 void lcd_lvgl_Init(void);
 bool bsp_lvgl_lock(int timeout_ms);
 void bsp_lvgl_unlock(void);
+const uint16_t *bsp_get_screen_fb(void);
 
 #ifdef __cplusplus
 }

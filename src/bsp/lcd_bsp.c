@@ -8,6 +8,7 @@ static SemaphoreHandle_t lvgl_mux = NULL;
 #define LCD_HOST SPI2_HOST
 
 static esp_lcd_panel_io_handle_t amoled_panel_io_handle = NULL;
+static uint16_t *s_screen_fb = NULL; // 360x360 live screen mirror in PSRAM (right-side up RGB565_SWAPPED)
 
 static void example_increase_lvgl_tick(void *arg);
 static bool example_notify_lvgl_flush_ready(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_io_event_data_t *edata, void *user_ctx);
@@ -244,9 +245,16 @@ void lcd_lvgl_Init(void) {
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_init(panel_handle));
 
     lv_init();
-    lv_color_t *buf1 = (lv_color_t *)heap_caps_malloc(EXAMPLE_LCD_H_RES * 20 * sizeof(lv_color_t), MALLOC_CAP_DMA);
+
+    // Allocate 360x360 screen mirror in PSRAM for zero-overhead screenshots
+    s_screen_fb = (uint16_t *)heap_caps_calloc(EXAMPLE_LCD_H_RES * EXAMPLE_LCD_V_RES, sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+    // Double-buffered 30-row internal DMA draw buffers for parallel CPU render + QSPI DMA flush at 60 FPS
+    const uint32_t buf_pixels = EXAMPLE_LCD_H_RES * EXAMPLE_LVGL_BUF_HEIGHT;
+    lv_color_t *buf1 = (lv_color_t *)heap_caps_malloc(buf_pixels * sizeof(lv_color_t), MALLOC_CAP_DMA);
+    lv_color_t *buf2 = (lv_color_t *)heap_caps_malloc(buf_pixels * sizeof(lv_color_t), MALLOC_CAP_DMA);
     assert(buf1);
-    lv_disp_draw_buf_init(&disp_buf, buf1, NULL, EXAMPLE_LCD_H_RES * 20);
+    lv_disp_draw_buf_init(&disp_buf, buf1, buf2, buf_pixels);
     lv_disp_drv_init(&disp_drv);
     disp_drv.hor_res = EXAMPLE_LCD_H_RES;
     disp_drv.ver_res = EXAMPLE_LCD_V_RES;
@@ -254,8 +262,8 @@ void lcd_lvgl_Init(void) {
     disp_drv.rounder_cb = example_lvgl_rounder_cb;
     disp_drv.draw_buf = &disp_buf;
     disp_drv.user_data = panel_handle;
-    disp_drv.sw_rotate = 1;
-    disp_drv.rotated = LV_DISP_ROT_180;
+    disp_drv.sw_rotate = 0;
+    disp_drv.rotated = LV_DISP_ROT_NONE;
     lv_disp_t *disp = lv_disp_drv_register(&disp_drv);
 
     static lv_indev_drv_t indev_drv;
@@ -315,23 +323,62 @@ static bool example_notify_lvgl_flush_ready(esp_lcd_panel_io_handle_t panel_io, 
     return false;
 }
 
+const uint16_t *bsp_get_screen_fb(void) {
+    return s_screen_fb;
+}
+
 static void example_lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map) {
     esp_lcd_panel_handle_t panel_handle = (esp_lcd_panel_handle_t)drv->user_data;
-    esp_lcd_panel_draw_bitmap(panel_handle, area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_map);
+    const int w = area->x2 - area->x1 + 1;
+    const int h = area->y2 - area->y1 + 1;
+    const uint32_t total = (uint32_t)w * (uint32_t)h;
+
+    // Save right-side-up pixels into PSRAM screen mirror for screenshots
+    if (s_screen_fb && area->x1 == 0 && w == EXAMPLE_LCD_H_RES) {
+        memcpy(&s_screen_fb[area->y1 * EXAMPLE_LCD_H_RES], color_map, total * sizeof(uint16_t));
+    } else if (s_screen_fb) {
+        const uint16_t *src = (const uint16_t *)color_map;
+        for (int y = area->y1; y <= area->y2; y++) {
+            memcpy(&s_screen_fb[y * EXAMPLE_LCD_H_RES + area->x1], src, w * sizeof(uint16_t));
+            src += w;
+        }
+    }
+
+    // Fast in-place 180-degree pixel reversal (USB-C port at top orientation)
+    uint16_t *p = (uint16_t *)color_map;
+    for (uint32_t i = 0, j = total - 1; i < j; i++, j--) {
+        uint16_t tmp = p[i];
+        p[i] = p[j];
+        p[j] = tmp;
+    }
+
+    const int rx1 = (EXAMPLE_LCD_H_RES - 1) - area->x2;
+    const int ry1 = (EXAMPLE_LCD_V_RES - 1) - area->y2;
+    const int rx2 = (EXAMPLE_LCD_H_RES - 1) - area->x1;
+    const int ry2 = (EXAMPLE_LCD_V_RES - 1) - area->y1;
+
+    esp_lcd_panel_draw_bitmap(panel_handle, rx1, ry1, rx2 + 1, ry2 + 1, color_map);
 }
 
 static void example_lvgl_rounder_cb(struct _lv_disp_drv_t *disp_drv, lv_area_t *area) {
-    area->x1 = (area->x1 >> 1) << 1;
-    area->y1 = (area->y1 >> 1) << 1;
-    area->x2 = ((area->x2 >> 1) << 1) + 1;
-    area->y2 = ((area->y2 >> 1) << 1) + 1;
+    (void)disp_drv;
+    // Always round to full-width even-row horizontal bands so sub_area chunks
+    // are guaranteed to have even x1/y1 and odd x2/y2 for SH8601 CASET/RASET.
+    area->x1 = 0;
+    area->x2 = EXAMPLE_LCD_H_RES - 1;
+    area->y1 = area->y1 & ~1;
+    area->y2 = area->y2 | 1;
 }
 
 static void example_lvgl_touch_cb(lv_indev_drv_t *drv, lv_indev_data_t *data) {
+    (void)drv;
     uint16_t tp_x, tp_y;
     if (getTouch(&tp_x, &tp_y)) {
-        data->point.x = (tp_x > EXAMPLE_LCD_H_RES) ? EXAMPLE_LCD_H_RES : tp_x;
-        data->point.y = (tp_y > EXAMPLE_LCD_V_RES) ? EXAMPLE_LCD_V_RES : tp_y;
+        if (tp_x >= EXAMPLE_LCD_H_RES) tp_x = EXAMPLE_LCD_H_RES - 1;
+        if (tp_y >= EXAMPLE_LCD_V_RES) tp_y = EXAMPLE_LCD_V_RES - 1;
+        // 180-degree rotated touch coordinates (USB-C port at top)
+        data->point.x = (EXAMPLE_LCD_H_RES - 1) - tp_x;
+        data->point.y = (EXAMPLE_LCD_V_RES - 1) - tp_y;
         data->state = LV_INDEV_STATE_PRESSED;
     } else {
         data->state = LV_INDEV_STATE_RELEASED;

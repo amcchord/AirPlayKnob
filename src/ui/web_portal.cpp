@@ -1,8 +1,11 @@
 #include "web_portal.h"
 #include "app_state.h"
+#include "knob_ui.h"
+#include "bsp/lcd_bsp.h"
 #include "bsp/cst816.h"
 #include "bsp/lcd_config.h"
 #include <Arduino.h>
+#include <WiFi.h>
 #include <WebServer.h>
 #include <Update.h>
 
@@ -624,7 +627,78 @@ static void handle_control() {
             xSemaphoreGive(g_app.mutex);
         }
     }
+    int tab = extract_json_int(body, "tab", -1);
+    if (tab >= 0 && tab <= 3) {
+        knob_ui_set_tab(tab);
+    }
+    int rot = extract_json_int(body, "rotate", 0);
+    if (rot != 0) {
+        knob_ui_on_rotate(rot);
+    }
     s_server.send(200, "application/json", "{\"ok\":true}");
+}
+
+static void handle_screenshot_bmp() {
+    const uint16_t *fb = bsp_get_screen_fb();
+    if (!fb) {
+        s_server.send(500, "text/plain", "No framebuffer");
+        return;
+    }
+
+    const int w = EXAMPLE_LCD_H_RES;
+    const int h = EXAMPLE_LCD_V_RES;
+    const uint32_t row_bytes = w * 3;
+    const uint32_t img_bytes = row_bytes * h;
+    const uint32_t file_size = 54 + img_bytes;
+
+    uint8_t hdr[54] = {0};
+    hdr[0] = 'B'; hdr[1] = 'M';
+    hdr[2] = (uint8_t)(file_size);
+    hdr[3] = (uint8_t)(file_size >> 8);
+    hdr[4] = (uint8_t)(file_size >> 16);
+    hdr[5] = (uint8_t)(file_size >> 24);
+    hdr[10] = 54;
+    hdr[14] = 40;
+    hdr[18] = (uint8_t)(w);
+    hdr[19] = (uint8_t)(w >> 8);
+    // Negative height (-360) for top-down BMP
+    int32_t neg_h = -h;
+    hdr[22] = (uint8_t)(neg_h);
+    hdr[23] = (uint8_t)(neg_h >> 8);
+    hdr[24] = (uint8_t)(neg_h >> 16);
+    hdr[25] = (uint8_t)(neg_h >> 24);
+    hdr[26] = 1;
+    hdr[28] = 24; // 24-bit BGR
+
+    WiFiClient client = s_server.client();
+    client.print("HTTP/1.1 200 OK\r\nContent-Type: image/bmp\r\nContent-Length: ");
+    client.print(file_size);
+    client.print("\r\nConnection: close\r\n\r\n");
+    client.write(hdr, 54);
+
+    uint8_t *row_buf = (uint8_t *)malloc(row_bytes * 4);
+    if (row_buf) {
+        for (int y = 0; y < h; y += 4) {
+            int lines = (y + 4 <= h) ? 4 : (h - y);
+            uint8_t *dst = row_buf;
+            for (int ly = 0; ly < lines; ly++) {
+                const uint16_t *src = &fb[(y + ly) * w];
+                for (int x = 0; x < w; x++) {
+                    uint16_t sw = src[x];
+                    uint16_t rgb565 = (sw >> 8) | (sw << 8);
+                    uint8_t r = ((rgb565 >> 11) & 0x1F) * 255 / 31;
+                    uint8_t g = ((rgb565 >> 5)  & 0x3F) * 255 / 63;
+                    uint8_t b = ( rgb565        & 0x1F) * 255 / 31;
+                    *dst++ = b;
+                    *dst++ = g;
+                    *dst++ = r;
+                }
+            }
+            client.write(row_buf, row_bytes * lines);
+        }
+        free(row_buf);
+    }
+    client.stop();
 }
 
 static void handle_presets() {
@@ -728,6 +802,7 @@ static void handle_ota_upload() {
 void web_portal_start(void) {
     s_server.on("/", HTTP_GET, handle_root);
     s_server.on("/api/status", HTTP_GET, handle_status);
+    s_server.on("/api/screenshot.bmp", HTTP_GET, handle_screenshot_bmp);
     s_server.on("/api/control", HTTP_POST, handle_control);
     s_server.on("/api/presets", HTTP_POST, handle_presets);
     s_server.on("/api/wifi", HTTP_POST, handle_wifi);
