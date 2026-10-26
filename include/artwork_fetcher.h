@@ -3,7 +3,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define ARTWORK_SIZE 156
+#define ARTWORK_SIZE 360
 
 void artwork_fetcher_start(void);
 const lv_img_dsc_t *artwork_get_dsc(void);

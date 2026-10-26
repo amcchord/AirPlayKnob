@@ -10,3 +10,4 @@ void knob_ui_tick(void);
 void knob_ui_set_tab(int tab);
 int  knob_ui_get_tab(void);
 void knob_ui_set_whitecap(bool visible);
+void knob_ui_on_swipe(int dir);

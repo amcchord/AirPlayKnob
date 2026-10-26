@@ -8,7 +8,7 @@
 #include <extra/libs/sjpg/tjpgd.h>
 #include <math.h>
 
-#define MAX_JPG_DIM 200
+#define MAX_JPG_DIM 300
 
 static lv_color_t *s_art_pixels = NULL;
 static lv_color_t *s_station_cache_pixels = NULL;
@@ -56,102 +56,68 @@ static int tjpg_output_cb(JDEC *jd, void *bitmap, JRECT *rect) {
     return 1;
 }
 
-// Signed distance to rounded box centered at (cx, cy) with half-size (hw, hh) and corner radius r
-static inline float sd_rounded_box(float px, float py, float hw, float hh, float r) {
-    float qx = fabsf(px) - hw + r;
-    float qy = fabsf(py) - hh + r;
-    float ox = fmaxf(qx, 0.0f);
-    float oy = fmaxf(qy, 0.0f);
-    return sqrtf(ox * ox + oy * oy) + fminf(fmaxf(qx, qy), 0.0f) - r;
-}
-
-// Applies anti-aliased rounded corners (radius 22px) + subtle 1px border over #050608
-static void apply_rounded_frame(lv_color_t *buf, uint32_t accent_hex) {
-    const float half = (ARTWORK_SIZE - 1) * 0.5f;
-    const float radius = 22.0f;
-    uint8_t ar = (accent_hex >> 16) & 0xFF;
-    uint8_t ag = (accent_hex >> 8) & 0xFF;
-    uint8_t ab = accent_hex & 0xFF;
-
-    for (int y = 0; y < ARTWORK_SIZE; y++) {
-        for (int x = 0; x < ARTWORK_SIZE; x++) {
-            float d = sd_rounded_box((float)x - half, (float)y - half, half, half, radius);
-            if (d > 0.6f) {
-                // Outside rounded card -> background #050608
-                buf[y * ARTWORK_SIZE + x] = lv_color_make(5, 6, 8);
-            } else if (d > -1.2f) {
-                // Subtle anti-aliased border ring
-                float t = (0.6f - d) / 1.8f;
-                if (t < 0.0f) t = 0.0f;
-                if (t > 1.0f) t = 1.0f;
-                uint8_t br = (uint8_t)(5 + (ar * 0.45f) * t);
-                uint8_t bg = (uint8_t)(6 + (ag * 0.45f) * t);
-                uint8_t bb = (uint8_t)(8 + (ab * 0.45f) * t);
-                buf[y * ARTWORK_SIZE + x] = lv_color_make(br, bg, bb);
-            }
-        }
-    }
-}
-
-// Renders bespoke geometric SomaFM stream art into `dst` (156x156)
+// Renders full-screen 360x360 bespoke geometric SomaFM stream art into `dst`
 static void render_procedural_stream_art(lv_color_t *dst, const StationPreset &st) {
     uint32_t col = st.color ? st.color : 0x10B981;
     uint8_t cr = (col >> 16) & 0xFF;
     uint8_t cg = (col >> 8) & 0xFF;
     uint8_t cb = col & 0xFF;
 
-    // Seed from station ID for distinct geometric motif per SomaFM station
     uint32_t seed = 0;
     for (const char *p = st.id; *p; p++) seed = seed * 31 + (uint8_t)(*p);
-    int rings = 3 + (seed % 4);
+    int rings = 4 + (seed % 4);
     float freq = 3.0f + (seed % 5);
     float phase = (seed % 360) * 0.017453f;
 
     const float cx = (ARTWORK_SIZE - 1) * 0.5f;
-    const float cy = (ARTWORK_SIZE - 1) * 0.5f;
+    const float cy = 148.0f; // Slightly above center so bottom overlay text frames the emblem
 
     for (int y = 0; y < ARTWORK_SIZE; y++) {
+        // Bottom scrim factor for y = 185..359 so bottom track/station text is ultra-legible
+        float scrim = 1.0f;
+        if (y > 180) {
+            float t = (float)(y - 180) / 115.0f;
+            if (t > 1.0f) t = 1.0f;
+            scrim = 1.0f - 0.86f * (t * t);
+        }
+
         for (int x = 0; x < ARTWORK_SIZE; x++) {
             float dx = (float)x - cx;
             float dy = (float)y - cy;
             float dist = sqrtf(dx * dx + dy * dy);
             float ang = atan2f(dy, dx);
 
-            // Deep radial gradient
-            float norm_d = dist / 105.0f;
+            float norm_d = dist / 210.0f;
             if (norm_d > 1.0f) norm_d = 1.0f;
             float glow = (1.0f - norm_d) * (1.0f - norm_d);
 
-            float r = 10.0f + cr * 0.38f * glow;
-            float g = 12.0f + cg * 0.38f * glow;
-            float b = 18.0f + cb * 0.38f * glow;
+            float r = 8.0f + cr * 0.42f * glow;
+            float g = 10.0f + cg * 0.42f * glow;
+            float b = 16.0f + cb * 0.42f * glow;
 
-            // Harmonic wave ring emblem in center
-            float wave_r = 38.0f + 8.0f * sinf(ang * freq + phase) + 4.0f * cosf(ang * (freq - 1.0f));
+            float wave_r = 72.0f + 16.0f * sinf(ang * freq + phase) + 8.0f * cosf(ang * (freq - 1.0f));
             float ring_d = fabsf(dist - wave_r);
-            if (ring_d < 2.2f) {
-                float k = (2.2f - ring_d) / 2.2f;
-                r += (cr - r + 55.0f) * k;
-                g += (cg - g + 55.0f) * k;
-                b += (cb - b + 55.0f) * k;
+            if (ring_d < 3.2f) {
+                float k = (3.2f - ring_d) / 3.2f;
+                r += (cr - r + 65.0f) * k;
+                g += (cg - g + 65.0f) * k;
+                b += (cb - b + 65.0f) * k;
             }
 
-            // Concentric orbital rings
             for (int i = 1; i <= rings; i++) {
-                float rad = 16.0f * i;
+                float rad = 28.0f * i;
                 float od = fabsf(dist - rad);
-                if (od < 1.1f) {
-                    float k = (1.1f - od) * 0.65f;
+                if (od < 1.5f) {
+                    float k = (1.5f - od) * 0.55f;
                     r += cr * k;
                     g += cg * k;
                     b += cb * k;
                 }
             }
 
-            // Subtle vinyl / scanline texture
-            if (((int)dist & 3) == 0 && dist < 64.0f) {
-                r *= 0.94f; g *= 0.94f; b *= 0.94f;
-            }
+            r = r * scrim + 4.0f * (1.0f - scrim);
+            g = g * scrim + 5.0f * (1.0f - scrim);
+            b = b * scrim + 8.0f * (1.0f - scrim);
 
             if (r > 255.0f) r = 255.0f;
             if (g > 255.0f) g = 255.0f;
@@ -159,10 +125,10 @@ static void render_procedural_stream_art(lv_color_t *dst, const StationPreset &s
             dst[y * ARTWORK_SIZE + x] = lv_color_make((uint8_t)r, (uint8_t)g, (uint8_t)b);
         }
     }
-    apply_rounded_frame(dst, col);
 }
 
 static bool decode_jpeg_to_artwork(const uint8_t *jpg_data, size_t jpg_len, lv_color_t *dst, uint32_t accent_col) {
+    (void)accent_col;
     void *work = heap_caps_malloc(3800, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!work) return false;
 
@@ -202,12 +168,20 @@ static bool decode_jpeg_to_artwork(const uint8_t *jpg_data, size_t jpg_len, lv_c
         return false;
     }
 
-    // Bilinear resample from (sw x sh) to (ARTWORK_SIZE x ARTWORK_SIZE)
+    // Bilinear resample from (sw x sh) to full-screen 360x360 with bottom vignette scrim
     for (int y = 0; y < ARTWORK_SIZE; y++) {
         float fy = ((float)y * (sw > 1 ? (sh - 1) : 0)) / (float)(ARTWORK_SIZE - 1);
         int y0 = (int)fy;
         int y1 = (y0 + 1 < sess.h) ? (y0 + 1) : y0;
         float wy = fy - y0;
+
+        // Smooth bottom dark gradient scrim for y = 180..359 so overlaid track/station info pops
+        float scrim = 1.0f;
+        if (y > 180) {
+            float t = (float)(y - 180) / 112.0f;
+            if (t > 1.0f) t = 1.0f;
+            scrim = 1.0f - 0.86f * (t * t);
+        }
 
         for (int x = 0; x < ARTWORK_SIZE; x++) {
             float fx = ((float)x * (sw > 1 ? (sw - 1) : 0)) / (float)(ARTWORK_SIZE - 1);
@@ -220,19 +194,22 @@ static bool decode_jpeg_to_artwork(const uint8_t *jpg_data, size_t jpg_len, lv_c
             const uint8_t *p01 = &sess.rgb_raw[(y1 * sess.w + x0) * 3];
             const uint8_t *p11 = &sess.rgb_raw[(y1 * sess.w + x1) * 3];
 
-            uint8_t r = (uint8_t)((p00[0] * (1 - wx) + p10[0] * wx) * (1 - wy) +
-                                  (p01[0] * (1 - wx) + p11[0] * wx) * wy);
-            uint8_t g = (uint8_t)((p00[1] * (1 - wx) + p10[1] * wx) * (1 - wy) +
-                                  (p01[1] * (1 - wx) + p11[1] * wx) * wy);
-            uint8_t b = (uint8_t)((p00[2] * (1 - wx) + p10[2] * wx) * (1 - wy) +
-                                  (p01[2] * (1 - wx) + p11[2] * wx) * wy);
+            float rf = ((p00[0] * (1 - wx) + p10[0] * wx) * (1 - wy) +
+                        (p01[0] * (1 - wx) + p11[0] * wx) * wy);
+            float gf = ((p00[1] * (1 - wx) + p10[1] * wx) * (1 - wy) +
+                        (p01[1] * (1 - wx) + p11[1] * wx) * wy);
+            float bf = ((p00[2] * (1 - wx) + p10[2] * wx) * (1 - wy) +
+                        (p01[2] * (1 - wx) + p11[2] * wx) * wy);
+
+            uint8_t r = (uint8_t)(rf * scrim + 4.0f * (1.0f - scrim));
+            uint8_t g = (uint8_t)(gf * scrim + 5.0f * (1.0f - scrim));
+            uint8_t b = (uint8_t)(bf * scrim + 8.0f * (1.0f - scrim));
 
             dst[y * ARTWORK_SIZE + x] = lv_color_make(r, g, b);
         }
     }
 
     heap_caps_free(sess.rgb_raw);
-    apply_rounded_frame(dst, accent_col);
     return true;
 }
 
@@ -305,7 +282,7 @@ static void url_encode_query(const char *src, char *dst, size_t dst_max) {
 
 static void artwork_worker_task(void *arg) {
     (void)arg;
-    const size_t MAX_DL = 48 * 1024;
+    const size_t MAX_DL = 64 * 1024;
     uint8_t *dl_buf = (uint8_t *)heap_caps_malloc(MAX_DL, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     lv_color_t *work_pixels = (lv_color_t *)heap_caps_malloc(ARTWORK_SIZE * ARTWORK_SIZE * sizeof(lv_color_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
@@ -399,10 +376,10 @@ static void artwork_worker_task(void *arg) {
                         if (art_end && (art_end - art_key) < 230) {
                             char art_url[256] = {0};
                             memcpy(art_url, art_key, art_end - art_key);
-                            // Upgrade 100x100bb.jpg to 160x160bb.jpg
+                            // Upgrade 100x100bb.jpg to 300x300bb.jpg for sharp full-screen 360x360 display
                             char *sz_pos = strstr(art_url, "100x100bb.jpg");
                             if (sz_pos) {
-                                memcpy(sz_pos, "160x160bb.jpg", 13);
+                                memcpy(sz_pos, "300x300bb.jpg", 13);
                             }
                             size_t jpg_len = 0;
                             if (download_url_to_buf(art_url, dl_buf, MAX_DL, &jpg_len)) {
@@ -423,7 +400,6 @@ static void artwork_worker_task(void *arg) {
             }
 
             if (!got_track_art) {
-                // Fallback to SomaFM station stream art
                 memcpy(s_art_pixels, s_station_cache_pixels, ARTWORK_SIZE * ARTWORK_SIZE * sizeof(lv_color_t));
                 s_art_seq = s_art_seq + 1;
                 char somafm_art_url[128];

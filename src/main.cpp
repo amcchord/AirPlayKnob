@@ -560,11 +560,24 @@ static void poll_serial_debug(void) {
                     int v = atoi(s_cmd + 4);
                     app_set_volume(v);
                     Serial.printf("[DBG] Set volume=%d\n", v);
+                } else if (strncasecmp(s_cmd, "SWIPE ", 6) == 0) {
+                    char d = s_cmd[6];
+                    int dir = 0;
+                    if (d == 'L' || d == 'l') dir = BSP_SWIPE_LEFT;
+                    else if (d == 'R' || d == 'r') dir = BSP_SWIPE_RIGHT;
+                    else if (d == 'U' || d == 'u') dir = BSP_SWIPE_UP;
+                    else if (d == 'D' || d == 'd') dir = BSP_SWIPE_DOWN;
+                    knob_ui_on_swipe(dir);
+                    Serial.printf("[DBG] Swipe dir=%d (%c)\n", dir, d);
+                } else if (strcasecmp(s_cmd, "FPS") == 0) {
+                    Serial.printf("[DBG] Display Flush FPS=%u (frame_us=%u)\n",
+                                  (unsigned)bsp_get_fps(), (unsigned)bsp_get_frame_us());
                 } else if (strcasecmp(s_cmd, "STATUS") == 0) {
                     const char *spk_name = (g_app.current_speaker >= 0 && g_app.current_speaker < g_app.speaker_count)
                                            ? g_app.speakers[g_app.current_speaker].name : "?";
-                    Serial.printf("[DBG] Tab=%d Preset=%d Speaker=%d ('%s') Vol=%d Status='%s' FreeHeap=%u FreePSRAM=%u\n",
-                                  knob_ui_get_tab(), g_app.current_preset, g_app.current_speaker, spk_name,
+                    Serial.printf("[DBG] Tab=%d WhiteCap=%d FPS=%u Preset=%d Speaker=%d ('%s') Vol=%d Status='%s' FreeHeap=%u FreePSRAM=%u\n",
+                                  knob_ui_get_tab(), (int)g_app.whitecap_active, (unsigned)bsp_get_fps(),
+                                  g_app.current_preset, g_app.current_speaker, spk_name,
                                   g_app.volume, g_app.status_text,
                                   (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
                     for (int i = 0; i < g_app.speaker_count; i++) {
@@ -594,5 +607,5 @@ void loop() {
     poll_serial_debug();
     knob_ui_tick();
     web_portal_poll();
-    delay(5);
+    delay(2);
 }

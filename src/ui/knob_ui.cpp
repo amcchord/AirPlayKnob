@@ -22,17 +22,17 @@ static ActiveTab s_active_tab = TAB_NOW_PLAYING;
 static lv_obj_t *s_scr = NULL;
 static lv_obj_t *s_outer_arc = NULL;
 static lv_obj_t *s_pages[4] = {NULL, NULL, NULL, NULL};
+static uint32_t s_prev_theme_col = 0;
+static int s_prev_arc_max = -1;
+static int s_prev_arc_val = -1;
 
-// Tab 0: Minimalist Now Playing (Artwork + Track Name Focus)
+// Tab 0: Full-Screen Album Art (360x360) + Bottom Scrim Typography Overlay
 static lv_obj_t *s_art_cont = NULL;
 static lv_obj_t *s_art_img = NULL;
 static lv_obj_t *s_pause_badge = NULL;
 static lv_obj_t *s_lbl_track = NULL;
 static lv_obj_t *s_lbl_artist = NULL;
 static lv_obj_t *s_lbl_sub_meta = NULL;
-static lv_obj_t *s_btn_dock_stations = NULL;
-static lv_obj_t *s_btn_dock_whitecap = NULL;
-static lv_obj_t *s_btn_dock_speakers = NULL;
 
 // =============================================================================
 // 60 FPS Virtualized 5-Slot Dial Wheel for Stations (Tab 1) & Speakers (Tab 2)
@@ -60,7 +60,7 @@ static int s_speaker_cursor = 0;
 static int s_sp_drag_accum = 0;
 static bool s_sp_dragging = false;
 
-// Tab 3: Wi-Fi, Web Portal QR & OTA Info Sheet
+// Tab 3: Settings (Wi-Fi, Web Portal QR, AirPlay Rescan & OTA Info)
 static lv_obj_t *s_lbl_wifi_ssid = NULL;
 static lv_obj_t *s_lbl_wifi_ip = NULL;
 static lv_obj_t *s_qr_code = NULL;
@@ -77,32 +77,62 @@ static lv_obj_t *s_lbl_hud_val = NULL;
 static uint32_t s_hud_hide_ms = 0;
 
 // =============================================================================
-// Full-Screen Old-School "WhiteCap" Visualizer (360x360 Framebuffer in PSRAM)
+// Full-Screen Old-School "WhiteCap" 3D Wireframe Terrain Visualizer (60 FPS)
+// Zero-PSRAM Direct Internal-SRAM DMA Strip Renderer
 // =============================================================================
 #define WC_W 360
 #define WC_H 360
+#define WC_COLS 34
+#define WC_ROWS 26
+#define WC_DIRTY_Y1 92
+#define WC_DIRTY_Y2 319
 
-static lv_color_t *s_wc_fb = NULL;
-static lv_img_dsc_t s_wc_dsc = {};
 static lv_obj_t *s_wc_layer = NULL;
-static lv_obj_t *s_wc_img = NULL;
 static lv_obj_t *s_wc_caption_box = NULL;
 static lv_obj_t *s_wc_lbl_track = NULL;
 static lv_obj_t *s_wc_lbl_sub = NULL;
 static uint32_t s_wc_caption_hide_ms = 0;
-static uint32_t s_wc_last_frame_ms = 0;
-static uint32_t s_wc_last_morph_ms = 0;
 static float s_wc_phase = 0.0f;
 
+// Stored in fast 240MHz internal SRAM (~4.5 KB total, zero PSRAM traffic!)
+static uint8_t s_wc_grid[WC_ROWS][WC_COLS] = {{0}};
+static int16_t s_wc_vx[WC_ROWS][WC_COLS] = {{0}};
+static int16_t s_wc_vy[WC_ROWS][WC_COLS] = {{0}};
+static int16_t s_wc_row_ymin[WC_ROWS] = {0};
+static int16_t s_wc_row_ymax[WC_ROWS] = {0};
+static int16_t s_wc_prev_frame_ymin = WC_DIRTY_Y1;
+static int16_t s_wc_cur_frame_ymin = WC_DIRTY_Y1;
+static int s_wc_cur_preset = 0;
+
 static const char *WHITECAP_PRESET_NAMES[4] = {
-    "WhiteCap • 3D Ribbon Tunnel",
-    "WhiteCap • Harmonic Coriolis",
-    "WhiteCap • Aether Horizon",
-    "WhiteCap • Supernova Halo"
+    "WhiteCap • Classic 3D Terrain",
+    "WhiteCap • Cyber Horizon",
+    "WhiteCap • Solar Flare",
+    "WhiteCap • Matrix Emerald"
 };
 
 static lv_color_t hex_to_lv(uint32_t hex) {
     return lv_color_make((hex >> 16) & 0xFF, (hex >> 8) & 0xFF, hex & 0xFF);
+}
+
+static inline uint16_t rgb_to_swapped565(uint8_t r, uint8_t g, uint8_t b) {
+    uint16_t c = ((uint16_t)(r & 0xF8) << 8) |
+                 ((uint16_t)(g & 0xFC) << 3) |
+                 ((uint16_t)(b >> 3));
+    return (uint16_t)((c >> 8) | (c << 8));
+}
+
+static void set_arc_state(int range_max, int val) {
+    if (!s_outer_arc) return;
+    if (range_max < 1) range_max = 1;
+    if (range_max != s_prev_arc_max) {
+        s_prev_arc_max = range_max;
+        lv_arc_set_range(s_outer_arc, 0, range_max);
+    }
+    if (val != s_prev_arc_val) {
+        s_prev_arc_val = val;
+        lv_arc_set_value(s_outer_arc, val);
+    }
 }
 
 static void show_hud(const char *label, const char *value, uint32_t color_hex, uint32_t duration_ms) {
@@ -124,36 +154,28 @@ static void show_whitecap_caption(const char *track, const char *sub, uint32_t d
     s_wc_caption_hide_ms = millis() + duration_ms;
 }
 
-// Fast phosphor trail decay on 360x360 RGB565 (byte-swapped LV_COLOR_16_SWAP=1) framebuffer
-static void wc_fade_frame(void) {
-    if (!s_wc_fb) return;
-    uint16_t *p = (uint16_t *)s_wc_fb;
-    const int count = WC_W * WC_H;
-    for (int i = 0; i < count; i++) {
-        uint16_t sw = p[i];
-        if (sw == 0) continue;
-        uint16_t c = (sw >> 8) | (sw << 8);
-        uint16_t q = (c & 0xE79C) >> 2;
-        c -= q;
-        if ((c & 0xF800) <= 0x0800) c &= ~0xF800;
-        if ((c & 0x07E0) <= 0x0040) c &= ~0x07E0;
-        if ((c & 0x001F) <= 0x0001) c &= ~0x001F;
-        p[i] = (c >> 8) | (c << 8);
-    }
-}
+// Direct Internal-SRAM Strip Bresenham line drawer (draws into LVGL's active DMA strip buffer)
+static inline void wc_strip_line(uint16_t *buf, int by1, int by2,
+                                 int x0, int y0, int x1, int y1, uint16_t col) {
+    // Trivial vertical reject if segment is completely outside this 40-row DMA strip
+    int seg_min_y = (y0 < y1) ? y0 : y1;
+    int seg_max_y = (y0 > y1) ? y0 : y1;
+    if (seg_max_y + 1 < by1 || seg_min_y > by2) return;
 
-// Draws a glowing wireframe line (core + soft 1px halo) for authentic WhiteCap look
-static void wc_draw_line(int x0, int y0, int x1, int y1, lv_color_t core_col, lv_color_t glow_col) {
     int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
     int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
     int err = dx + dy;
-    int max_steps = 512;
 
-    while (max_steps-- > 0) {
-        if ((unsigned)x0 < WC_W && (unsigned)y0 < WC_H) {
-            s_wc_fb[y0 * WC_W + x0] = core_col;
-            if (x0 + 1 < WC_W) s_wc_fb[y0 * WC_W + x0 + 1] = glow_col;
-            if (y0 + 1 < WC_H) s_wc_fb[(y0 + 1) * WC_W + x0] = glow_col;
+    for (;;) {
+        if ((unsigned)x0 < WC_W - 1) {
+            if (y0 >= by1 && y0 <= by2) {
+                uint16_t *row = &buf[(y0 - by1) * WC_W + x0];
+                row[0] = col;
+                row[1] = col;
+            }
+            if (y0 + 1 >= by1 && y0 + 1 <= by2) {
+                buf[(y0 + 1 - by1) * WC_W + x0] = col;
+            }
         }
         if (x0 == x1 && y0 == y1) break;
         int e2 = 2 * err;
@@ -162,175 +184,257 @@ static void wc_draw_line(int x0, int y0, int x1, int y1, lv_color_t core_col, lv
     }
 }
 
-static lv_color_t wc_hsv(float h, float s, float v) {
-    h = fmodf(h, 360.0f);
-    if (h < 0) h += 360.0f;
-    float c = v * s;
-    float x = c * (1.0f - fabsf(fmodf(h / 60.0f, 2.0f) - 1.0f));
-    float m = v - c;
-    float r = 0, g = 0, b = 0;
-    if (h < 60)       { r = c; g = x; b = 0; }
-    else if (h < 120) { r = x; g = c; b = 0; }
-    else if (h < 180) { r = 0; g = c; b = x; }
-    else if (h < 240) { r = 0; g = x; b = c; }
-    else if (h < 300) { r = x; g = 0; b = c; }
-    else              { r = c; g = 0; b = x; }
-    return lv_color_make((uint8_t)((r + m) * 255.0f),
-                         (uint8_t)((g + m) * 255.0f),
-                         (uint8_t)((b + m) * 255.0f));
-}
-
-static void render_whitecap_frame(const int8_t *wl, const int8_t *wr, const uint8_t *vu, uint8_t peak, int preset) {
-    if (!s_wc_fb) return;
-
-    wc_fade_frame();
-
-    float energy = (float)peak / 100.0f;
-    if (energy < 0.12f) energy = 0.12f;
-    s_wc_phase += 0.045f + energy * 0.055f;
-
-    float base_hue = fmodf(s_wc_phase * 18.0f + preset * 75.0f, 360.0f);
-    const float cx = 180.0f;
-    const float cy = 180.0f;
+static uint16_t wc_row_color(int r, int preset, uint16_t *out_long_col) {
+    // Interpolate t in [0..255] from front (r=0) to horizon (r=WC_ROWS-1)
+    int t = (r * 255) / (WC_ROWS - 1);
+    int r8 = 255, g8 = 24, b8 = 8;
 
     if (preset == 0) {
-        const int NUM_RIBBONS = 6;
-        const int PTS = 36;
-        int prev_rx[PTS], prev_ry[PTS];
-        bool has_prev = false;
-
-        float roll = sinf(s_wc_phase * 0.35f) * 0.42f;
-        float c_roll = cosf(roll);
-        float s_roll = sinf(roll);
-
-        for (int r = 0; r < NUM_RIBBONS; r++) {
-            float z = 1.0f + (float)r * 0.38f - fmodf(s_wc_phase * 0.3f, 0.38f);
-            if (z < 0.75f) z = 0.75f;
-            float persp = 1.35f / z;
-            float y_plane = ((r % 2 == 0) ? 1.0f : -1.0f) * (34.0f + energy * 18.0f);
-
-            lv_color_t col_core = wc_hsv(base_hue + r * 28.0f, 0.75f, fminf(1.0f, 1.15f / z));
-            lv_color_t col_glow = wc_hsv(base_hue + r * 28.0f, 0.85f, fminf(0.55f, 0.65f / z));
-
-            int cur_rx[PTS], cur_ry[PTS];
-            for (int i = 0; i < PTS; i++) {
-                float u = ((float)i / (float)(PTS - 1)) * 2.0f - 1.0f;
-                int w_idx = (i * 127) / (PTS - 1);
-                float sample = (r & 1) ? (wr[w_idx] / 127.0f) : (wl[w_idx] / 127.0f);
-                float wave = sample * (48.0f + energy * 42.0f) +
-                             14.0f * sinf(u * 4.5f + s_wc_phase * 1.4f + r * 0.7f);
-
-                float x3 = u * 165.0f;
-                float y3 = y_plane + wave;
-
-                float rx = (x3 * c_roll - y3 * s_roll) * persp + cx;
-                float ry = (x3 * s_roll + y3 * c_roll) * persp + cy;
-                cur_rx[i] = (int)rx;
-                cur_ry[i] = (int)ry;
-
-                if (i > 0) {
-                    wc_draw_line(cur_rx[i - 1], cur_ry[i - 1], cur_rx[i], cur_ry[i], col_core, col_glow);
-                }
-                if (has_prev && (i % 4 == 0)) {
-                    wc_draw_line(prev_rx[i], prev_ry[i], cur_rx[i], cur_ry[i], col_glow, col_glow);
-                }
-            }
-            memcpy(prev_rx, cur_rx, sizeof(cur_rx));
-            memcpy(prev_ry, cur_ry, sizeof(cur_ry));
-            has_prev = true;
+        // Exact Old-School WhiteCap palette from reference screenshot:
+        // Front rows: Vivid Red (#FF1800) -> Mid-front: Red-Orange (#E84800) ->
+        // Mid-back: Amber/Olive (#A89800) -> Far Horizon: Bright Neon Green (#08FF18)
+        if (t < 96) {
+            int u = (t * 255) / 96;
+            r8 = 240 + ((15 * u) >> 8);
+            g8 = 12 + ((56 * u) >> 8);
+            b8 = 4;
+        } else if (t < 185) {
+            int u = ((t - 96) * 255) / 89;
+            r8 = 255 - ((110 * u) >> 8);
+            g8 = 68 + ((116 * u) >> 8);
+            b8 = 4;
+        } else {
+            int u = ((t - 185) * 255) / 70;
+            r8 = 145 - ((137 * u) >> 8);
+            g8 = 184 + ((71 * u) >> 8);
+            b8 = 8 + ((16 * u) >> 8);
         }
     } else if (preset == 1) {
-        const int RINGS = 3;
-        const int N = 72;
-        for (int ring = 0; ring < RINGS; ring++) {
-            float rad_base = 58.0f + ring * 38.0f + (vu[ring * 3] * 0.25f);
-            float f1 = 2.0f + ring;
-            float f2 = 3.0f + ring * 2.0f;
-            float rot = s_wc_phase * (0.4f + ring * 0.2f) * ((ring & 1) ? -1.0f : 1.0f);
-
-            lv_color_t col_core = wc_hsv(base_hue + ring * 65.0f, 0.7f, 0.95f);
-            lv_color_t col_glow = wc_hsv(base_hue + ring * 65.0f + 20.0f, 0.85f, 0.45f);
-
-            int first_x = 0, first_y = 0, px = 0, py = 0;
-            for (int i = 0; i <= N; i++) {
-                int idx = (i * 127) / N;
-                float ang = ((float)i / (float)N) * 6.2831853f;
-                float audio_mod = (wl[idx] * 0.35f + wr[idx] * 0.35f);
-                float r = rad_base + audio_mod +
-                          22.0f * sinf(ang * f1 + s_wc_phase) * cosf(ang * f2 - rot);
-                int x = (int)(cx + r * cosf(ang + rot));
-                int y = (int)(cy + r * sinf(ang + rot));
-                if (i == 0) {
-                    first_x = x; first_y = y;
-                } else {
-                    wc_draw_line(px, py, x, y, col_core, col_glow);
-                }
-                px = x; py = y;
-            }
-            wc_draw_line(px, py, first_x, first_y, col_core, col_glow);
+        // Cyber Horizon: Cyan (#00F5D4) -> Electric Blue (#38BDF8) -> Neon Magenta (#FF1E8E)
+        if (t < 128) {
+            int u = t * 2;
+            r8 = (56 * u) >> 8;
+            g8 = 245 - ((65 * u) >> 8);
+            b8 = 212 + ((43 * u) >> 8);
+        } else {
+            int u = (t - 128) * 2;
+            r8 = 56 + ((199 * u) >> 8);
+            g8 = 180 - ((150 * u) >> 8);
+            b8 = 255 - ((95 * u) >> 8);
         }
     } else if (preset == 2) {
-        const int ROWS = 5;
-        const int COLS = 32;
-        for (int side = -1; side <= 1; side += 2) {
-            int prev_x[COLS], prev_y[COLS];
-            for (int r = 0; r < ROWS; r++) {
-                float depth = 1.0f + r * 0.42f;
-                float y_base = cy + side * (28.0f + r * 24.0f);
-                float x_span = 165.0f / (0.65f + r * 0.18f);
-
-                lv_color_t col_core = wc_hsv(base_hue + (side > 0 ? 0 : 140) + r * 18.0f, 0.75f, 1.0f / (0.8f + r * 0.2f));
-                lv_color_t col_glow = wc_hsv(base_hue + (side > 0 ? 0 : 140) + r * 18.0f, 0.85f, 0.42f);
-
-                int cur_x[COLS], cur_y[COLS];
-                for (int c = 0; c < COLS; c++) {
-                    float u = ((float)c / (float)(COLS - 1)) * 2.0f - 1.0f;
-                    int w_idx = (c * 127) / (COLS - 1);
-                    float s_val = (side < 0 ? wl[w_idx] : wr[w_idx]) / 127.0f;
-                    float dy = s_val * (38.0f / depth) +
-                               10.0f * cosf(u * 5.0f + s_wc_phase * 1.6f + r);
-                    cur_x[c] = (int)(cx + u * x_span);
-                    cur_y[c] = (int)(y_base + dy * side);
-
-                    if (c > 0) {
-                        wc_draw_line(cur_x[c - 1], cur_y[c - 1], cur_x[c], cur_y[c], col_core, col_glow);
-                    }
-                    if (r > 0 && (c % 3 == 0)) {
-                        wc_draw_line(prev_x[c], prev_y[c], cur_x[c], cur_y[c], col_glow, col_glow);
-                    }
-                }
-                memcpy(prev_x, cur_x, sizeof(cur_x));
-                memcpy(prev_y, cur_y, sizeof(cur_y));
-            }
+        // Solar Flare: Crimson (#FF0044) -> Gold (#FFAA00) -> Ice White (#E0F7FF)
+        if (t < 140) {
+            int u = (t * 255) / 140;
+            r8 = 255;
+            g8 = (180 * u) >> 8;
+            b8 = 68 - ((68 * u) >> 8);
+        } else {
+            int u = ((t - 140) * 255) / 115;
+            r8 = 255 - ((25 * u) >> 8);
+            g8 = 180 + ((70 * u) >> 8);
+            b8 = (255 * u) >> 8;
         }
     } else {
-        const int N = 96;
-        lv_color_t col_ring = wc_hsv(base_hue, 0.65f, 1.0f);
-        lv_color_t col_ray  = wc_hsv(base_hue + 45.0f, 0.85f, 0.85f);
-        lv_color_t col_glow = wc_hsv(base_hue + 90.0f, 0.9f, 0.45f);
+        // Matrix Emerald: Bright Lime (#A3E635) -> Emerald (#10B981) -> Deep Cyan (#06B6D4)
+        r8 = 163 - ((150 * t) >> 8);
+        g8 = 235 - ((45 * t) >> 8);
+        b8 = 45 + ((170 * t) >> 8);
+    }
 
-        int fx = 0, fy = 0, px = 0, py = 0;
-        float base_r = 78.0f + energy * 24.0f;
-        for (int i = 0; i < N; i++) {
-            int idx = (i * 127) / N;
-            float ang = ((float)i / (float)N) * 6.2831853f + s_wc_phase * 0.25f;
-            float sample = (wl[idx] + wr[idx]) * 0.38f;
-            float r = base_r + sample;
-            int x = (int)(cx + r * cosf(ang));
-            int y = (int)(cy + r * sinf(ang));
-            if (i == 0) { fx = x; fy = y; }
-            else { wc_draw_line(px, py, x, y, col_ring, col_glow); }
-            px = x; py = y;
+    if (out_long_col) {
+        // Slightly darker shade for longitudinal depth lines so horizontal ridges pop
+        *out_long_col = rgb_to_swapped565((uint8_t)((r8 * 165) >> 8),
+                                          (uint8_t)((g8 * 165) >> 8),
+                                          (uint8_t)((b8 * 165) >> 8));
+    }
+    return rgb_to_swapped565((uint8_t)r8, (uint8_t)g8, (uint8_t)b8);
+}
 
-            if ((i % 3 == 0) && fabsf(sample) > 12.0f) {
-                float r_out = r + fabsf(sample) * 0.85f;
-                int ox = (int)(cx + r_out * cosf(ang));
-                int oy = (int)(cy + r_out * sinf(ang));
-                wc_draw_line(x, y, ox, oy, col_ray, col_glow);
+static void step_whitecap_simulation(const int8_t *wl, const int8_t *wr, const uint8_t *vu, uint8_t peak, int preset) {
+    s_wc_cur_preset = preset;
+
+    // 1. Shift 3D terrain history rows back by 1 (row 1 -> row 2 ... row 24 -> row 25)
+    // Row 0 stays anchored at h=0 right on the green baseline!
+    memmove(&s_wc_grid[2][0], &s_wc_grid[1][0], (WC_ROWS - 2) * WC_COLS);
+
+    float energy = (float)peak / 100.0f;
+    s_wc_phase += 0.12f + energy * 0.10f;
+
+    // 2. Build new live audio row (row 1) from stereo waveform + VU spectrum
+    uint8_t raw_row[WC_COLS];
+    for (int c = 0; c < WC_COLS; c++) {
+        int w_idx = (c * 127) / (WC_COLS - 1);
+        int b_idx = (c * 11) / (WC_COLS - 1);
+
+        int s_l = abs((int)wl[w_idx]);
+        int s_r = abs((int)wr[127 - w_idx]);
+        int wave_amp = (c < WC_COLS / 2) ? ((s_l * 3 + s_r) >> 2) : ((s_r * 3 + s_l) >> 2);
+        int band_amp = (int)vu[b_idx];
+
+        // Classic WhiteCap terrain shaping:
+        // Tallest bass mountain peaks on the left-center (c = 2..12), finer harmonic ripples across center/right
+        float env = (c < 12) ? (1.22f - 0.03f * abs(c - 4))
+                             : (0.75f - 0.013f * (c - 12));
+        if (env < 0.25f) env = 0.25f;
+
+        float organic = 5.0f + 5.0f * sinf(c * 0.48f - s_wc_phase)
+                             + 4.0f * cosf(c * 0.31f + s_wc_phase * 0.7f);
+
+        float h_val = (band_amp * 0.45f + wave_amp * 0.56f) * env + organic;
+
+        int w_signed = (c & 1) ? wl[w_idx] : wr[w_idx];
+        if (w_signed > 14) {
+            h_val += (w_signed - 14) * 0.38f * env;
+        }
+
+        if (h_val < 0.0f) h_val = 0.0f;
+        if (h_val > 92.0f) h_val = 92.0f;
+        raw_row[c] = (uint8_t)h_val;
+    }
+
+    // Smooth horizontally [1, 2, 1]/4 and blend with row 2 for cohesive mountain ridges
+    for (int c = 0; c < WC_COLS; c++) {
+        int prev_c = (c > 0) ? raw_row[c - 1] : raw_row[c];
+        int next_c = (c + 1 < WC_COLS) ? raw_row[c + 1] : raw_row[c];
+        int smoothed = (prev_c + (raw_row[c] << 1) + next_c) >> 2;
+        int temporal = (smoothed * 3 + (int)s_wc_grid[2][c]) >> 2;
+
+        // Taper left & right borders so the mesh edges sit cleanly like the reference screenshot
+        if (c == 0 || c == WC_COLS - 1) temporal = 0;
+        else if (c == 1 || c == WC_COLS - 2) temporal = (temporal * 2) / 5;
+        else if (c == 2 || c == WC_COLS - 3) temporal = (temporal * 3) / 4;
+
+        s_wc_grid[1][c] = (uint8_t)temporal;
+        s_wc_grid[0][c] = 0; // Front edge anchored flush to the green baseline
+    }
+
+    // 3. Project 3D heightfield into 2D oblique perspective screen coordinates in internal SRAM
+    const float max_r = (float)(WC_ROWS - 1);
+    const float k_z = 0.041f;
+    const float min_persp = 1.0f / (1.0f + max_r * k_z);
+    int16_t frame_min_y = WC_DIRTY_Y2;
+
+    for (int r = 0; r < WC_ROWS; r++) {
+        float persp = 1.0f / (1.0f + (float)r * k_z);
+        float depth_t = (1.0f - persp) / (1.0f - min_persp);
+
+        float x_left  = 46.0f  + depth_t * 118.0f;
+        float x_right = 308.0f - depth_t * 10.0f;
+        float y_left  = 276.0f - depth_t * 154.0f;
+        float y_right = 314.0f - depth_t * 174.0f;
+        float h_scale = persp * 0.96f;
+
+        int16_t r_min_y = 360;
+        int16_t r_max_y = 0;
+
+        for (int c = 0; c < WC_COLS; c++) {
+            float u = (float)c / (float)(WC_COLS - 1);
+            float bx = x_left + u * (x_right - x_left);
+            float by = y_left + u * (y_right - y_left);
+            float py = by - (float)s_wc_grid[r][c] * h_scale;
+            if (py < (float)WC_DIRTY_Y1) py = (float)WC_DIRTY_Y1;
+            if (py > (float)(WC_DIRTY_Y2 - 2)) py = (float)(WC_DIRTY_Y2 - 2);
+            int16_t ix = (int16_t)bx;
+            int16_t iy = (int16_t)py;
+            s_wc_vx[r][c] = ix;
+            s_wc_vy[r][c] = iy;
+            if (iy < r_min_y) r_min_y = iy;
+            if (iy > r_max_y) r_max_y = iy;
+            if (r > 0) {
+                int16_t py_prev = s_wc_vy[r - 1][c];
+                if (py_prev < r_min_y) r_min_y = py_prev;
+                if (py_prev > r_max_y) r_max_y = py_prev;
             }
         }
-        wc_draw_line(px, py, fx, fy, col_ring, col_glow);
+        s_wc_row_ymin[r] = r_min_y - 2;
+        s_wc_row_ymax[r] = r_max_y + 2;
+        if (s_wc_row_ymin[r] < frame_min_y) frame_min_y = s_wc_row_ymin[r];
     }
+    if (frame_min_y < WC_DIRTY_Y1) frame_min_y = WC_DIRTY_Y1;
+    s_wc_cur_frame_ymin = frame_min_y;
+}
+
+// LVGL custom draw callback: rasterizes visible 3D wireframe segments directly into internal DMA SRAM!
+static void wc_layer_draw_event_cb(lv_event_t *e) {
+    lv_draw_ctx_t *draw_ctx = lv_event_get_draw_ctx(e);
+    if (!draw_ctx || !draw_ctx->buf || !draw_ctx->buf_area) return;
+
+    uint16_t *buf = (uint16_t *)draw_ctx->buf;
+    const int by1 = draw_ctx->buf_area->y1;
+    const int by2 = draw_ctx->buf_area->y2;
+    const int preset = s_wc_cur_preset;
+
+    // Render back-to-front (painter's order r = WC_ROWS - 1 down to 1)
+    for (int r = WC_ROWS - 1; r >= 1; r--) {
+        if (s_wc_row_ymax[r] < by1 || s_wc_row_ymin[r] > by2) continue;
+
+        uint16_t col_long = 0;
+        uint16_t col_ridge = wc_row_color(r, preset, &col_long);
+
+        // Longitudinal depth lines connecting row r to row r-1
+        for (int c = 0; c < WC_COLS; c++) {
+            wc_strip_line(buf, by1, by2,
+                          s_wc_vx[r][c],     s_wc_vy[r][c],
+                          s_wc_vx[r - 1][c], s_wc_vy[r - 1][c],
+                          col_long);
+        }
+
+        // Transverse ridge line across row r
+        for (int c = 1; c < WC_COLS; c++) {
+            wc_strip_line(buf, by1, by2,
+                          s_wc_vx[r][c - 1], s_wc_vy[r][c - 1],
+                          s_wc_vx[r][c],     s_wc_vy[r][c],
+                          col_ridge);
+        }
+    }
+
+    // Crisp neon green front baseline along row 0 (exact match to reference screenshot)
+    if (s_wc_row_ymax[0] >= by1 && s_wc_row_ymin[0] <= by2) {
+        uint16_t baseline_col = (preset == 0) ? rgb_to_swapped565(32, 255, 32)
+                              : (preset == 1) ? rgb_to_swapped565(0, 245, 212)
+                              : (preset == 2) ? rgb_to_swapped565(255, 180, 0)
+                                              : rgb_to_swapped565(16, 185, 129);
+        for (int c = 1; c < WC_COLS; c++) {
+            wc_strip_line(buf, by1, by2,
+                          s_wc_vx[0][c - 1], s_wc_vy[0][c - 1],
+                          s_wc_vx[0][c],     s_wc_vy[0][c],
+                          baseline_col);
+        }
+    }
+}
+
+// LVGL timer callback: runs directly inside lv_timer_handler() right before display refresh for 60 FPS
+static void whitecap_lv_timer_cb(lv_timer_t *timer) {
+    (void)timer;
+    if (!g_app.whitecap_active || !s_wc_layer || lv_obj_has_flag(s_wc_layer, LV_OBJ_FLAG_HIDDEN)) {
+        return;
+    }
+
+    uint8_t vu[12];
+    uint8_t peak;
+    int8_t wl[128];
+    int8_t wr[128];
+    int wc_preset;
+
+    if (xSemaphoreTake(g_app.mutex, 0) == pdTRUE) {
+        memcpy(vu, g_app.vu_bars, 12);
+        peak = g_app.vu_peak;
+        memcpy(wl, g_app.wave_l, 128);
+        memcpy(wr, g_app.wave_r, 128);
+        wc_preset = g_app.whitecap_preset & 3;
+        xSemaphoreGive(g_app.mutex);
+    } else {
+        return;
+    }
+
+    step_whitecap_simulation(wl, wr, vu, peak, wc_preset);
+
+    // Only invalidate the exact vertical bounding band of the previous + current 3D terrain mesh
+    int16_t inv_y1 = (s_wc_cur_frame_ymin < s_wc_prev_frame_ymin) ? s_wc_cur_frame_ymin : s_wc_prev_frame_ymin;
+    s_wc_prev_frame_ymin = s_wc_cur_frame_ymin;
+    lv_area_t dirty = {0, inv_y1, WC_W - 1, WC_DIRTY_Y2};
+    _lv_inv_area(lv_disp_get_default(), &dirty);
 }
 
 static void split_artist_track(const char *raw, const char *fallback_station,
@@ -382,7 +486,7 @@ static void update_station_wheel(bool sync_cursor_to_active) {
     static const int SLOT_W[WHEEL_SLOTS] = {252, 282, 300, 282, 252};
     const StationPreset &focused_st = g_app.presets[s_station_cursor];
     if (s_lbl_st_hdr) {
-        lv_label_set_text_fmt(s_lbl_st_hdr, "%d / %d  •  %s",
+        lv_label_set_text_fmt(s_lbl_st_hdr, "STATIONS  •  %d / %d  •  %s",
                               s_station_cursor + 1, count,
                               focused_st.genre[0] ? focused_st.genre : "SomaFM");
     }
@@ -421,10 +525,7 @@ static void update_station_wheel(bool sync_cursor_to_active) {
     }
     xSemaphoreGive(g_app.mutex);
 
-    if (s_outer_arc) {
-        lv_arc_set_range(s_outer_arc, 0, count > 1 ? count - 1 : 1);
-        lv_arc_set_value(s_outer_arc, s_station_cursor);
-    }
+    set_arc_state(count > 1 ? count - 1 : 1, s_station_cursor);
 }
 
 static void update_speaker_wheel(bool sync_cursor_to_active) {
@@ -508,10 +609,7 @@ static void update_speaker_wheel(bool sync_cursor_to_active) {
     }
     xSemaphoreGive(g_app.mutex);
 
-    if (s_outer_arc) {
-        lv_arc_set_range(s_outer_arc, 0, count > 1 ? count - 1 : 1);
-        lv_arc_set_value(s_outer_arc, s_speaker_cursor);
-    }
+    set_arc_state(count > 1 ? count - 1 : 1, s_speaker_cursor);
 }
 
 static void switch_tab(ActiveTab tab) {
@@ -536,16 +634,99 @@ static void set_whitecap_visible(bool visible) {
     }
     if (!s_wc_layer) return;
     if (visible) {
-        if (s_wc_fb) memset(s_wc_fb, 0, WC_W * WC_H * sizeof(lv_color_t));
+        // Pre-seed terrain history with gentle organic waves so frame 1 looks alive immediately
+        memset(s_wc_grid, 0, sizeof(s_wc_grid));
+        for (int r = 1; r < WC_ROWS; r++) {
+            for (int c = 1; c < WC_COLS - 1; c++) {
+                s_wc_grid[r][c] = (uint8_t)(6.0f + 5.0f * sinf(c * 0.35f + r * 0.25f));
+            }
+        }
+        int8_t zero_w[128] = {0};
+        uint8_t zero_vu[12] = {0};
+        step_whitecap_simulation(zero_w, zero_w, zero_vu, 18, g_app.whitecap_preset & 3);
+        s_wc_prev_frame_ymin = 0;
+
+        // Hide underlying page and perimeter arc while full-screen WhiteCap is running so LVGL
+        // does zero redundant background/arc composition work during 60 FPS frame blits!
+        if (s_pages[s_active_tab]) lv_obj_add_flag(s_pages[s_active_tab], LV_OBJ_FLAG_HIDDEN);
+        if (s_outer_arc) lv_obj_add_flag(s_outer_arc, LV_OBJ_FLAG_HIDDEN);
+
         lv_obj_clear_flag(s_wc_layer, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(s_wc_layer);
         int preset = g_app.whitecap_preset & 3;
-        show_whitecap_caption(lv_label_get_text(s_lbl_track), WHITECAP_PRESET_NAMES[preset], 4200);
-        s_wc_last_morph_ms = millis();
+        show_whitecap_caption(lv_label_get_text(s_lbl_track), WHITECAP_PRESET_NAMES[preset], 2600);
         haptic_play_effect(HAPTIC_DOUBLE_CLICK);
     } else {
         lv_obj_add_flag(s_wc_layer, LV_OBJ_FLAG_HIDDEN);
+        if (s_pages[s_active_tab]) lv_obj_clear_flag(s_pages[s_active_tab], LV_OBJ_FLAG_HIDDEN);
+        if (s_outer_arc) lv_obj_clear_flag(s_outer_arc, LV_OBJ_FLAG_HIDDEN);
         haptic_play_effect(HAPTIC_SHARP_CLICK);
+    }
+}
+
+static void handle_swipe_gesture(bsp_swipe_dir_t dir) {
+    if (dir == BSP_SWIPE_NONE) return;
+
+    // Close Wi-Fi scan modal if open and swiped
+    if (s_wifi_modal && !s_wifi_kb) {
+        lv_obj_del(s_wifi_modal);
+        s_wifi_modal = NULL;
+        s_wifi_list = NULL;
+        haptic_play_effect(HAPTIC_SHARP_CLICK);
+        return;
+    }
+
+    // WhiteCap Visualizer active:
+    // - Swipe Down (or Up) -> Exit WhiteCap back to Home
+    // - Swipe Left / Right -> Cycle 3D terrain color palette
+    if (g_app.whitecap_active) {
+        if (dir == BSP_SWIPE_DOWN || dir == BSP_SWIPE_UP) {
+            set_whitecap_visible(false);
+        } else if (dir == BSP_SWIPE_LEFT || dir == BSP_SWIPE_RIGHT) {
+            int next_p = 0;
+            if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+                next_p = (g_app.whitecap_preset + (dir == BSP_SWIPE_LEFT ? 1 : 3)) & 3;
+                g_app.whitecap_preset = next_p;
+                xSemaphoreGive(g_app.mutex);
+            }
+            haptic_play_effect(HAPTIC_LIGHT_TICK);
+            show_whitecap_caption(lv_label_get_text(s_lbl_track), WHITECAP_PRESET_NAMES[next_p], 2800);
+        }
+        return;
+    }
+
+    // Home Screen (TAB_NOW_PLAYING): 4-Direction Swipe Navigation
+    // - Swipe Left  -> Stations Wheel
+    // - Swipe Right -> AirPlay Speakers Wheel
+    // - Swipe Up    -> Old-School WhiteCap 3D Visualizer
+    // - Swipe Down  -> Settings (Wi-Fi / Web QR / AirPlay Rescan)
+    if (s_active_tab == TAB_NOW_PLAYING) {
+        if (dir == BSP_SWIPE_LEFT) {
+            switch_tab(TAB_STATIONS);
+        } else if (dir == BSP_SWIPE_RIGHT) {
+            switch_tab(TAB_SPEAKERS);
+        } else if (dir == BSP_SWIPE_UP) {
+            set_whitecap_visible(true);
+        } else if (dir == BSP_SWIPE_DOWN) {
+            switch_tab(TAB_WIFI);
+        }
+        return;
+    }
+
+    // Stations or AirPlay Speakers Wheel: Horizontal swipe returns to Home
+    if (s_active_tab == TAB_STATIONS || s_active_tab == TAB_SPEAKERS) {
+        if (dir == BSP_SWIPE_LEFT || dir == BSP_SWIPE_RIGHT) {
+            switch_tab(TAB_NOW_PLAYING);
+        }
+        return;
+    }
+
+    // Settings (TAB_WIFI): Swipe Up / Left / Right returns to Home
+    if (s_active_tab == TAB_WIFI) {
+        if (dir == BSP_SWIPE_UP || dir == BSP_SWIPE_LEFT || dir == BSP_SWIPE_RIGHT) {
+            switch_tab(TAB_NOW_PLAYING);
+        }
+        return;
     }
 }
 
@@ -567,6 +748,11 @@ void knob_ui_set_whitecap(bool visible) {
     bsp_lvgl_unlock();
 }
 
+void knob_ui_on_swipe(int dir) {
+    if (dir < (int)BSP_SWIPE_LEFT || dir > (int)BSP_SWIPE_DOWN) return;
+    bsp_push_swipe_gesture((bsp_swipe_dir_t)dir);
+}
+
 static void wifi_kb_event_cb(lv_event_t *e) {
     lv_event_code_t code = lv_event_get_code(e);
     if (code == LV_EVENT_READY) {
@@ -577,12 +763,14 @@ static void wifi_kb_event_cb(lv_event_t *e) {
             lv_obj_del(s_wifi_modal);
             s_wifi_modal = NULL;
             s_wifi_list = NULL;
+            s_wifi_kb = NULL;
         }
     } else if (code == LV_EVENT_CANCEL) {
         if (s_wifi_modal) {
             lv_obj_del(s_wifi_modal);
             s_wifi_modal = NULL;
             s_wifi_list = NULL;
+            s_wifi_kb = NULL;
         }
     }
 }
@@ -620,6 +808,7 @@ static void wifi_ssid_click_cb(lv_event_t *e) {
 
 static void open_wifi_scan_modal(lv_event_t *e) {
     (void)e;
+    if (bsp_was_touch_dragged()) return;
     haptic_play_effect(HAPTIC_SHARP_CLICK);
     if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
         g_app.wifi_scan_requested = true;
@@ -627,6 +816,7 @@ static void open_wifi_scan_modal(lv_event_t *e) {
     }
 
     if (s_wifi_modal) lv_obj_del(s_wifi_modal);
+    s_wifi_kb = NULL;
     s_wifi_modal = lv_obj_create(s_scr);
     lv_obj_set_size(s_wifi_modal, 360, 360);
     lv_obj_center(s_wifi_modal);
@@ -668,6 +858,7 @@ static void open_wifi_scan_modal(lv_event_t *e) {
             lv_obj_del(s_wifi_modal);
             s_wifi_modal = NULL;
             s_wifi_list = NULL;
+            s_wifi_kb = NULL;
         }
     }, LV_EVENT_CLICKED, NULL);
 }
@@ -715,7 +906,7 @@ static void station_slot_event_cb(lv_event_t *e) {
             update_station_wheel(false);
         }
     } else if (code == LV_EVENT_CLICKED) {
-        if (s_st_dragging) return;
+        if (s_st_dragging || bsp_was_touch_dragged()) return;
         lv_obj_t *target = lv_event_get_current_target(e);
         int idx = (int)(intptr_t)lv_obj_get_user_data(target);
         s_station_cursor = idx;
@@ -747,7 +938,7 @@ static void speaker_slot_event_cb(lv_event_t *e) {
             update_speaker_wheel(false);
         }
     } else if (code == LV_EVENT_CLICKED) {
-        if (s_sp_dragging) return;
+        if (s_sp_dragging || bsp_was_touch_dragged()) return;
         lv_obj_t *target = lv_event_get_current_target(e);
         int idx = (int)(intptr_t)lv_obj_get_user_data(target);
         s_speaker_cursor = idx;
@@ -766,21 +957,6 @@ void knob_ui_init(void) {
     lv_obj_set_style_pad_all(s_scr, 0, 0);
     lv_obj_clear_flag(s_scr, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Subtle 3px 360-degree bezel progress ring
-    s_outer_arc = lv_arc_create(s_scr);
-    lv_obj_set_size(s_outer_arc, 354, 354);
-    lv_obj_center(s_outer_arc);
-    lv_arc_set_rotation(s_outer_arc, 270);
-    lv_arc_set_bg_angles(s_outer_arc, 0, 360);
-    lv_arc_set_range(s_outer_arc, 0, 100);
-    lv_arc_set_value(s_outer_arc, 18);
-    lv_obj_remove_style(s_outer_arc, NULL, LV_PART_KNOB);
-    lv_obj_clear_flag(s_outer_arc, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_style_arc_width(s_outer_arc, 3, LV_PART_MAIN);
-    lv_obj_set_style_arc_color(s_outer_arc, hex_to_lv(0x111827), LV_PART_MAIN);
-    lv_obj_set_style_arc_width(s_outer_arc, 3, LV_PART_INDICATOR);
-    lv_obj_set_style_arc_color(s_outer_arc, hex_to_lv(0x10B981), LV_PART_INDICATOR);
-
     for (int i = 0; i < 4; i++) {
         s_pages[i] = lv_obj_create(s_scr);
         lv_obj_set_size(s_pages[i], 360, 360);
@@ -792,19 +968,34 @@ void knob_ui_init(void) {
         if (i != 0) lv_obj_add_flag(s_pages[i], LV_OBJ_FLAG_HIDDEN);
     }
 
+    // Subtle 3px 360-degree bezel progress ring floating above pages
+    s_outer_arc = lv_arc_create(s_scr);
+    lv_obj_set_size(s_outer_arc, 356, 356);
+    lv_obj_center(s_outer_arc);
+    lv_arc_set_rotation(s_outer_arc, 270);
+    lv_arc_set_bg_angles(s_outer_arc, 0, 360);
+    lv_obj_remove_style(s_outer_arc, NULL, LV_PART_KNOB);
+    lv_obj_clear_flag(s_outer_arc, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_arc_width(s_outer_arc, 3, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(s_outer_arc, hex_to_lv(0x111827), LV_PART_MAIN);
+    lv_obj_set_style_arc_opa(s_outer_arc, LV_OPA_40, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(s_outer_arc, 3, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(s_outer_arc, hex_to_lv(0x10B981), LV_PART_INDICATOR);
+    s_prev_theme_col = 0x10B981;
+    set_arc_state(100, 18);
+
     // =========================================================================
-    // PAGE 0: MINIMALIST NOW PLAYING (Artwork + Track Name Focus)
+    // PAGE 0: FULL-SCREEN ALBUM ART (360x360) + BOTTOM SCRIM OVERLAY
+    // Swipe Left -> Stations | Swipe Right -> AirPlay | Swipe Up -> WhiteCap | Swipe Down -> Settings
     // =========================================================================
     lv_obj_t *p0 = s_pages[0];
 
-    // Centerpiece 156x156 Album Art / Stream Art Card (y = 20..176)
     s_art_cont = lv_obj_create(p0);
     lv_obj_set_size(s_art_cont, ARTWORK_SIZE, ARTWORK_SIZE);
-    lv_obj_align(s_art_cont, LV_ALIGN_TOP_MID, 0, 20);
-    lv_obj_set_style_radius(s_art_cont, 22, 0);
+    lv_obj_center(s_art_cont);
+    lv_obj_set_style_radius(s_art_cont, 0, 0);
     lv_obj_set_style_bg_opa(s_art_cont, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(s_art_cont, 1, 0);
-    lv_obj_set_style_border_color(s_art_cont, hex_to_lv(0x1E293B), 0);
+    lv_obj_set_style_border_width(s_art_cont, 0, 0);
     lv_obj_set_style_pad_all(s_art_cont, 0, 0);
     lv_obj_clear_flag(s_art_cont, LV_OBJ_FLAG_SCROLLABLE);
 
@@ -814,14 +1005,33 @@ void knob_ui_init(void) {
     lv_obj_add_flag(s_art_img, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_art_img, [](lv_event_t *e) {
         (void)e;
-        haptic_play_effect(HAPTIC_STRONG_CLICK);
-        app_toggle_play();
+        if (bsp_was_touch_dragged()) return;
+        lv_point_t pt;
+        lv_indev_get_point(lv_indev_get_act(), &pt);
+        if (pt.y >= 285) {
+            // Tapping the bottom station/speaker line cycles Knob Mode
+            KnobMode next = KNOB_MODE_VOLUME;
+            if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                next = (KnobMode)(((int)g_app.knob_mode + 1) % 3);
+                g_app.knob_mode = next;
+                g_app.preview_preset = g_app.current_preset;
+                g_app.preview_speaker = g_app.current_speaker;
+                xSemaphoreGive(g_app.mutex);
+            }
+            haptic_play_effect(HAPTIC_SHARP_CLICK);
+            if (next == KNOB_MODE_VOLUME)       show_hud("KNOB MODE", "Volume", 0x10B981, 1000);
+            else if (next == KNOB_MODE_STATION) show_hud("KNOB MODE", "Station Dial", 0xF59E0B, 1000);
+            else                                show_hud("KNOB MODE", "Speaker Dial", 0x38BDF8, 1000);
+        } else {
+            haptic_play_effect(HAPTIC_STRONG_CLICK);
+            app_toggle_play();
+        }
     }, LV_EVENT_CLICKED, NULL);
 
     // Subtle frosted pause indicator on artwork when paused
-    s_pause_badge = lv_obj_create(s_art_cont);
-    lv_obj_set_size(s_pause_badge, 44, 44);
-    lv_obj_center(s_pause_badge);
+    s_pause_badge = lv_obj_create(p0);
+    lv_obj_set_size(s_pause_badge, 52, 52);
+    lv_obj_align(s_pause_badge, LV_ALIGN_CENTER, 0, -24);
     lv_obj_set_style_radius(s_pause_badge, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(s_pause_badge, hex_to_lv(0x050608), 0);
     lv_obj_set_style_bg_opa(s_pause_badge, LV_OPA_80, 0);
@@ -836,93 +1046,52 @@ void knob_ui_init(void) {
     lv_obj_center(pl);
     lv_obj_add_flag(s_pause_badge, LV_OBJ_FLAG_HIDDEN);
 
-    // Primary Focus: Track Name (y = 188..212, single-line ellipsis, never wraps)
+    // Bottom Overlay Typography over the pre-baked full-screen artwork scrim:
+    // 1. Track Name (y = 244..268, bold white, single-line ellipsis)
     s_lbl_track = lv_label_create(p0);
     lv_label_set_text(s_lbl_track, "Groove Salad");
     lv_obj_set_style_text_font(s_lbl_track, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(s_lbl_track, hex_to_lv(0xFFFFFF), 0);
     lv_label_set_long_mode(s_lbl_track, LV_LABEL_LONG_DOT);
-    lv_obj_set_size(s_lbl_track, 284, 24);
+    lv_obj_set_size(s_lbl_track, 292, 24);
     lv_obj_set_style_text_align(s_lbl_track, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(s_lbl_track, LV_ALIGN_TOP_MID, 0, 188);
+    lv_obj_align(s_lbl_track, LV_ALIGN_TOP_MID, 0, 244);
+    lv_obj_clear_flag(s_lbl_track, LV_OBJ_FLAG_CLICKABLE);
 
-    // Secondary Focus: Artist Name (y = 216..234, single-line ellipsis)
+    // 2. Artist Name (y = 272..290, crisp silver, single-line ellipsis)
     s_lbl_artist = lv_label_create(p0);
     lv_label_set_text(s_lbl_artist, "SomaFM Radio");
     lv_obj_set_style_text_font(s_lbl_artist, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(s_lbl_artist, hex_to_lv(0x94A3B8), 0);
+    lv_obj_set_style_text_color(s_lbl_artist, hex_to_lv(0xE2E8F0), 0);
     lv_label_set_long_mode(s_lbl_artist, LV_LABEL_LONG_DOT);
-    lv_obj_set_size(s_lbl_artist, 256, 18);
+    lv_obj_set_size(s_lbl_artist, 264, 18);
     lv_obj_set_style_text_align(s_lbl_artist, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(s_lbl_artist, LV_ALIGN_TOP_MID, 0, 216);
+    lv_obj_align(s_lbl_artist, LV_ALIGN_TOP_MID, 0, 272);
+    lv_obj_clear_flag(s_lbl_artist, LV_OBJ_FLAG_CLICKABLE);
 
-    // Subtle Station • Speaker status line (y = 240..260, tap to cycle Knob Mode)
-    lv_obj_t *sub_btn = lv_btn_create(p0);
-    lv_obj_set_size(sub_btn, 244, 20);
-    lv_obj_align(sub_btn, LV_ALIGN_TOP_MID, 0, 240);
-    lv_obj_set_style_bg_opa(sub_btn, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(sub_btn, 0, 0);
-    lv_obj_set_style_shadow_width(sub_btn, 0, 0);
-    lv_obj_set_style_pad_all(sub_btn, 0, 0);
-    lv_obj_add_event_cb(sub_btn, [](lv_event_t *e) {
-        (void)e;
-        KnobMode next = KNOB_MODE_VOLUME;
-        if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-            next = (KnobMode)(((int)g_app.knob_mode + 1) % 3);
-            g_app.knob_mode = next;
-            g_app.preview_preset = g_app.current_preset;
-            g_app.preview_speaker = g_app.current_speaker;
-            xSemaphoreGive(g_app.mutex);
-        }
-        haptic_play_effect(HAPTIC_SHARP_CLICK);
-        if (next == KNOB_MODE_VOLUME)       show_hud("KNOB MODE", "Volume", 0x10B981, 1000);
-        else if (next == KNOB_MODE_STATION) show_hud("KNOB MODE", "Station Dial", 0xF59E0B, 1000);
-        else                                show_hud("KNOB MODE", "Speaker Dial", 0x38BDF8, 1000);
-    }, LV_EVENT_CLICKED, NULL);
-
-    s_lbl_sub_meta = lv_label_create(sub_btn);
+    // 3. Station • AirPlay Speaker status line (y = 296..312, station theme accent color)
+    s_lbl_sub_meta = lv_label_create(p0);
     lv_label_set_text(s_lbl_sub_meta, "Groove Salad  •  Tree House");
     lv_obj_set_style_text_font(s_lbl_sub_meta, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(s_lbl_sub_meta, hex_to_lv(0x10B981), 0);
     lv_label_set_long_mode(s_lbl_sub_meta, LV_LABEL_LONG_DOT);
-    lv_obj_set_size(s_lbl_sub_meta, 240, 16);
+    lv_obj_set_size(s_lbl_sub_meta, 248, 16);
     lv_obj_set_style_text_align(s_lbl_sub_meta, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_center(s_lbl_sub_meta);
-
-    // Minimalist Bottom Action Dock (y = 272..304: Stations | WhiteCap | AirPlay)
-    s_btn_dock_stations = create_pill_btn(p0, 74, 32, 0x0F141D, 0x1E293B, "Stations", 0xCBD5E1);
-    lv_obj_align(s_btn_dock_stations, LV_ALIGN_TOP_MID, -78, 272);
-    lv_obj_add_event_cb(s_btn_dock_stations, [](lv_event_t *e) {
-        (void)e;
-        switch_tab(TAB_STATIONS);
-    }, LV_EVENT_CLICKED, NULL);
-
-    s_btn_dock_whitecap = create_pill_btn(p0, 78, 32, 0x131C2E, 0x334155, "WhiteCap", 0xF8FAFC);
-    lv_obj_align(s_btn_dock_whitecap, LV_ALIGN_TOP_MID, 0, 272);
-    lv_obj_add_event_cb(s_btn_dock_whitecap, [](lv_event_t *e) {
-        (void)e;
-        set_whitecap_visible(true);
-    }, LV_EVENT_CLICKED, NULL);
-
-    s_btn_dock_speakers = create_pill_btn(p0, 74, 32, 0x0F141D, 0x1E293B, "AirPlay", 0xCBD5E1);
-    lv_obj_align(s_btn_dock_speakers, LV_ALIGN_TOP_MID, 78, 272);
-    lv_obj_add_event_cb(s_btn_dock_speakers, [](lv_event_t *e) {
-        (void)e;
-        switch_tab(TAB_SPEAKERS);
-    }, LV_EVENT_CLICKED, NULL);
+    lv_obj_align(s_lbl_sub_meta, LV_ALIGN_TOP_MID, 0, 296);
+    lv_obj_clear_flag(s_lbl_sub_meta, LV_OBJ_FLAG_CLICKABLE);
 
     // =========================================================================
-    // PAGE 1: 60 FPS VIRTUALIZED SOMAFM STATIONS WHEEL
+    // PAGE 1: 60 FPS VIRTUALIZED SOMAFM STATIONS WHEEL (Swipe Left from Home)
     // =========================================================================
     lv_obj_t *p1 = s_pages[1];
 
     s_lbl_st_hdr = lv_label_create(p1);
-    lv_label_set_text(s_lbl_st_hdr, "SOMAFM  •  1 / 30");
+    lv_label_set_text(s_lbl_st_hdr, "STATIONS  •  1 / 30");
     lv_obj_set_style_text_font(s_lbl_st_hdr, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(s_lbl_st_hdr, hex_to_lv(0x94A3B8), 0);
-    lv_obj_align(s_lbl_st_hdr, LV_ALIGN_TOP_MID, 0, 22);
+    lv_obj_align(s_lbl_st_hdr, LV_ALIGN_TOP_MID, 0, 26);
 
-    static const int SLOT_Y[WHEEL_SLOTS] = {48, 90, 132, 180, 222};
+    static const int SLOT_Y[WHEEL_SLOTS] = {56, 98, 140, 188, 230};
     static const int SLOT_W[WHEEL_SLOTS] = {252, 282, 300, 282, 252};
     static const int SLOT_H[WHEEL_SLOTS] = {38, 38, 44, 38, 38};
 
@@ -969,26 +1138,16 @@ void knob_ui_init(void) {
         s_st_tags[i] = tag;
     }
 
-    lv_obj_t *st_back = create_pill_btn(p1, 86, 32, 0x0F141D, 0x1E293B, "Back", 0xCBD5E1);
-    lv_obj_align(st_back, LV_ALIGN_TOP_MID, -52, 274);
-    lv_obj_add_event_cb(st_back, [](lv_event_t *e) {
-        (void)e;
-        switch_tab(TAB_NOW_PLAYING);
-    }, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t *st_tune = create_pill_btn(p1, 96, 32, 0x10B981, 0x10B981, "Tune In", 0x050608);
-    lv_obj_align(st_tune, LV_ALIGN_TOP_MID, 50, 274);
-    lv_obj_add_event_cb(st_tune, [](lv_event_t *e) {
-        (void)e;
-        haptic_play_effect(HAPTIC_DOUBLE_CLICK);
-        app_select_preset(s_station_cursor, true);
-        switch_tab(TAB_NOW_PLAYING);
-    }, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *st_hint = lv_label_create(p1);
+    lv_label_set_text(st_hint, "TAP TO TUNE  •  SWIPE BACK");
+    lv_obj_set_style_text_font(st_hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(st_hint, hex_to_lv(0x475569), 0);
+    lv_obj_align(st_hint, LV_ALIGN_TOP_MID, 0, 288);
 
     update_station_wheel(true);
 
     // =========================================================================
-    // PAGE 2: 60 FPS VIRTUALIZED AIRPLAY SPEAKERS WHEEL
+    // PAGE 2: 60 FPS VIRTUALIZED AIRPLAY SPEAKERS WHEEL (Swipe Right from Home)
     // =========================================================================
     lv_obj_t *p2 = s_pages[2];
 
@@ -996,7 +1155,7 @@ void knob_ui_init(void) {
     lv_label_set_text(s_lbl_spkr_hdr, "AIRPLAY SPEAKERS");
     lv_obj_set_style_text_font(s_lbl_spkr_hdr, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(s_lbl_spkr_hdr, hex_to_lv(0x94A3B8), 0);
-    lv_obj_align(s_lbl_spkr_hdr, LV_ALIGN_TOP_MID, 0, 22);
+    lv_obj_align(s_lbl_spkr_hdr, LV_ALIGN_TOP_MID, 0, 26);
 
     for (int i = 0; i < WHEEL_SLOTS; i++) {
         lv_obj_t *row = lv_obj_create(p2);
@@ -1041,40 +1200,16 @@ void knob_ui_init(void) {
         s_sp_tags[i] = tag;
     }
 
-    // Bottom buttons on Speaker sheet (y = 274): [Rescan] [Connect] [Wi-Fi]
-    lv_obj_t *sp_scan = create_pill_btn(p2, 70, 32, 0x0F141D, 0x1E293B, "Rescan", 0xCBD5E1);
-    lv_obj_align(sp_scan, LV_ALIGN_TOP_MID, -78, 274);
-    lv_obj_add_event_cb(sp_scan, [](lv_event_t *e) {
-        (void)e;
-        haptic_play_effect(HAPTIC_SHARP_CLICK);
-        if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-            g_app.speaker_scan_requested = true;
-            g_app.speaker_scanning = true;
-            xSemaphoreGive(g_app.mutex);
-        }
-        if (s_lbl_spkr_hdr) lv_label_set_text(s_lbl_spkr_hdr, "SCANNING AIRPLAY...");
-    }, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t *sp_conn = create_pill_btn(p2, 78, 32, 0x38BDF8, 0x38BDF8, "Connect", 0x050608);
-    lv_obj_align(sp_conn, LV_ALIGN_TOP_MID, 0, 274);
-    lv_obj_add_event_cb(sp_conn, [](lv_event_t *e) {
-        (void)e;
-        haptic_play_effect(HAPTIC_DOUBLE_CLICK);
-        app_select_speaker(s_speaker_cursor);
-        switch_tab(TAB_NOW_PLAYING);
-    }, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t *sp_wifi = create_pill_btn(p2, 70, 32, 0x0F141D, 0x1E293B, LV_SYMBOL_WIFI " Info", 0xCBD5E1);
-    lv_obj_align(sp_wifi, LV_ALIGN_TOP_MID, 78, 274);
-    lv_obj_add_event_cb(sp_wifi, [](lv_event_t *e) {
-        (void)e;
-        switch_tab(TAB_WIFI);
-    }, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *sp_hint = lv_label_create(p2);
+    lv_label_set_text(sp_hint, "TAP TO CONNECT  •  SWIPE BACK");
+    lv_obj_set_style_text_font(sp_hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(sp_hint, hex_to_lv(0x475569), 0);
+    lv_obj_align(sp_hint, LV_ALIGN_TOP_MID, 0, 288);
 
     update_speaker_wheel(true);
 
     // =========================================================================
-    // PAGE 3: WI-FI, WEB UI QR & OTA INFO SHEET
+    // PAGE 3: SETTINGS SHEET (Swipe Down from Home: Wi-Fi, Web QR, AirPlay Scan)
     // =========================================================================
     lv_obj_t *p3 = s_pages[3];
 
@@ -1082,17 +1217,17 @@ void knob_ui_init(void) {
     lv_label_set_text(s_lbl_wifi_ssid, LV_SYMBOL_WIFI " SvensHaus");
     lv_obj_set_style_text_font(s_lbl_wifi_ssid, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(s_lbl_wifi_ssid, hex_to_lv(0xF8FAFC), 0);
-    lv_obj_align(s_lbl_wifi_ssid, LV_ALIGN_TOP_MID, 0, 26);
+    lv_obj_align(s_lbl_wifi_ssid, LV_ALIGN_TOP_MID, 0, 24);
 
     s_lbl_wifi_ip = lv_label_create(p3);
     lv_label_set_text(s_lbl_wifi_ip, "http://airplayknob.local/");
     lv_obj_set_style_text_font(s_lbl_wifi_ip, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(s_lbl_wifi_ip, hex_to_lv(0x38BDF8), 0);
-    lv_obj_align(s_lbl_wifi_ip, LV_ALIGN_TOP_MID, 0, 48);
+    lv_obj_align(s_lbl_wifi_ip, LV_ALIGN_TOP_MID, 0, 46);
 
     lv_obj_t *qr_card = lv_obj_create(p3);
     lv_obj_set_size(qr_card, 132, 132);
-    lv_obj_align(qr_card, LV_ALIGN_TOP_MID, 0, 74);
+    lv_obj_align(qr_card, LV_ALIGN_TOP_MID, 0, 72);
     lv_obj_set_style_radius(qr_card, 16, 0);
     lv_obj_set_style_bg_color(qr_card, hex_to_lv(0xFFFFFF), 0);
     lv_obj_set_style_border_width(qr_card, 0, 0);
@@ -1107,57 +1242,60 @@ void knob_ui_init(void) {
     lv_label_set_text(ota_lbl, "Web Presets & OTA Ready");
     lv_obj_set_style_text_font(ota_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(ota_lbl, hex_to_lv(0x64748B), 0);
-    lv_obj_align(ota_lbl, LV_ALIGN_TOP_MID, 0, 218);
+    lv_obj_align(ota_lbl, LV_ALIGN_TOP_MID, 0, 214);
 
-    lv_obj_t *w_scan_btn = create_pill_btn(p3, 98, 32, 0x0F141D, 0x1E293B, "Wi-Fi Scan", 0xCBD5E1);
-    lv_obj_align(w_scan_btn, LV_ALIGN_TOP_MID, -54, 272);
+    lv_obj_t *w_scan_btn = create_pill_btn(p3, 102, 32, 0x0F141D, 0x1E293B, "Wi-Fi Scan", 0xCBD5E1);
+    lv_obj_align(w_scan_btn, LV_ALIGN_TOP_MID, -56, 244);
     lv_obj_add_event_cb(w_scan_btn, open_wifi_scan_modal, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t *w_done_btn = create_pill_btn(p3, 88, 32, 0x161B26, 0x334155, "Done", 0xF8FAFC);
-    lv_obj_align(w_done_btn, LV_ALIGN_TOP_MID, 52, 272);
-    lv_obj_add_event_cb(w_done_btn, [](lv_event_t *e) {
+    lv_obj_t *w_airplay_btn = create_pill_btn(p3, 106, 32, 0x0F141D, 0x1E293B, "Scan AirPlay", 0x38BDF8);
+    lv_obj_align(w_airplay_btn, LV_ALIGN_TOP_MID, 56, 244);
+    lv_obj_add_event_cb(w_airplay_btn, [](lv_event_t *e) {
         (void)e;
-        switch_tab(TAB_NOW_PLAYING);
+        if (bsp_was_touch_dragged()) return;
+        haptic_play_effect(HAPTIC_SHARP_CLICK);
+        if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            g_app.speaker_scan_requested = true;
+            g_app.speaker_scanning = true;
+            xSemaphoreGive(g_app.mutex);
+        }
+        show_hud("AIRPLAY", "Scanning Network...", 0x38BDF8, 1400);
     }, LV_EVENT_CLICKED, NULL);
 
-    // =========================================================================
-    // FULL-SCREEN WHITECAP VISUALIZER LAYER (360x360)
-    // =========================================================================
-    s_wc_fb = (lv_color_t *)heap_caps_calloc(WC_W * WC_H, sizeof(lv_color_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    s_wc_dsc.header.always_zero = 0;
-    s_wc_dsc.header.w = WC_W;
-    s_wc_dsc.header.h = WC_H;
-    s_wc_dsc.header.cf = LV_IMG_CF_TRUE_COLOR;
-    s_wc_dsc.data_size = WC_W * WC_H * sizeof(lv_color_t);
-    s_wc_dsc.data = (const uint8_t *)s_wc_fb;
+    lv_obj_t *set_hint = lv_label_create(p3);
+    lv_label_set_text(set_hint, "SWIPE UP FOR HOME");
+    lv_obj_set_style_text_font(set_hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(set_hint, hex_to_lv(0x475569), 0);
+    lv_obj_align(set_hint, LV_ALIGN_TOP_MID, 0, 290);
 
+    // =========================================================================
+    // FULL-SCREEN WHITECAP VISUALIZER LAYER (360x360, Swipe Up from Home)
+    // Renders directly into internal DMA SRAM strips via LV_EVENT_DRAW_MAIN!
+    // =========================================================================
     s_wc_layer = lv_obj_create(s_scr);
     lv_obj_set_size(s_wc_layer, WC_W, WC_H);
     lv_obj_center(s_wc_layer);
     lv_obj_set_style_bg_color(s_wc_layer, hex_to_lv(0x000000), 0);
+    lv_obj_set_style_bg_opa(s_wc_layer, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(s_wc_layer, 0, 0);
     lv_obj_set_style_pad_all(s_wc_layer, 0, 0);
     lv_obj_clear_flag(s_wc_layer, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(s_wc_layer, LV_OBJ_FLAG_HIDDEN);
-
-    s_wc_img = lv_img_create(s_wc_layer);
-    lv_img_set_src(s_wc_img, &s_wc_dsc);
-    lv_obj_center(s_wc_img);
-    lv_obj_add_flag(s_wc_img, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(s_wc_img, [](lv_event_t *e) {
+    lv_obj_add_flag(s_wc_layer, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(s_wc_layer, wc_layer_draw_event_cb, LV_EVENT_DRAW_MAIN, NULL);
+    lv_obj_add_event_cb(s_wc_layer, [](lv_event_t *e) {
         (void)e;
+        if (bsp_was_touch_dragged()) return;
         lv_point_t pt;
         lv_indev_get_point(lv_indev_get_act(), &pt);
-        if (pt.y < 140) {
+        if (pt.y < 120) {
             int next_p = 0;
             if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
                 next_p = (g_app.whitecap_preset + 1) & 3;
                 g_app.whitecap_preset = next_p;
                 xSemaphoreGive(g_app.mutex);
             }
-            s_wc_last_morph_ms = millis();
             haptic_play_effect(HAPTIC_LIGHT_TICK);
-            show_whitecap_caption(lv_label_get_text(s_lbl_track), WHITECAP_PRESET_NAMES[next_p], 3200);
+            show_whitecap_caption(lv_label_get_text(s_lbl_track), WHITECAP_PRESET_NAMES[next_p], 2800);
         } else {
             set_whitecap_visible(false);
         }
@@ -1165,10 +1303,10 @@ void knob_ui_init(void) {
 
     s_wc_caption_box = lv_obj_create(s_wc_layer);
     lv_obj_set_size(s_wc_caption_box, 256, 52);
-    lv_obj_align(s_wc_caption_box, LV_ALIGN_TOP_MID, 0, 268);
+    lv_obj_align(s_wc_caption_box, LV_ALIGN_TOP_MID, 0, 272);
     lv_obj_set_style_radius(s_wc_caption_box, 26, 0);
     lv_obj_set_style_bg_color(s_wc_caption_box, hex_to_lv(0x050608), 0);
-    lv_obj_set_style_bg_opa(s_wc_caption_box, LV_OPA_90, 0);
+    lv_obj_set_style_bg_opa(s_wc_caption_box, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(s_wc_caption_box, 1, 0);
     lv_obj_set_style_border_color(s_wc_caption_box, hex_to_lv(0x1E293B), 0);
     lv_obj_set_style_pad_all(s_wc_caption_box, 0, 0);
@@ -1192,13 +1330,16 @@ void knob_ui_init(void) {
     lv_obj_set_style_text_align(s_wc_lbl_sub, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(s_wc_lbl_sub, LV_ALIGN_TOP_MID, 0, 28);
 
+    // Register 60+ FPS WhiteCap render timer inside LVGL
+    lv_timer_create(whitecap_lv_timer_cb, 1, NULL);
+
     // =========================================================================
-    // MINIMALIST FLOATING HUD PILL (Opaque cover over dock area when turning knob)
+    // MINIMALIST FLOATING HUD PILL (Opaque cover when turning physical knob)
     // =========================================================================
     s_hud_pill = lv_obj_create(s_scr);
-    lv_obj_set_size(s_hud_pill, 232, 54);
-    lv_obj_align(s_hud_pill, LV_ALIGN_TOP_MID, 0, 264);
-    lv_obj_set_style_radius(s_hud_pill, 27, 0);
+    lv_obj_set_size(s_hud_pill, 236, 56);
+    lv_obj_align(s_hud_pill, LV_ALIGN_TOP_MID, 0, 258);
+    lv_obj_set_style_radius(s_hud_pill, 28, 0);
     lv_obj_set_style_bg_color(s_hud_pill, hex_to_lv(0x0B0F19), 0);
     lv_obj_set_style_bg_opa(s_hud_pill, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(s_hud_pill, 1, 0);
@@ -1213,7 +1354,7 @@ void knob_ui_init(void) {
     lv_label_set_long_mode(s_lbl_hud_title, LV_LABEL_LONG_DOT);
     lv_obj_set_size(s_lbl_hud_title, 196, 16);
     lv_obj_set_style_text_align(s_lbl_hud_title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(s_lbl_hud_title, LV_ALIGN_TOP_MID, 0, 7);
+    lv_obj_align(s_lbl_hud_title, LV_ALIGN_TOP_MID, 0, 8);
 
     s_lbl_hud_val = lv_label_create(s_hud_pill);
     lv_label_set_text(s_lbl_hud_val, "18%");
@@ -1222,7 +1363,7 @@ void knob_ui_init(void) {
     lv_label_set_long_mode(s_lbl_hud_val, LV_LABEL_LONG_DOT);
     lv_obj_set_size(s_lbl_hud_val, 204, 20);
     lv_obj_set_style_text_align(s_lbl_hud_val, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(s_lbl_hud_val, LV_ALIGN_TOP_MID, 0, 26);
+    lv_obj_align(s_lbl_hud_val, LV_ALIGN_TOP_MID, 0, 27);
 
     lv_obj_add_flag(s_hud_pill, LV_OBJ_FLAG_HIDDEN);
 
@@ -1234,7 +1375,7 @@ void knob_ui_on_rotate(int delta) {
     if (!bsp_lvgl_lock(30)) return;
 
     // 60 FPS O(1) Virtualized Station Wheel Scroll
-    if (s_active_tab == TAB_STATIONS) {
+    if (!g_app.whitecap_active && s_active_tab == TAB_STATIONS) {
         int count = g_app.preset_count > 0 ? g_app.preset_count : 1;
         s_station_cursor = (s_station_cursor + (delta > 0 ? 1 : -1) + count * 8) % count;
         haptic_play_effect(HAPTIC_LIGHT_TICK);
@@ -1244,7 +1385,7 @@ void knob_ui_on_rotate(int delta) {
     }
 
     // 60 FPS O(1) Virtualized AirPlay Speaker Wheel Scroll
-    if (s_active_tab == TAB_SPEAKERS) {
+    if (!g_app.whitecap_active && s_active_tab == TAB_SPEAKERS) {
         int count = g_app.speaker_count > 0 ? g_app.speaker_count : 1;
         s_speaker_cursor = (s_speaker_cursor + (delta > 0 ? 1 : -1) + count * 8) % count;
         haptic_play_effect(HAPTIC_LIGHT_TICK);
@@ -1297,27 +1438,33 @@ void knob_ui_on_rotate(int delta) {
         snprintf(vstr, sizeof(vstr), "%d%%", vol);
         show_hud(preview_sp.name[0] ? preview_sp.name : "VOLUME", vstr,
                  preview_st.color ? preview_st.color : 0x10B981, 950);
-        lv_arc_set_range(s_outer_arc, 0, 100);
-        lv_arc_set_value(s_outer_arc, vol);
+        set_arc_state(100, vol);
     } else if (mode == KNOB_MODE_STATION) {
         haptic_play_effect(HAPTIC_LIGHT_TICK);
         show_hud("TUNE STATION", preview_st.name, preview_st.color ? preview_st.color : 0xF59E0B, 1150);
-        lv_arc_set_range(s_outer_arc, 0, p_cnt > 1 ? p_cnt - 1 : 1);
-        lv_arc_set_value(s_outer_arc, p_preview);
+        set_arc_state(p_cnt > 1 ? p_cnt - 1 : 1, p_preview);
     } else if (mode == KNOB_MODE_SPEAKER) {
         haptic_play_effect(HAPTIC_LIGHT_TICK);
         show_hud("AIRPLAY SPEAKER", preview_sp.name, 0x38BDF8, 1200);
-        lv_arc_set_range(s_outer_arc, 0, s_cnt > 1 ? s_cnt - 1 : 1);
-        lv_arc_set_value(s_outer_arc, s_preview);
+        set_arc_state(s_cnt > 1 ? s_cnt - 1 : 1, s_preview);
     }
 
     bsp_lvgl_unlock();
 }
 
 void knob_ui_tick(void) {
+    uint32_t now_ms = millis();
+
+    // Fast path: check swipe gesture immediately without takingLVGL lock if idle
+    bsp_swipe_dir_t swipe = bsp_pop_swipe_gesture();
+    static uint32_t s_last_slow_tick_ms = 0;
+    if (swipe == BSP_SWIPE_NONE && (now_ms - s_last_slow_tick_ms < 35)) {
+        return;
+    }
+    s_last_slow_tick_ms = now_ms;
+
     int commit_preset = -1;
     int commit_speaker = -1;
-    uint32_t now_ms = millis();
 
     if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
         if (g_app.preview_timestamp_ms > 0 && (now_ms - g_app.preview_timestamp_ms >= 900)) {
@@ -1342,6 +1489,10 @@ void knob_ui_tick(void) {
 
     if (!bsp_lvgl_lock(15)) return;
 
+    if (swipe != BSP_SWIPE_NONE) {
+        handle_swipe_gesture(swipe);
+    }
+
     if (s_hud_hide_ms > 0 && now_ms >= s_hud_hide_ms) {
         s_hud_hide_ms = 0;
         if (s_hud_pill) lv_obj_add_flag(s_hud_pill, LV_OBJ_FLAG_HIDDEN);
@@ -1357,15 +1508,10 @@ void knob_ui_tick(void) {
     bool playing = false;
     int vol = 18;
     char raw_track[128] = {0};
-    uint8_t vu[12] = {0};
-    uint8_t peak = 0;
-    int8_t wl[128] = {0};
-    int8_t wr[128] = {0};
     bool wifi_ok = false;
     char ssid[36] = {0};
     char ip[20] = {0};
     bool wc_active = false;
-    int wc_preset = 0;
     bool ota_active = false;
     int ota_pct = 0;
     int spk_count = 1;
@@ -1381,15 +1527,10 @@ void knob_ui_tick(void) {
         playing = g_app.playing;
         vol = g_app.volume;
         strncpy(raw_track, g_app.track_title, sizeof(raw_track) - 1);
-        memcpy(vu, g_app.vu_bars, 12);
-        peak = g_app.vu_peak;
-        memcpy(wl, g_app.wave_l, 128);
-        memcpy(wr, g_app.wave_r, 128);
         wifi_ok = g_app.wifi_connected;
         strncpy(ssid, g_app.wifi_ssid, sizeof(ssid) - 1);
         strncpy(ip, g_app.wifi_ip, sizeof(ip) - 1);
         wc_active = g_app.whitecap_active;
-        wc_preset = g_app.whitecap_preset & 3;
         ota_active = g_app.ota_in_progress;
         ota_pct = g_app.ota_progress_pct;
         spk_count = g_app.speaker_count;
@@ -1401,8 +1542,7 @@ void knob_ui_tick(void) {
         char pstr[32];
         snprintf(pstr, sizeof(pstr), "%d%% Complete", ota_pct);
         show_hud("OTA FIRMWARE UPDATE", pstr, 0x38BDF8, 1000);
-        lv_arc_set_range(s_outer_arc, 0, 100);
-        lv_arc_set_value(s_outer_arc, ota_pct);
+        set_arc_state(100, ota_pct);
         bsp_lvgl_unlock();
         return;
     }
@@ -1423,17 +1563,26 @@ void knob_ui_tick(void) {
     uint32_t cur_art_seq = artwork_get_seq();
     if (cur_art_seq != last_art_seq) {
         last_art_seq = cur_art_seq;
-        if (s_art_img) lv_obj_invalidate(s_art_img);
+        if (s_art_img && !wc_active && s_active_tab == TAB_NOW_PLAYING) {
+            lv_obj_invalidate(s_art_img);
+        }
     }
 
     uint32_t theme_col = cur_st.color ? cur_st.color : 0x10B981;
-    lv_obj_set_style_arc_color(s_outer_arc, hex_to_lv(theme_col), LV_PART_INDICATOR);
-    lv_obj_set_style_border_color(s_art_cont, hex_to_lv(theme_col), 0);
+    if (theme_col != s_prev_theme_col) {
+        s_prev_theme_col = theme_col;
+        lv_obj_set_style_arc_color(s_outer_arc, hex_to_lv(theme_col), LV_PART_INDICATOR);
+        lv_obj_set_style_text_color(s_lbl_sub_meta, hex_to_lv(theme_col), 0);
+    }
 
-    if (playing) lv_obj_add_flag(s_pause_badge, LV_OBJ_FLAG_HIDDEN);
-    else         lv_obj_clear_flag(s_pause_badge, LV_OBJ_FLAG_HIDDEN);
+    static bool prev_playing = true;
+    if (playing != prev_playing) {
+        prev_playing = playing;
+        if (playing) lv_obj_add_flag(s_pause_badge, LV_OBJ_FLAG_HIDDEN);
+        else         lv_obj_clear_flag(s_pause_badge, LV_OBJ_FLAG_HIDDEN);
+    }
 
-    // Split "Artist - Track" and update minimalist typography
+    // Split "Artist - Track" and update minimalist bottom overlay typography
     char artist_str[80] = {0};
     char track_str[100] = {0};
     split_artist_track(raw_track, cur_st.name, artist_str, sizeof(artist_str), track_str, sizeof(track_str));
@@ -1444,7 +1593,7 @@ void knob_ui_tick(void) {
         lv_label_set_text(s_lbl_track, track_str);
         lv_label_set_text(s_lbl_artist, artist_str);
         if (wc_active) {
-            show_whitecap_caption(track_str, artist_str, 4500);
+            show_whitecap_caption(track_str, artist_str, 4000);
         }
     }
 
@@ -1458,32 +1607,8 @@ void knob_ui_tick(void) {
         lv_obj_set_style_text_color(s_lbl_sub_meta, hex_to_lv(theme_col), 0);
     }
 
-    if (s_active_tab == TAB_NOW_PLAYING && s_hud_hide_ms == 0) {
-        lv_arc_set_range(s_outer_arc, 0, 100);
-        lv_arc_set_value(s_outer_arc, vol);
-    }
-
-    // Update Full-Screen WhiteCap Visualizer if active (~50 FPS)
-    if (wc_active && s_wc_layer) {
-        if (lv_obj_has_flag(s_wc_layer, LV_OBJ_FLAG_HIDDEN)) {
-            lv_obj_clear_flag(s_wc_layer, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_move_foreground(s_wc_layer);
-        }
-        if (now_ms - s_wc_last_morph_ms >= 16000) {
-            s_wc_last_morph_ms = now_ms;
-            if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                g_app.whitecap_preset = (g_app.whitecap_preset + 1) & 3;
-                wc_preset = g_app.whitecap_preset;
-                xSemaphoreGive(g_app.mutex);
-            }
-        }
-        if (now_ms - s_wc_last_frame_ms >= 20) {
-            s_wc_last_frame_ms = now_ms;
-            render_whitecap_frame(wl, wr, vu, peak, wc_preset);
-            lv_obj_invalidate(s_wc_img);
-        }
-    } else if (!wc_active && s_wc_layer && !lv_obj_has_flag(s_wc_layer, LV_OBJ_FLAG_HIDDEN)) {
-        lv_obj_add_flag(s_wc_layer, LV_OBJ_FLAG_HIDDEN);
+    if (!wc_active && s_active_tab == TAB_NOW_PLAYING && s_hud_hide_ms == 0) {
+        set_arc_state(100, vol);
     }
 
     // Update Wi-Fi & QR code tab when IP changes

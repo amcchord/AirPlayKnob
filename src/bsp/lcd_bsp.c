@@ -10,6 +10,22 @@ static SemaphoreHandle_t lvgl_mux = NULL;
 static esp_lcd_panel_io_handle_t amoled_panel_io_handle = NULL;
 static uint16_t *s_screen_fb = NULL; // 360x360 live screen mirror in PSRAM (right-side up RGB565_SWAPPED)
 
+static volatile bsp_swipe_dir_t s_pending_swipe = BSP_SWIPE_NONE;
+static bool s_tp_pressed = false;
+static bool s_tp_dragged = false;
+static int16_t s_tp_start_x = 180;
+static int16_t s_tp_start_y = 180;
+static int16_t s_tp_last_x = 180;
+static int16_t s_tp_last_y = 180;
+static int64_t s_tp_start_us = 0;
+
+static uint32_t s_fps_frames = 0;
+static int64_t s_fps_window_start_us = 0;
+static volatile uint32_t s_last_fps = 60;
+static volatile uint32_t s_last_frame_us = 0;
+static int64_t s_flush_start_us = 0;
+static volatile bool s_capture_mirror = false;
+
 static void example_increase_lvgl_tick(void *arg);
 static bool example_notify_lvgl_flush_ready(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_io_event_data_t *edata, void *user_ctx);
 static void example_lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map);
@@ -324,32 +340,88 @@ static bool example_notify_lvgl_flush_ready(esp_lcd_panel_io_handle_t panel_io, 
 }
 
 const uint16_t *bsp_get_screen_fb(void) {
+    if (!s_screen_fb) return NULL;
+    s_capture_mirror = true;
+    if (bsp_lvgl_lock(50)) {
+        lv_obj_invalidate(lv_scr_act());
+        bsp_lvgl_unlock();
+    }
+    vTaskDelay(pdMS_TO_TICKS(35));
+    s_capture_mirror = false;
     return s_screen_fb;
 }
 
+bsp_swipe_dir_t bsp_pop_swipe_gesture(void) {
+    bsp_swipe_dir_t dir = s_pending_swipe;
+    s_pending_swipe = BSP_SWIPE_NONE;
+    return dir;
+}
+
+void bsp_push_swipe_gesture(bsp_swipe_dir_t dir) {
+    s_pending_swipe = dir;
+}
+
+bool bsp_was_touch_dragged(void) {
+    return s_tp_dragged;
+}
+
+uint32_t bsp_get_fps(void) {
+    return s_last_fps;
+}
+
+uint32_t bsp_get_frame_us(void) {
+    return s_last_frame_us;
+}
+
 static void example_lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map) {
+    if (s_flush_start_us == 0) {
+        s_flush_start_us = esp_timer_get_time();
+    }
     esp_lcd_panel_handle_t panel_handle = (esp_lcd_panel_handle_t)drv->user_data;
     const int w = area->x2 - area->x1 + 1;
     const int h = area->y2 - area->y1 + 1;
     const uint32_t total = (uint32_t)w * (uint32_t)h;
 
-    // Save right-side-up pixels into PSRAM screen mirror for screenshots
-    if (s_screen_fb && area->x1 == 0 && w == EXAMPLE_LCD_H_RES) {
-        memcpy(&s_screen_fb[area->y1 * EXAMPLE_LCD_H_RES], color_map, total * sizeof(uint16_t));
-    } else if (s_screen_fb) {
-        const uint16_t *src = (const uint16_t *)color_map;
-        for (int y = area->y1; y <= area->y2; y++) {
-            memcpy(&s_screen_fb[y * EXAMPLE_LCD_H_RES + area->x1], src, w * sizeof(uint16_t));
-            src += w;
+    // Only copy to PSRAM screen mirror when a screenshot is actively requested
+    if (s_capture_mirror && s_screen_fb) {
+        if (area->x1 == 0 && w == EXAMPLE_LCD_H_RES) {
+            memcpy(&s_screen_fb[area->y1 * EXAMPLE_LCD_H_RES], color_map, total * sizeof(uint16_t));
+        } else {
+            const uint16_t *src = (const uint16_t *)color_map;
+            for (int y = area->y1; y <= area->y2; y++) {
+                memcpy(&s_screen_fb[y * EXAMPLE_LCD_H_RES + area->x1], src, w * sizeof(uint16_t));
+                src += w;
+            }
         }
     }
 
-    // Fast in-place 180-degree pixel reversal (USB-C port at top orientation)
-    uint16_t *p = (uint16_t *)color_map;
-    for (uint32_t i = 0, j = total - 1; i < j; i++, j--) {
-        uint16_t tmp = p[i];
-        p[i] = p[j];
-        p[j] = tmp;
+    // Fast 32-bit 2-pixel in-place 180-degree reversal (USB-C port at top orientation)
+    uint32_t *p32 = (uint32_t *)color_map;
+    uint32_t pairs = total >> 1;
+    for (uint32_t i = 0, j = pairs - 1; i < j; i++, j--) {
+        uint32_t a = p32[i];
+        uint32_t b = p32[j];
+        p32[i] = (b >> 16) | (b << 16);
+        p32[j] = (a >> 16) | (a << 16);
+    }
+    if (pairs & 1U) {
+        uint32_t mid = pairs >> 1;
+        uint32_t m = p32[mid];
+        p32[mid] = (m >> 16) | (m << 16);
+    }
+
+    if (lv_disp_flush_is_last(drv)) {
+        int64_t now_us = esp_timer_get_time();
+        s_last_frame_us = (uint32_t)(now_us - s_flush_start_us);
+        s_flush_start_us = 0;
+        s_fps_frames++;
+        if (s_fps_window_start_us == 0) {
+            s_fps_window_start_us = now_us;
+        } else if (now_us - s_fps_window_start_us >= 1000000LL) {
+            s_last_fps = (uint32_t)((s_fps_frames * 1000000LL) / (now_us - s_fps_window_start_us));
+            s_fps_frames = 0;
+            s_fps_window_start_us = now_us;
+        }
     }
 
     const int rx1 = (EXAMPLE_LCD_H_RES - 1) - area->x2;
@@ -377,10 +449,48 @@ static void example_lvgl_touch_cb(lv_indev_drv_t *drv, lv_indev_data_t *data) {
         if (tp_x >= EXAMPLE_LCD_H_RES) tp_x = EXAMPLE_LCD_H_RES - 1;
         if (tp_y >= EXAMPLE_LCD_V_RES) tp_y = EXAMPLE_LCD_V_RES - 1;
         // 180-degree rotated touch coordinates (USB-C port at top)
-        data->point.x = (EXAMPLE_LCD_H_RES - 1) - tp_x;
-        data->point.y = (EXAMPLE_LCD_V_RES - 1) - tp_y;
+        int16_t rx = (int16_t)((EXAMPLE_LCD_H_RES - 1) - tp_x);
+        int16_t ry = (int16_t)((EXAMPLE_LCD_V_RES - 1) - tp_y);
+        data->point.x = rx;
+        data->point.y = ry;
         data->state = LV_INDEV_STATE_PRESSED;
+
+        if (!s_tp_pressed) {
+            s_tp_pressed = true;
+            s_tp_dragged = false;
+            s_tp_start_x = rx;
+            s_tp_start_y = ry;
+            s_tp_last_x = rx;
+            s_tp_last_y = ry;
+            s_tp_start_us = esp_timer_get_time();
+        } else {
+            s_tp_last_x = rx;
+            s_tp_last_y = ry;
+            int dx = (int)rx - (int)s_tp_start_x;
+            int dy = (int)ry - (int)s_tp_start_y;
+            if (dx * dx + dy * dy >= 18 * 18) {
+                s_tp_dragged = true;
+            }
+        }
     } else {
+        data->point.x = s_tp_last_x;
+        data->point.y = s_tp_last_y;
         data->state = LV_INDEV_STATE_RELEASED;
+
+        if (s_tp_pressed) {
+            s_tp_pressed = false;
+            int dx = (int)s_tp_last_x - (int)s_tp_start_x;
+            int dy = (int)s_tp_last_y - (int)s_tp_start_y;
+            int adx = dx < 0 ? -dx : dx;
+            int ady = dy < 0 ? -dy : dy;
+            int64_t dt_ms = (esp_timer_get_time() - s_tp_start_us) / 1000LL;
+            if ((adx >= 38 || ady >= 38) && dt_ms <= 900) {
+                if (adx >= ady) {
+                    s_pending_swipe = (dx < 0) ? BSP_SWIPE_LEFT : BSP_SWIPE_RIGHT;
+                } else {
+                    s_pending_swipe = (dy < 0) ? BSP_SWIPE_UP : BSP_SWIPE_DOWN;
+                }
+            }
+        }
     }
 }
