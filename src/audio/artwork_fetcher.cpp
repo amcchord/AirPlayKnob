@@ -1,4 +1,5 @@
 #include "artwork_fetcher.h"
+#include "radio_streamer.h"
 #include "app_state.h"
 #include <Arduino.h>
 #include <WiFi.h>
@@ -335,7 +336,9 @@ static void artwork_worker_task(void *arg) {
         }
 
         // 2. If Wi-Fi is up and we haven't downloaded the SomaFM station JPEG yet, fetch it
-        if (wifi_ok && !station_jpg_loaded && st.id[0] != '\0') {
+        //    Wait until at least 2.0s of audio is buffered so TLS handshake never starves initial playback!
+        if (wifi_ok && !station_jpg_loaded && st.id[0] != '\0' &&
+            (!g_app.playing || radio_get_buffered_ms() >= 2000)) {
             char somafm_art_url[128];
             snprintf(somafm_art_url, sizeof(somafm_art_url), "https://somafm.com/img/%s120.jpg", st.id);
             size_t jpg_len = 0;
@@ -349,8 +352,9 @@ static void artwork_worker_task(void *arg) {
             station_jpg_loaded = true;
         }
 
-        // 3. Did the live ICY track change? Query iTunes for Album Art!
-        if (wifi_ok && cur_track[0] != '\0' && strcmp(cur_track, last_track) != 0) {
+        // 3. Did the live ICY track change? Query iTunes for Album Art once audio buffer has >= 2.2s cushion!
+        if (wifi_ok && cur_track[0] != '\0' && strcmp(cur_track, last_track) != 0 &&
+            (!g_app.playing || radio_get_buffered_ms() >= 2200)) {
             strncpy(last_track, cur_track, sizeof(last_track) - 1);
 
             bool is_real_song = (strstr(cur_track, " - ") != NULL) &&
@@ -437,7 +441,7 @@ void artwork_fetcher_start(void) {
 
     StackType_t *art_stack = (StackType_t *)heap_caps_malloc(16384, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     StaticTask_t *art_tcb  = (StaticTask_t *)heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    xTaskCreateStaticPinnedToCore(artwork_worker_task, "art_fetch", 16384 / sizeof(StackType_t), NULL, 2, art_stack, art_tcb, 0);
+    xTaskCreateStaticPinnedToCore(artwork_worker_task, "art_fetch", 16384 / sizeof(StackType_t), NULL, 1, art_stack, art_tcb, 0);
 }
 
 const lv_img_dsc_t *artwork_get_dsc(void) {

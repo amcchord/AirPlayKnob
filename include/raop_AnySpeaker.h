@@ -32,6 +32,10 @@ private:
                   const char *content_type, const uint8_t *content, int content_len,
                   const char *extra_headers, char *resp_headers_out, int resp_headers_max,
                   uint8_t **resp_body_out, int *resp_body_len_out);
+    bool sendRtspAsync(const char *cmd, const char *uri_override,
+                       const char *content_type, const uint8_t *content, int content_len,
+                       const char *extra_headers);
+    void drainRtspResponses();
 
     int rtspSend(const uint8_t *data, int len);
     bool rtspFillPlain(int timeout_ms);

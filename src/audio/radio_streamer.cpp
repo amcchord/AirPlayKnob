@@ -13,8 +13,9 @@
 #include <esp_heap_caps.h>
 #include <esp_timer.h>
 
-// 256KB stereo PCM ringbuffer in PSRAM (65536 stereo frames = ~1.48 seconds at 44.1kHz)
-#define PCM_RING_FRAMES 65536
+// 2MB stereo PCM ringbuffer in PSRAM (524288 stereo frames = ~11.89 seconds at 44.1kHz)
+#define PCM_RING_FRAMES 524288
+#define MP3_BUF_SIZE    65536
 static int16_t *s_pcm_ring = NULL;
 static volatile uint32_t s_ring_write = 0;
 static volatile uint32_t s_ring_read = 0;
@@ -25,6 +26,10 @@ static uint32_t ring_available_frames() {
     uint32_t avail = (s_ring_write - s_ring_read) & (PCM_RING_FRAMES - 1);
     portEXIT_CRITICAL(&s_ring_mux);
     return avail;
+}
+
+uint32_t radio_get_buffered_ms(void) {
+    return (uint32_t)(((uint64_t)ring_available_frames() * 1000ULL) / 44100ULL);
 }
 
 static uint32_t ring_free_frames() {
@@ -138,12 +143,12 @@ static void parse_icy_metadata(const char *meta_buf, int meta_len) {
     }
 }
 
-// Task 1: HTTP Icecast reader + MP3 decoder -> PSRAM ringbuffer
+// Task 1: HTTP Icecast reader + MP3 decoder -> 2MB PSRAM ringbuffer (~12 seconds cushion)
 static void http_decoder_task(void *arg) {
     mp3dec_t *mp3d = (mp3dec_t *)heap_caps_malloc(sizeof(mp3dec_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     int16_t *pcm_out = (int16_t *)heap_caps_malloc(MINIMP3_MAX_SAMPLES_PER_FRAME * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     int16_t *stereo_tmp = (int16_t *)heap_caps_malloc(MINIMP3_MAX_SAMPLES_PER_FRAME * 2 * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    uint8_t *mp3_buf = (uint8_t *)heap_caps_malloc(16384, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint8_t *mp3_buf = (uint8_t *)heap_caps_malloc(MP3_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     char *meta_buf = (char *)heap_caps_malloc(4096, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
     int mirror_idx = 0;
@@ -207,8 +212,8 @@ static void http_decoder_task(void *arg) {
         HTTPClient http;
         http.setUserAgent("VLC/3.0.20");
         http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-        http.setConnectTimeout(6000);
-        http.setTimeout(6000);
+        http.setConnectTimeout(8000);
+        http.setTimeout(12000);
 
         const char *header_keys[] = {"icy-metaint", "icy-name", "icy-br"};
         http.collectHeaders(header_keys, 3);
@@ -285,71 +290,75 @@ static void http_decoder_task(void *arg) {
             }
             if (!keep_going) break;
 
-            // Throttle reading if ringbuffer is nearly full
-            if (ring_free_frames() < 2304) {
+            // Throttle reading only when the 12-second ringbuffer is nearly full
+            if (ring_free_frames() < 4608) {
                 vTaskDelay(pdMS_TO_TICKS(5));
                 continue;
             }
 
             int avail = stream->available();
-            if (avail <= 0) {
-                if (millis() - last_data_ms > 8000) {
-                    Serial.println("[RADIO] Stream read timeout, reconnecting...");
-                    break;
+            if (avail > 0) {
+                last_data_ms = millis();
+                int space = MP3_BUF_SIZE - mp3_fill;
+                if (space <= 0) {
+                    // Drop oldest half if MP3 buffer couldn't sync
+                    int drop = MP3_BUF_SIZE / 2;
+                    memmove(mp3_buf, mp3_buf + drop, mp3_fill - drop);
+                    mp3_fill -= drop;
+                    space = MP3_BUF_SIZE - mp3_fill;
                 }
-                vTaskDelay(pdMS_TO_TICKS(3));
-                continue;
-            }
-            last_data_ms = millis();
 
-            int space = 16384 - mp3_fill;
-            if (space <= 0) {
-                // Drop half if buffer couldn't sync
-                memmove(mp3_buf, mp3_buf + 8192, mp3_fill - 8192);
-                mp3_fill -= 8192;
-                space = 8192;
-            }
+                int to_read = (avail < space) ? avail : space;
+                if (to_read > 8192) to_read = 8192;
+                if (metaint > 0 && to_read > bytes_until_meta) {
+                    to_read = bytes_until_meta;
+                }
 
-            int to_read = (avail < space) ? avail : space;
-            if (metaint > 0 && to_read > bytes_until_meta) {
-                to_read = bytes_until_meta;
-            }
-
-            int n = stream->read(mp3_buf + mp3_fill, to_read);
-            if (n > 0) {
-                mp3_fill += n;
-                if (metaint > 0) {
-                    bytes_until_meta -= n;
-                    if (bytes_until_meta == 0) {
-                        // Read 1-byte ICY metadata length
-                        uint32_t t0 = millis();
-                        while (stream->available() < 1 && millis() - t0 < 2000) {
-                            vTaskDelay(pdMS_TO_TICKS(2));
-                        }
-                        int len_byte = stream->read();
-                        if (len_byte > 0) {
-                            int mlen = len_byte * 16;
-                            int mread = 0;
-                            t0 = millis();
-                            while (mread < mlen && millis() - t0 < 2500) {
-                                int c = stream->read((uint8_t *)meta_buf + mread, mlen - mread);
-                                if (c > 0) mread += c;
-                                else vTaskDelay(pdMS_TO_TICKS(2));
+                int n = stream->read(mp3_buf + mp3_fill, to_read);
+                if (n > 0) {
+                    mp3_fill += n;
+                    if (metaint > 0) {
+                        bytes_until_meta -= n;
+                        if (bytes_until_meta == 0) {
+                            // Read 1-byte ICY metadata length
+                            uint32_t t0 = millis();
+                            while (stream->available() < 1 && millis() - t0 < 2500) {
+                                vTaskDelay(pdMS_TO_TICKS(2));
                             }
-                            meta_buf[mread] = '\0';
-                            parse_icy_metadata(meta_buf, mread);
+                            int len_byte = stream->read();
+                            if (len_byte > 0) {
+                                int mlen = len_byte * 16;
+                                int mread = 0;
+                                t0 = millis();
+                                while (mread < mlen && millis() - t0 < 3000) {
+                                    int c = stream->read((uint8_t *)meta_buf + mread, mlen - mread);
+                                    if (c > 0) mread += c;
+                                    else vTaskDelay(pdMS_TO_TICKS(2));
+                                }
+                                meta_buf[mread] = '\0';
+                                parse_icy_metadata(meta_buf, mread);
+                            }
+                            bytes_until_meta = metaint;
                         }
-                        bytes_until_meta = metaint;
                     }
                 }
+            } else if (mp3_fill < 2048) {
+                if (millis() - last_data_ms > 15000) {
+                    Serial.println("[RADIO] Stream read timeout (15s), reconnecting...");
+                    break;
+                }
+                vTaskDelay(pdMS_TO_TICKS(2));
+                continue;
             }
 
-            // Decode as many MP3 frames as available
-            while (mp3_fill >= 1024 && ring_free_frames() >= 1152) {
+            // Decode up to 6 MP3 frames per iteration using a rolling offset (single memmove per batch)
+            int mp3_off = 0;
+            int decoded_batches = 0;
+            while ((mp3_fill - mp3_off) >= 1440 && ring_free_frames() >= 1152 && decoded_batches < 6) {
                 mp3dec_frame_info_t info = {};
-                int samples = mp3dec_decode_frame(mp3d, mp3_buf, mp3_fill, pcm_out, &info);
+                int samples = mp3dec_decode_frame(mp3d, mp3_buf + mp3_off, mp3_fill - mp3_off, pcm_out, &info);
                 if (info.frame_bytes == 0) {
-                    break; // need more data
+                    break; // need more MP3 bytes
                 }
                 if (samples > 0) {
                     if (info.channels == 2) {
@@ -362,9 +371,13 @@ static void http_decoder_task(void *arg) {
                         ring_push_frames(stereo_tmp, (uint32_t)samples);
                     }
                 }
-                mp3_fill -= info.frame_bytes;
+                mp3_off += info.frame_bytes;
+                decoded_batches++;
+            }
+            if (mp3_off > 0) {
+                mp3_fill -= mp3_off;
                 if (mp3_fill > 0) {
-                    memmove(mp3_buf, mp3_buf + info.frame_bytes, mp3_fill);
+                    memmove(mp3_buf, mp3_buf + mp3_off, mp3_fill);
                 }
             }
         }
@@ -467,10 +480,10 @@ static void raop_sender_task(void *arg) {
 
         raop->pollControlAndKeepalive();
 
-        // Pre-buffer ~0.4s (17640 frames) before starting burst so RTSP/HTTP jitter never underruns
+        // Pre-buffer ~0.65s (28665 frames) before starting burst; background decoder continues filling up to ~12s!
         uint32_t avail = ring_available_frames();
         if (prebuffering) {
-            if (avail < 17640) {
+            if (avail < 28665) {
                 vTaskDelay(pdMS_TO_TICKS(5));
                 next_send_us = esp_timer_get_time();
                 continue;
@@ -478,6 +491,7 @@ static void raop_sender_task(void *arg) {
             prebuffering = false;
             next_send_us = esp_timer_get_time();
         } else if (avail < RAOP_CHUNK_FRAMES) {
+            Serial.println("[RADIO] PCM ringbuffer underrun; re-buffering...");
             prebuffering = true;
             vTaskDelay(pdMS_TO_TICKS(5));
             continue;
@@ -533,7 +547,7 @@ void radio_streamer_start(void) {
     // Allocate large audio decoder & RAOP task stacks in PSRAM to keep internal SRAM free for TLS/Wi-Fi
     StackType_t *http_stack = (StackType_t *)heap_caps_malloc(28672, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     StaticTask_t *http_tcb  = (StaticTask_t *)heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    xTaskCreateStaticPinnedToCore(http_decoder_task, "radio_http", 28672 / sizeof(StackType_t), NULL, 3, http_stack, http_tcb, 0);
+    xTaskCreateStaticPinnedToCore(http_decoder_task, "radio_http", 28672 / sizeof(StackType_t), NULL, 4, http_stack, http_tcb, 0);
 
     StackType_t *raop_stack = (StackType_t *)heap_caps_malloc(24576, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     StaticTask_t *raop_tcb  = (StaticTask_t *)heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);

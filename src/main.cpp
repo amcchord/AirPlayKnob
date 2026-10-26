@@ -575,8 +575,9 @@ static void poll_serial_debug(void) {
                 } else if (strcasecmp(s_cmd, "STATUS") == 0) {
                     const char *spk_name = (g_app.current_speaker >= 0 && g_app.current_speaker < g_app.speaker_count)
                                            ? g_app.speakers[g_app.current_speaker].name : "?";
-                    Serial.printf("[DBG] Tab=%d WhiteCap=%d FPS=%u Preset=%d Speaker=%d ('%s') Vol=%d Status='%s' FreeHeap=%u FreePSRAM=%u\n",
+                    Serial.printf("[DBG] Tab=%d WhiteCap=%d FPS=%u BufMs=%u Preset=%d Speaker=%d ('%s') Vol=%d Status='%s' FreeHeap=%u FreePSRAM=%u\n",
                                   knob_ui_get_tab(), (int)g_app.whitecap_active, (unsigned)bsp_get_fps(),
+                                  (unsigned)radio_get_buffered_ms(),
                                   g_app.current_preset, g_app.current_speaker, spk_name,
                                   g_app.volume, g_app.status_text,
                                   (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());

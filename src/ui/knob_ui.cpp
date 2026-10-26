@@ -1,4 +1,5 @@
 #include "knob_ui.h"
+#include "ui_fonts.h"
 #include "app_state.h"
 #include "artwork_fetcher.h"
 #include "bsp/lcd_bsp.h"
@@ -834,7 +835,7 @@ static void wifi_ssid_click_cb(lv_event_t *e) {
 
     lv_obj_t *lbl = lv_label_create(s_wifi_modal);
     lv_label_set_text_fmt(lbl, "Join %s", s_pending_ssid);
-    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(lbl, &ui_font_md, 0);
     lv_obj_set_style_text_color(lbl, hex_to_lv(0xF8FAFC), 0);
     lv_obj_align(lbl, LV_ALIGN_TOP_MID, 0, 26);
 
@@ -873,7 +874,7 @@ static void open_wifi_scan_modal(lv_event_t *e) {
 
     lv_obj_t *hdr = lv_label_create(s_wifi_modal);
     lv_label_set_text(hdr, "Select Wi-Fi Network");
-    lv_obj_set_style_text_font(hdr, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(hdr, &ui_font_md, 0);
     lv_obj_set_style_text_color(hdr, hex_to_lv(0x94A3B8), 0);
     lv_obj_align(hdr, LV_ALIGN_TOP_MID, 0, 26);
 
@@ -924,7 +925,7 @@ static lv_obj_t *create_pill_btn(lv_obj_t *parent, int w, int h, uint32_t bg_hex
 
     lv_obj_t *lbl = lv_label_create(btn);
     lv_label_set_text(lbl, text);
-    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(lbl, &ui_font_sm, 0);
     lv_obj_set_style_text_color(lbl, hex_to_lv(text_hex), 0);
     lv_obj_center(lbl);
     return btn;
@@ -1093,37 +1094,37 @@ void knob_ui_init(void) {
     lv_obj_add_flag(s_pause_badge, LV_OBJ_FLAG_HIDDEN);
 
     // Bottom Overlay Typography over the pre-baked full-screen artwork scrim:
-    // 1. Track Name (y = 244..268, bold white, single-line ellipsis)
+    // 1. Track Name (y = 240..268, bold Space Grotesk 22px, single-line ellipsis)
     s_lbl_track = lv_label_create(p0);
     lv_label_set_text(s_lbl_track, "Groove Salad");
-    lv_obj_set_style_text_font(s_lbl_track, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(s_lbl_track, &ui_font_xl, 0);
     lv_obj_set_style_text_color(s_lbl_track, hex_to_lv(0xFFFFFF), 0);
     lv_label_set_long_mode(s_lbl_track, LV_LABEL_LONG_DOT);
-    lv_obj_set_size(s_lbl_track, 292, 24);
+    lv_obj_set_size(s_lbl_track, 292, 28);
     lv_obj_set_style_text_align(s_lbl_track, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(s_lbl_track, LV_ALIGN_TOP_MID, 0, 244);
+    lv_obj_align(s_lbl_track, LV_ALIGN_TOP_MID, 0, 240);
     lv_obj_clear_flag(s_lbl_track, LV_OBJ_FLAG_CLICKABLE);
 
-    // 2. Artist Name (y = 272..290, crisp silver, single-line ellipsis)
+    // 2. Artist Name (y = 270..292, Space Grotesk Medium 15px, single-line ellipsis)
     s_lbl_artist = lv_label_create(p0);
     lv_label_set_text(s_lbl_artist, "SomaFM Radio");
-    lv_obj_set_style_text_font(s_lbl_artist, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(s_lbl_artist, &ui_font_md, 0);
     lv_obj_set_style_text_color(s_lbl_artist, hex_to_lv(0xE2E8F0), 0);
     lv_label_set_long_mode(s_lbl_artist, LV_LABEL_LONG_DOT);
-    lv_obj_set_size(s_lbl_artist, 264, 18);
+    lv_obj_set_size(s_lbl_artist, 264, 22);
     lv_obj_set_style_text_align(s_lbl_artist, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(s_lbl_artist, LV_ALIGN_TOP_MID, 0, 272);
+    lv_obj_align(s_lbl_artist, LV_ALIGN_TOP_MID, 0, 270);
     lv_obj_clear_flag(s_lbl_artist, LV_OBJ_FLAG_CLICKABLE);
 
-    // 3. Station • AirPlay Speaker status line (y = 296..312, station theme accent color)
+    // 3. Station • AirPlay Speaker status line (y = 295..315, Space Grotesk Bold 13px)
     s_lbl_sub_meta = lv_label_create(p0);
     lv_label_set_text(s_lbl_sub_meta, "Groove Salad  •  Tree House");
-    lv_obj_set_style_text_font(s_lbl_sub_meta, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(s_lbl_sub_meta, &ui_font_sm, 0);
     lv_obj_set_style_text_color(s_lbl_sub_meta, hex_to_lv(0x10B981), 0);
     lv_label_set_long_mode(s_lbl_sub_meta, LV_LABEL_LONG_DOT);
-    lv_obj_set_size(s_lbl_sub_meta, 248, 16);
+    lv_obj_set_size(s_lbl_sub_meta, 248, 20);
     lv_obj_set_style_text_align(s_lbl_sub_meta, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(s_lbl_sub_meta, LV_ALIGN_TOP_MID, 0, 296);
+    lv_obj_align(s_lbl_sub_meta, LV_ALIGN_TOP_MID, 0, 295);
     lv_obj_clear_flag(s_lbl_sub_meta, LV_OBJ_FLAG_CLICKABLE);
 
     // =========================================================================
@@ -1133,7 +1134,7 @@ void knob_ui_init(void) {
 
     s_lbl_st_hdr = lv_label_create(p1);
     lv_label_set_text(s_lbl_st_hdr, "STATIONS  •  1 / 30");
-    lv_obj_set_style_text_font(s_lbl_st_hdr, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(s_lbl_st_hdr, &ui_font_sm, 0);
     lv_obj_set_style_text_color(s_lbl_st_hdr, hex_to_lv(0x94A3B8), 0);
     lv_obj_align(s_lbl_st_hdr, LV_ALIGN_TOP_MID, 0, 26);
 
@@ -1164,17 +1165,17 @@ void knob_ui_init(void) {
         lv_obj_clear_flag(dot, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
 
         lv_obj_t *title = lv_label_create(row);
-        lv_obj_set_style_text_font(title, i == 2 ? &lv_font_montserrat_16 : &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_font(title, i == 2 ? &ui_font_lg : &ui_font_md, 0);
         lv_obj_set_style_text_color(title, hex_to_lv(0xFFFFFF), 0);
         lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
-        lv_obj_set_size(title, SLOT_W[i] - 102, i == 2 ? 20 : 18);
+        lv_obj_set_size(title, SLOT_W[i] - 102, i == 2 ? 24 : 20);
         lv_obj_align(title, LV_ALIGN_LEFT_MID, 26, 0);
 
         lv_obj_t *tag = lv_label_create(row);
-        lv_obj_set_style_text_font(tag, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_font(tag, &ui_font_sm, 0);
         lv_obj_set_style_text_color(tag, hex_to_lv(0x64748B), 0);
         lv_label_set_long_mode(tag, LV_LABEL_LONG_CLIP);
-        lv_obj_set_size(tag, 64, 16);
+        lv_obj_set_size(tag, 64, 18);
         lv_obj_set_style_text_align(tag, LV_TEXT_ALIGN_RIGHT, 0);
         lv_obj_align(tag, LV_ALIGN_RIGHT_MID, -12, 0);
 
@@ -1186,7 +1187,7 @@ void knob_ui_init(void) {
 
     lv_obj_t *st_hint = lv_label_create(p1);
     lv_label_set_text(st_hint, "TAP TO TUNE  •  SWIPE BACK");
-    lv_obj_set_style_text_font(st_hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(st_hint, &ui_font_sm, 0);
     lv_obj_set_style_text_color(st_hint, hex_to_lv(0x475569), 0);
     lv_obj_align(st_hint, LV_ALIGN_TOP_MID, 0, 288);
 
@@ -1199,7 +1200,7 @@ void knob_ui_init(void) {
 
     s_lbl_spkr_hdr = lv_label_create(p2);
     lv_label_set_text(s_lbl_spkr_hdr, "AIRPLAY SPEAKERS");
-    lv_obj_set_style_text_font(s_lbl_spkr_hdr, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(s_lbl_spkr_hdr, &ui_font_sm, 0);
     lv_obj_set_style_text_color(s_lbl_spkr_hdr, hex_to_lv(0x94A3B8), 0);
     lv_obj_align(s_lbl_spkr_hdr, LV_ALIGN_TOP_MID, 0, 26);
 
@@ -1226,17 +1227,17 @@ void knob_ui_init(void) {
         lv_obj_clear_flag(dot, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
 
         lv_obj_t *title = lv_label_create(row);
-        lv_obj_set_style_text_font(title, i == 2 ? &lv_font_montserrat_16 : &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_font(title, i == 2 ? &ui_font_lg : &ui_font_md, 0);
         lv_obj_set_style_text_color(title, hex_to_lv(0xFFFFFF), 0);
         lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
-        lv_obj_set_size(title, SLOT_W[i] - 104, i == 2 ? 20 : 18);
+        lv_obj_set_size(title, SLOT_W[i] - 104, i == 2 ? 24 : 20);
         lv_obj_align(title, LV_ALIGN_LEFT_MID, 26, 0);
 
         lv_obj_t *tag = lv_label_create(row);
-        lv_obj_set_style_text_font(tag, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_font(tag, &ui_font_sm, 0);
         lv_obj_set_style_text_color(tag, hex_to_lv(0x38BDF8), 0);
         lv_label_set_long_mode(tag, LV_LABEL_LONG_CLIP);
-        lv_obj_set_size(tag, 66, 16);
+        lv_obj_set_size(tag, 66, 18);
         lv_obj_set_style_text_align(tag, LV_TEXT_ALIGN_RIGHT, 0);
         lv_obj_align(tag, LV_ALIGN_RIGHT_MID, -12, 0);
 
@@ -1248,7 +1249,7 @@ void knob_ui_init(void) {
 
     lv_obj_t *sp_hint = lv_label_create(p2);
     lv_label_set_text(sp_hint, "TAP TO CONNECT  •  SWIPE BACK");
-    lv_obj_set_style_text_font(sp_hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(sp_hint, &ui_font_sm, 0);
     lv_obj_set_style_text_color(sp_hint, hex_to_lv(0x475569), 0);
     lv_obj_align(sp_hint, LV_ALIGN_TOP_MID, 0, 288);
 
@@ -1261,13 +1262,13 @@ void knob_ui_init(void) {
 
     s_lbl_wifi_ssid = lv_label_create(p3);
     lv_label_set_text(s_lbl_wifi_ssid, LV_SYMBOL_WIFI " SvensHaus");
-    lv_obj_set_style_text_font(s_lbl_wifi_ssid, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(s_lbl_wifi_ssid, &ui_font_md, 0);
     lv_obj_set_style_text_color(s_lbl_wifi_ssid, hex_to_lv(0xF8FAFC), 0);
     lv_obj_align(s_lbl_wifi_ssid, LV_ALIGN_TOP_MID, 0, 24);
 
     s_lbl_wifi_ip = lv_label_create(p3);
     lv_label_set_text(s_lbl_wifi_ip, "http://airplayknob.local/");
-    lv_obj_set_style_text_font(s_lbl_wifi_ip, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(s_lbl_wifi_ip, &ui_font_sm, 0);
     lv_obj_set_style_text_color(s_lbl_wifi_ip, hex_to_lv(0x38BDF8), 0);
     lv_obj_align(s_lbl_wifi_ip, LV_ALIGN_TOP_MID, 0, 46);
 
@@ -1286,16 +1287,16 @@ void knob_ui_init(void) {
 
     lv_obj_t *ota_lbl = lv_label_create(p3);
     lv_label_set_text(ota_lbl, "Web Presets & OTA Ready");
-    lv_obj_set_style_text_font(ota_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(ota_lbl, &ui_font_sm, 0);
     lv_obj_set_style_text_color(ota_lbl, hex_to_lv(0x64748B), 0);
     lv_obj_align(ota_lbl, LV_ALIGN_TOP_MID, 0, 214);
 
-    lv_obj_t *w_scan_btn = create_pill_btn(p3, 102, 32, 0x0F141D, 0x1E293B, "Wi-Fi Scan", 0xCBD5E1);
-    lv_obj_align(w_scan_btn, LV_ALIGN_TOP_MID, -56, 244);
+    lv_obj_t *w_scan_btn = create_pill_btn(p3, 106, 32, 0x0F141D, 0x1E293B, "Wi-Fi Scan", 0xCBD5E1);
+    lv_obj_align(w_scan_btn, LV_ALIGN_TOP_MID, -58, 244);
     lv_obj_add_event_cb(w_scan_btn, open_wifi_scan_modal, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t *w_airplay_btn = create_pill_btn(p3, 106, 32, 0x0F141D, 0x1E293B, "Scan AirPlay", 0x38BDF8);
-    lv_obj_align(w_airplay_btn, LV_ALIGN_TOP_MID, 56, 244);
+    lv_obj_t *w_airplay_btn = create_pill_btn(p3, 110, 32, 0x0F141D, 0x1E293B, "Scan AirPlay", 0x38BDF8);
+    lv_obj_align(w_airplay_btn, LV_ALIGN_TOP_MID, 58, 244);
     lv_obj_add_event_cb(w_airplay_btn, [](lv_event_t *e) {
         (void)e;
         if (bsp_was_touch_dragged()) return;
@@ -1310,7 +1311,7 @@ void knob_ui_init(void) {
 
     lv_obj_t *set_hint = lv_label_create(p3);
     lv_label_set_text(set_hint, "SWIPE UP FOR HOME");
-    lv_obj_set_style_text_font(set_hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(set_hint, &ui_font_sm, 0);
     lv_obj_set_style_text_color(set_hint, hex_to_lv(0x475569), 0);
     lv_obj_align(set_hint, LV_ALIGN_TOP_MID, 0, 290);
 
@@ -1348,9 +1349,9 @@ void knob_ui_init(void) {
     }, LV_EVENT_CLICKED, NULL);
 
     s_wc_caption_box = lv_obj_create(s_wc_layer);
-    lv_obj_set_size(s_wc_caption_box, 256, 52);
+    lv_obj_set_size(s_wc_caption_box, 256, 54);
     lv_obj_align(s_wc_caption_box, LV_ALIGN_TOP_MID, 0, 272);
-    lv_obj_set_style_radius(s_wc_caption_box, 26, 0);
+    lv_obj_set_style_radius(s_wc_caption_box, 27, 0);
     lv_obj_set_style_bg_color(s_wc_caption_box, hex_to_lv(0x050608), 0);
     lv_obj_set_style_bg_opa(s_wc_caption_box, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(s_wc_caption_box, 1, 0);
@@ -1360,21 +1361,21 @@ void knob_ui_init(void) {
 
     s_wc_lbl_track = lv_label_create(s_wc_caption_box);
     lv_label_set_text(s_wc_lbl_track, "Groove Salad");
-    lv_obj_set_style_text_font(s_wc_lbl_track, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(s_wc_lbl_track, &ui_font_md, 0);
     lv_obj_set_style_text_color(s_wc_lbl_track, hex_to_lv(0xF8FAFC), 0);
     lv_label_set_long_mode(s_wc_lbl_track, LV_LABEL_LONG_DOT);
-    lv_obj_set_size(s_wc_lbl_track, 228, 18);
+    lv_obj_set_size(s_wc_lbl_track, 228, 20);
     lv_obj_set_style_text_align(s_wc_lbl_track, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(s_wc_lbl_track, LV_ALIGN_TOP_MID, 0, 8);
 
     s_wc_lbl_sub = lv_label_create(s_wc_caption_box);
     lv_label_set_text(s_wc_lbl_sub, WHITECAP_PRESET_NAMES[0]);
-    lv_obj_set_style_text_font(s_wc_lbl_sub, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(s_wc_lbl_sub, &ui_font_sm, 0);
     lv_obj_set_style_text_color(s_wc_lbl_sub, hex_to_lv(0x94A3B8), 0);
     lv_label_set_long_mode(s_wc_lbl_sub, LV_LABEL_LONG_DOT);
-    lv_obj_set_size(s_wc_lbl_sub, 228, 16);
+    lv_obj_set_size(s_wc_lbl_sub, 228, 18);
     lv_obj_set_style_text_align(s_wc_lbl_sub, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(s_wc_lbl_sub, LV_ALIGN_TOP_MID, 0, 28);
+    lv_obj_align(s_wc_lbl_sub, LV_ALIGN_TOP_MID, 0, 29);
 
     // Register 60+ FPS WhiteCap render timer inside LVGL
     lv_timer_create(whitecap_lv_timer_cb, 1, NULL);
@@ -1383,9 +1384,9 @@ void knob_ui_init(void) {
     // MINIMALIST FLOATING HUD PILL (Opaque cover when turning physical knob)
     // =========================================================================
     s_hud_pill = lv_obj_create(s_scr);
-    lv_obj_set_size(s_hud_pill, 236, 56);
-    lv_obj_align(s_hud_pill, LV_ALIGN_TOP_MID, 0, 258);
-    lv_obj_set_style_radius(s_hud_pill, 28, 0);
+    lv_obj_set_size(s_hud_pill, 236, 58);
+    lv_obj_align(s_hud_pill, LV_ALIGN_TOP_MID, 0, 256);
+    lv_obj_set_style_radius(s_hud_pill, 29, 0);
     lv_obj_set_style_bg_color(s_hud_pill, hex_to_lv(0x0B0F19), 0);
     lv_obj_set_style_bg_opa(s_hud_pill, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(s_hud_pill, 1, 0);
@@ -1395,19 +1396,19 @@ void knob_ui_init(void) {
 
     s_lbl_hud_title = lv_label_create(s_hud_pill);
     lv_label_set_text(s_lbl_hud_title, "VOLUME");
-    lv_obj_set_style_text_font(s_lbl_hud_title, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(s_lbl_hud_title, &ui_font_sm, 0);
     lv_obj_set_style_text_color(s_lbl_hud_title, hex_to_lv(0x10B981), 0);
     lv_label_set_long_mode(s_lbl_hud_title, LV_LABEL_LONG_DOT);
-    lv_obj_set_size(s_lbl_hud_title, 196, 16);
+    lv_obj_set_size(s_lbl_hud_title, 196, 18);
     lv_obj_set_style_text_align(s_lbl_hud_title, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(s_lbl_hud_title, LV_ALIGN_TOP_MID, 0, 8);
 
     s_lbl_hud_val = lv_label_create(s_hud_pill);
     lv_label_set_text(s_lbl_hud_val, "18%");
-    lv_obj_set_style_text_font(s_lbl_hud_val, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(s_lbl_hud_val, &ui_font_lg, 0);
     lv_obj_set_style_text_color(s_lbl_hud_val, hex_to_lv(0xFFFFFF), 0);
     lv_label_set_long_mode(s_lbl_hud_val, LV_LABEL_LONG_DOT);
-    lv_obj_set_size(s_lbl_hud_val, 204, 20);
+    lv_obj_set_size(s_lbl_hud_val, 204, 24);
     lv_obj_set_style_text_align(s_lbl_hud_val, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(s_lbl_hud_val, LV_ALIGN_TOP_MID, 0, 27);
 
@@ -1692,7 +1693,7 @@ void knob_ui_tick(void) {
                 lv_obj_add_event_cb(b, wifi_ssid_click_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
                 lv_obj_t *l = lv_label_create(b);
                 lv_label_set_text_fmt(l, "%s (%ld dBm)", items[i].ssid, (long)items[i].rssi);
-                lv_obj_set_style_text_font(l, &lv_font_montserrat_12, 0);
+                lv_obj_set_style_text_font(l, &ui_font_sm, 0);
                 lv_obj_align(l, LV_ALIGN_LEFT_MID, 10, 0);
             }
         }

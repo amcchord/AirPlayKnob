@@ -18,7 +18,7 @@
 #include <mbedtls/hkdf.h>
 #include <sodium.h>
 
-#define BACKLOG_SIZE 256
+#define BACKLOG_SIZE 512
 #define BPLIST_CONTENT_TYPE "application/x-apple-binary-plist"
 #define AP2_BLOCK_MAX 0x400
 #define AP2_TAG_SIZE  16
@@ -460,7 +460,7 @@ bool RaopClient::connect(const AirPlaySpeaker &spk, int initial_volume_pct) {
         return false;
     }
 
-    int sndbuf = 65536;
+    int sndbuf = 131072;
     setsockopt(m_audio_sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 
     m_remote_time_port = 0;
@@ -659,6 +659,71 @@ bool RaopClient::rtspFillPlain(int timeout_ms) {
     return true;
 }
 
+bool RaopClient::sendRtspAsync(const char *cmd, const char *uri_override,
+                               const char *content_type, const uint8_t *content, int content_len,
+                               const char *extra_headers) {
+    if (m_rtsp_sock < 0) return false;
+
+    int req_cap = 1024 + content_len;
+    uint8_t *req = (uint8_t *)malloc(req_cap);
+    if (!req) return false;
+
+    int hdr_len = snprintf((char *)req, 1024,
+        "%s %s RTSP/1.0\r\n"
+        "CSeq: %d\r\n"
+        "User-Agent: %s\r\n"
+        "Client-Instance: %s\r\n"
+        "DACP-ID: %s\r\n"
+        "Active-Remote: %s\r\n",
+        cmd, uri_override ? uri_override : m_rtsp_url,
+        ++m_cseq, m_user_agent, m_sci, m_dacp_id, m_active_remote);
+
+    if (m_ap2) {
+        hdr_len += snprintf((char *)req + hdr_len, 1024 - hdr_len, "X-Apple-Client-Name: AirPlay\r\n");
+    }
+    if (m_session[0]) {
+        hdr_len += snprintf((char *)req + hdr_len, 1024 - hdr_len, "Session: %s\r\n", m_session);
+    }
+    if (extra_headers && extra_headers[0]) {
+        hdr_len += snprintf((char *)req + hdr_len, 1024 - hdr_len, "%s", extra_headers);
+    }
+    if (content_type && content && content_len > 0) {
+        hdr_len += snprintf((char *)req + hdr_len, 1024 - hdr_len,
+            "Content-Type: %s\r\nContent-Length: %d\r\n", content_type, content_len);
+    }
+    hdr_len += snprintf((char *)req + hdr_len, 1024 - hdr_len, "\r\n");
+
+    if (content && content_len > 0) {
+        memcpy(req + hdr_len, content, content_len);
+    }
+
+    int total_send = hdr_len + content_len;
+    int sent = rtspSend(req, total_send);
+    free(req);
+    return (sent == total_send);
+}
+
+void RaopClient::drainRtspResponses() {
+    if (m_rtsp_sock < 0) return;
+    while (rtspFillPlain(0)) {
+        // Keep draining non-blockingly while socket has bytes
+    }
+    while (m_rx_plain_buf && m_rx_plain_len > 0) {
+        char *hdr_end_ptr = strstr((char *)m_rx_plain_buf, "\r\n\r\n");
+        if (!hdr_end_ptr) break;
+        int clen = 0;
+        char *cl_ptr = strcasestr((char *)m_rx_plain_buf, "\r\nContent-Length:");
+        if (cl_ptr && cl_ptr < hdr_end_ptr) {
+            clen = atoi(cl_ptr + 17);
+        }
+        size_t hdr_bytes = (size_t)(hdr_end_ptr + 4 - (char *)m_rx_plain_buf);
+        size_t needed = hdr_bytes + (size_t)clen;
+        if (m_rx_plain_len < needed) break;
+        memmove(m_rx_plain_buf, m_rx_plain_buf + needed, m_rx_plain_len - needed + 1);
+        m_rx_plain_len -= needed;
+    }
+}
+
 bool RaopClient::execRtsp(const char *cmd, const char *uri_override,
                           const char *content_type, const uint8_t *content, int content_len,
                           const char *extra_headers, char *resp_headers_out, int resp_headers_max,
@@ -666,6 +731,8 @@ bool RaopClient::execRtsp(const char *cmd, const char *uri_override,
     if (resp_body_out) *resp_body_out = NULL;
     if (resp_body_len_out) *resp_body_len_out = 0;
     if (m_rtsp_sock < 0) return false;
+
+    drainRtspResponses();
 
     int req_cap = 1024 + content_len;
     uint8_t *req = (uint8_t *)malloc(req_cap);
@@ -1324,7 +1391,7 @@ bool RaopClient::setVolume(int volume_pct) {
     float db = (volume_pct == 0) ? -144.0f : (-28.0f + (28.0f * (float)volume_pct) / 100.0f);
     char body[64];
     int blen = snprintf(body, sizeof(body), "volume: %.6f\r\n", db);
-    return execRtsp("SET_PARAMETER", NULL, "text/parameters", (const uint8_t *)body, blen, NULL, NULL, 0, NULL, NULL);
+    return sendRtspAsync("SET_PARAMETER", NULL, "text/parameters", (const uint8_t *)body, blen, NULL);
 }
 
 static int write_dmap_str(uint8_t *dst, const char *tag, const char *str) {
@@ -1356,7 +1423,7 @@ bool RaopClient::setMetadata(const char *title, const char *artist, const char *
 
     char hdr[64];
     snprintf(hdr, sizeof(hdr), "RTP-Info: rtptime=%u\r\n", (unsigned)(m_head_ts + m_latency_frames));
-    return execRtsp("SET_PARAMETER", NULL, "application/x-dmap-tagged", dmap, pos, hdr, NULL, 0, NULL, NULL);
+    return sendRtspAsync("SET_PARAMETER", NULL, "application/x-dmap-tagged", dmap, pos, hdr);
 }
 
 void RaopClient::sendSyncPacket(bool first) {
@@ -1399,7 +1466,7 @@ bool RaopClient::sendChunk(const int16_t *stereo_pcm_352) {
     if (!m_connected || m_audio_sock < 0) return false;
 
     uint64_t now_ts = ntp_to_ts(get_ntp_now(NULL, NULL), RAOP_SAMPLE_RATE);
-    if (m_first_pkt || now_ts > m_head_ts + 22050ULL) {
+    if (m_first_pkt || now_ts > m_head_ts + 88200ULL) {
         m_head_ts = now_ts;
         sendSyncPacket(true);
         m_last_sync_us = esp_timer_get_time();
@@ -1534,6 +1601,7 @@ void RaopClient::handleControlSocket() {
 void RaopClient::pollControlAndKeepalive() {
     if (!m_connected) return;
     handleControlSocket();
+    drainRtspResponses();
     if (m_ap2) {
         pollEventChannel();
     }
@@ -1541,9 +1609,9 @@ void RaopClient::pollControlAndKeepalive() {
     if (now_us - m_last_keepalive_us >= 20000000ULL) {
         m_last_keepalive_us = now_us;
         if (m_ap2) {
-            execRtsp("POST", "/feedback", NULL, NULL, 0, NULL, NULL, 0, NULL, NULL);
+            sendRtspAsync("POST", "/feedback", NULL, NULL, 0, NULL);
         } else {
-            execRtsp("OPTIONS", "*", NULL, NULL, 0, NULL, NULL, 0, NULL, NULL);
+            sendRtspAsync("OPTIONS", "*", NULL, NULL, 0, NULL);
         }
     }
 }
