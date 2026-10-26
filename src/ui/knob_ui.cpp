@@ -93,15 +93,23 @@ static lv_obj_t *s_wc_lbl_track = NULL;
 static lv_obj_t *s_wc_lbl_sub = NULL;
 static uint32_t s_wc_caption_hide_ms = 0;
 static float s_wc_phase = 0.0f;
+static float s_wc_cam_time = 0.0f;
+static float s_wc_color_drift = 0.0f;
+static float s_wc_agc_peak = 32.0f;
 
-// Stored in fast 240MHz internal SRAM (~4.5 KB total, zero PSRAM traffic!)
-static uint8_t s_wc_grid[WC_ROWS][WC_COLS] = {{0}};
+// Stored in fast 240MHz internal SRAM (~4.6 KB total, zero PSRAM traffic!)
+static int8_t  s_wc_wave[WC_ROWS][WC_COLS] = {{0}};
 static int16_t s_wc_vx[WC_ROWS][WC_COLS] = {{0}};
 static int16_t s_wc_vy[WC_ROWS][WC_COLS] = {{0}};
 static int16_t s_wc_row_ymin[WC_ROWS] = {0};
 static int16_t s_wc_row_ymax[WC_ROWS] = {0};
-static int16_t s_wc_prev_frame_ymin = WC_DIRTY_Y1;
-static int16_t s_wc_cur_frame_ymin = WC_DIRTY_Y1;
+static uint16_t s_wc_col_ridge[WC_ROWS] = {0};
+static uint16_t s_wc_col_long[WC_ROWS] = {0};
+static int16_t s_wc_prev_frame_ymin = 0;
+static int16_t s_wc_prev_frame_ymax = WC_H - 1;
+static int16_t s_wc_cur_frame_ymin = 0;
+static int16_t s_wc_cur_frame_ymax = WC_H - 1;
+static bool s_wc_front_to_back = false;
 static int s_wc_cur_preset = 0;
 
 static const char *WHITECAP_PRESET_NAMES[4] = {
@@ -184,161 +192,192 @@ static inline void wc_strip_line(uint16_t *buf, int by1, int by2,
     }
 }
 
-static uint16_t wc_row_color(int r, int preset, uint16_t *out_long_col) {
-    // Interpolate t in [0..255] from front (r=0) to horizon (r=WC_ROWS-1)
-    int t = (r * 255) / (WC_ROWS - 1);
-    int r8 = 255, g8 = 24, b8 = 8;
+static void wc_hsv_to_rgb(float h, float s, float v, uint8_t *r_out, uint8_t *g_out, uint8_t *b_out) {
+    h = fmodf(h, 360.0f);
+    if (h < 0.0f) h += 360.0f;
+    float c = v * s;
+    float x = c * (1.0f - fabsf(fmodf(h / 60.0f, 2.0f) - 1.0f));
+    float m = v - c;
+    float r = 0.0f, g = 0.0f, b = 0.0f;
+    if (h < 60.0f)       { r = c; g = x; b = 0; }
+    else if (h < 120.0f) { r = x; g = c; b = 0; }
+    else if (h < 180.0f) { r = 0; g = c; b = x; }
+    else if (h < 240.0f) { r = 0; g = x; b = c; }
+    else if (h < 300.0f) { r = x; g = 0; b = c; }
+    else                 { r = c; g = 0; b = x; }
+    *r_out = (uint8_t)((r + m) * 255.0f);
+    *g_out = (uint8_t)((g + m) * 255.0f);
+    *b_out = (uint8_t)((b + m) * 255.0f);
+}
 
-    if (preset == 0) {
-        // Exact Old-School WhiteCap palette from reference screenshot:
-        // Front rows: Vivid Red (#FF1800) -> Mid-front: Red-Orange (#E84800) ->
-        // Mid-back: Amber/Olive (#A89800) -> Far Horizon: Bright Neon Green (#08FF18)
-        if (t < 96) {
-            int u = (t * 255) / 96;
-            r8 = 240 + ((15 * u) >> 8);
-            g8 = 12 + ((56 * u) >> 8);
-            b8 = 4;
-        } else if (t < 185) {
-            int u = ((t - 96) * 255) / 89;
-            r8 = 255 - ((110 * u) >> 8);
-            g8 = 68 + ((116 * u) >> 8);
-            b8 = 4;
-        } else {
-            int u = ((t - 185) * 255) / 70;
-            r8 = 145 - ((137 * u) >> 8);
-            g8 = 184 + ((71 * u) >> 8);
-            b8 = 8 + ((16 * u) >> 8);
-        }
-    } else if (preset == 1) {
-        // Cyber Horizon: Cyan (#00F5D4) -> Electric Blue (#38BDF8) -> Neon Magenta (#FF1E8E)
-        if (t < 128) {
-            int u = t * 2;
-            r8 = (56 * u) >> 8;
-            g8 = 245 - ((65 * u) >> 8);
-            b8 = 212 + ((43 * u) >> 8);
-        } else {
-            int u = (t - 128) * 2;
-            r8 = 56 + ((199 * u) >> 8);
-            g8 = 180 - ((150 * u) >> 8);
-            b8 = 255 - ((95 * u) >> 8);
-        }
-    } else if (preset == 2) {
-        // Solar Flare: Crimson (#FF0044) -> Gold (#FFAA00) -> Ice White (#E0F7FF)
-        if (t < 140) {
-            int u = (t * 255) / 140;
-            r8 = 255;
-            g8 = (180 * u) >> 8;
-            b8 = 68 - ((68 * u) >> 8);
-        } else {
-            int u = ((t - 140) * 255) / 115;
-            r8 = 255 - ((25 * u) >> 8);
-            g8 = 180 + ((70 * u) >> 8);
-            b8 = (255 * u) >> 8;
-        }
-    } else {
-        // Matrix Emerald: Bright Lime (#A3E635) -> Emerald (#10B981) -> Deep Cyan (#06B6D4)
-        r8 = 163 - ((150 * t) >> 8);
-        g8 = 235 - ((45 * t) >> 8);
-        b8 = 45 + ((170 * t) >> 8);
-    }
+static void update_whitecap_palette(int preset) {
+    // Base hue shift slowly drifts over time (~5 deg/sec) + 90 deg per manual preset
+    float shift = s_wc_color_drift + (float)preset * 90.0f;
 
-    if (out_long_col) {
-        // Slightly darker shade for longitudinal depth lines so horizontal ridges pop
-        *out_long_col = rgb_to_swapped565((uint8_t)((r8 * 165) >> 8),
-                                          (uint8_t)((g8 * 165) >> 8),
-                                          (uint8_t)((b8 * 165) >> 8));
+    for (int r = 0; r < WC_ROWS; r++) {
+        uint8_t r8 = 255, g8 = 32, b8 = 16;
+        if (r == 0) {
+            // Row 0 is the live front-edge real-time oscilloscope waveform:
+            // Starts at vibrant Neon Green (122 deg) and subtly shifts with the palette!
+            float front_hue = 122.0f + shift;
+            wc_hsv_to_rgb(front_hue, 0.88f, 1.0f, &r8, &g8, &b8);
+            s_wc_col_ridge[0] = rgb_to_swapped565(r8, g8, b8);
+            s_wc_col_long[0]  = s_wc_col_ridge[0];
+        } else {
+            // Rows 1..WC_ROWS-1 sweep from Red (4 deg) -> Orange/Gold (42 deg) -> Neon Green (118 deg)
+            // plus the subtle continuous color drift `shift`
+            float t = (float)(r - 1) / (float)(WC_ROWS - 2);
+            float row_hue = 4.0f + t * 114.0f + shift;
+            float sat = 0.95f - 0.08f * sinf(t * 3.14159f);
+            float val = 0.98f - 0.14f * t;
+            wc_hsv_to_rgb(row_hue, sat, val, &r8, &g8, &b8);
+            s_wc_col_ridge[r] = rgb_to_swapped565(r8, g8, b8);
+            s_wc_col_long[r]  = rgb_to_swapped565((uint8_t)((r8 * 165) >> 8),
+                                                  (uint8_t)((g8 * 165) >> 8),
+                                                  (uint8_t)((b8 * 165) >> 8));
+        }
     }
-    return rgb_to_swapped565((uint8_t)r8, (uint8_t)g8, (uint8_t)b8);
 }
 
 static void step_whitecap_simulation(const int8_t *wl, const int8_t *wr, const uint8_t *vu, uint8_t peak, int preset) {
     s_wc_cur_preset = preset;
 
-    // 1. Shift 3D terrain history rows back by 1 (row 1 -> row 2 ... row 24 -> row 25)
-    // Row 0 stays anchored at h=0 right on the green baseline!
-    memmove(&s_wc_grid[2][0], &s_wc_grid[1][0], (WC_ROWS - 2) * WC_COLS);
+    // 1. Shift 3D terrain waterfall history back by 1 row (r = 0 -> 1 -> 2 ... -> 25)
+    // Row 0 flows directly into Row 1..25 so every real-time waveform excursion on the front line
+    // propagates backward across the 3D terrain with no discontinuity!
+    for (int r = WC_ROWS - 1; r >= 2; r--) {
+        memcpy(s_wc_wave[r], s_wc_wave[r - 1], WC_COLS * sizeof(int8_t));
+    }
+    for (int c = 0; c < WC_COLS; c++) {
+        int prev_c = (c > 0) ? s_wc_wave[0][c - 1] : s_wc_wave[0][c];
+        int next_c = (c + 1 < WC_COLS) ? s_wc_wave[0][c + 1] : s_wc_wave[0][c];
+        s_wc_wave[1][c] = (int8_t)((prev_c + ((int)s_wc_wave[0][c] * 6) + next_c) >> 3);
+    }
 
+    // 2. Advance animation clocks:
+    // - s_wc_phase drives organic ridge detail
+    // - s_wc_cam_time smoothly rotates/orbits the 3D viewpoint
+    // - s_wc_color_drift subtly evolves the color palette over time
     float energy = (float)peak / 100.0f;
-    s_wc_phase += 0.12f + energy * 0.10f;
+    s_wc_phase       += 0.10f + energy * 0.08f;
+    s_wc_cam_time    += 0.012f + energy * 0.006f;
+    s_wc_color_drift += 0.075f + energy * 0.045f; // ~4.5 deg/sec subtle color morph
+    if (s_wc_color_drift >= 360.0f) s_wc_color_drift -= 360.0f;
 
-    // 2. Build new live audio row (row 1) from stereo waveform + VU spectrum
-    uint8_t raw_row[WC_COLS];
+    update_whitecap_palette(preset);
+
+    // 3. Automatic Gain Control (AGC) on live stereo PCM (wl, wr) so quiet and loud tracks
+    // both produce a vivid real-time front waveform and 3D ridge heights
+    int max_sample = 1;
+    for (int i = 0; i < 128; i += 2) {
+        int a = abs((int)wl[i]) + abs((int)wr[i]);
+        if (a > max_sample) max_sample = a;
+    }
+    float target_peak = (float)max_sample * 0.55f;
+    if (target_peak < 12.0f) target_peak = 12.0f;
+    if (target_peak > s_wc_agc_peak) {
+        s_wc_agc_peak = s_wc_agc_peak * 0.72f + target_peak * 0.28f;
+    } else {
+        s_wc_agc_peak = s_wc_agc_peak * 0.96f + target_peak * 0.04f;
+    }
+    float gain = 34.0f / s_wc_agc_peak;
+    if (gain > 2.6f) gain = 2.6f;
+    if (gain < 0.45f) gain = 0.45f;
+
+    int8_t raw_front[WC_COLS];
+
     for (int c = 0; c < WC_COLS; c++) {
         int w_idx = (c * 127) / (WC_COLS - 1);
         int b_idx = (c * 11) / (WC_COLS - 1);
 
-        int s_l = abs((int)wl[w_idx]);
-        int s_r = abs((int)wr[127 - w_idx]);
-        int wave_amp = (c < WC_COLS / 2) ? ((s_l * 3 + s_r) >> 2) : ((s_r * 3 + s_l) >> 2);
-        int band_amp = (int)vu[b_idx];
+        float u = (float)c / (float)(WC_COLS - 1);
+        // Classic WhiteCap profile: stronger bass/low-mid mountain ridges on the left, finer ripples on the right
+        float left_boost = 1.55f - 0.95f * sqrtf(u);
 
-        // Classic WhiteCap terrain shaping:
-        // Tallest bass mountain peaks on the left-center (c = 2..12), finer harmonic ripples across center/right
-        float env = (c < 12) ? (1.22f - 0.03f * abs(c - 4))
-                             : (0.75f - 0.013f * (c - 12));
-        if (env < 0.25f) env = 0.25f;
+        // Real-time signed stereo oscilloscope sample + positive spectrum carrier so the front line (r=0)
+        // is a live real-time waveform that stays above the ground plane (y >= 0) as it flows into r=1..25
+        float pcm_signed = ((float)wl[w_idx] * 0.65f + (float)wr[127 - w_idx] * 0.35f) * gain;
+        float spec_lift  = (float)vu[b_idx] * 0.34f * left_boost + 14.0f * left_boost;
+        float carrier    = 4.5f * sinf(c * 0.48f - s_wc_phase * 1.5f)
+                         + 3.5f * cosf(c * 0.27f + s_wc_phase * 0.9f);
 
-        float organic = 5.0f + 5.0f * sinf(c * 0.48f - s_wc_phase)
-                             + 4.0f * cosf(c * 0.31f + s_wc_phase * 0.7f);
-
-        float h_val = (band_amp * 0.45f + wave_amp * 0.56f) * env + organic;
-
-        int w_signed = (c & 1) ? wl[w_idx] : wr[w_idx];
-        if (w_signed > 14) {
-            h_val += (w_signed - 14) * 0.38f * env;
-        }
-
-        if (h_val < 0.0f) h_val = 0.0f;
-        if (h_val > 92.0f) h_val = 92.0f;
-        raw_row[c] = (uint8_t)h_val;
+        float val = (spec_lift + pcm_signed * 0.85f * left_boost + carrier)
+                  * (0.15f + 0.85f * sinf(u * 3.14159265f));
+        if (c == 0 || c == WC_COLS - 1) val *= 0.20f;
+        if (val < 0.0f)  val = 0.0f;
+        if (val > 72.0f) val = 72.0f;
+        raw_front[c] = (int8_t)val;
     }
 
-    // Smooth horizontally [1, 2, 1]/4 and blend with row 2 for cohesive mountain ridges
+    // Populate Row 0 (live real-time oscilloscope front line)
     for (int c = 0; c < WC_COLS; c++) {
-        int prev_c = (c > 0) ? raw_row[c - 1] : raw_row[c];
-        int next_c = (c + 1 < WC_COLS) ? raw_row[c + 1] : raw_row[c];
-        int smoothed = (prev_c + (raw_row[c] << 1) + next_c) >> 2;
-        int temporal = (smoothed * 3 + (int)s_wc_grid[2][c]) >> 2;
-
-        // Taper left & right borders so the mesh edges sit cleanly like the reference screenshot
-        if (c == 0 || c == WC_COLS - 1) temporal = 0;
-        else if (c == 1 || c == WC_COLS - 2) temporal = (temporal * 2) / 5;
-        else if (c == 2 || c == WC_COLS - 3) temporal = (temporal * 3) / 4;
-
-        s_wc_grid[1][c] = (uint8_t)temporal;
-        s_wc_grid[0][c] = 0; // Front edge anchored flush to the green baseline
+        int pf = (c > 0) ? raw_front[c - 1] : raw_front[c];
+        int nf = (c + 1 < WC_COLS) ? raw_front[c + 1] : raw_front[c];
+        s_wc_wave[0][c] = (int8_t)((pf + (raw_front[c] << 1) + nf) >> 2);
     }
 
-    // 3. Project 3D heightfield into 2D oblique perspective screen coordinates in internal SRAM
-    const float max_r = (float)(WC_ROWS - 1);
-    const float k_z = 0.041f;
-    const float min_persp = 1.0f / (1.0f + max_r * k_z);
-    int16_t frame_min_y = WC_DIRTY_Y2;
+    // 4. 3D Rotating Viewpoint Projection (Yaw + Pitch + Roll + Perspective)
+    // Smoothly sweeps yaw angle around the classic oblique view (-36 deg .. +28 deg + slow orbital sway),
+    // while pitch looks down at the terrain (23 deg .. 33 deg) and roll banks subtly (-5 deg .. +5 deg)
+    float yaw   = -0.26f + 0.52f * sinf(s_wc_cam_time * 0.65f) + 0.20f * cosf(s_wc_cam_time * 0.29f);
+    float pitch =  0.48f + 0.10f * sinf(s_wc_cam_time * 0.43f + 1.1f);
+    float roll  =  0.09f * sinf(s_wc_cam_time * 0.55f);
+
+    float cy = cosf(yaw),   sy = sinf(yaw);
+    float cp = cosf(pitch), sp = sinf(pitch);
+    float cr = cosf(roll),  sr = sinf(roll);
+
+    s_wc_front_to_back = (cy < 0.0f);
+
+    int16_t frame_min_y = WC_H - 1;
+    int16_t frame_max_y = 0;
 
     for (int r = 0; r < WC_ROWS; r++) {
-        float persp = 1.0f / (1.0f + (float)r * k_z);
-        float depth_t = (1.0f - persp) / (1.0f - min_persp);
+        // Normalized z in [-1.0 (front live waveform r=0) .. +1.0 (far horizon r=WC_ROWS-1)]
+        float z3 = (((float)r / (float)(WC_ROWS - 1)) * 2.0f - 1.0f) * 118.0f;
 
-        float x_left  = 46.0f  + depth_t * 118.0f;
-        float x_right = 308.0f - depth_t * 10.0f;
-        float y_left  = 276.0f - depth_t * 154.0f;
-        float y_right = 314.0f - depth_t * 174.0f;
-        float h_scale = persp * 0.96f;
-
-        int16_t r_min_y = 360;
+        int16_t r_min_y = WC_H - 1;
         int16_t r_max_y = 0;
 
         for (int c = 0; c < WC_COLS; c++) {
-            float u = (float)c / (float)(WC_COLS - 1);
-            float bx = x_left + u * (x_right - x_left);
-            float by = y_left + u * (y_right - y_left);
-            float py = by - (float)s_wc_grid[r][c] * h_scale;
-            if (py < (float)WC_DIRTY_Y1) py = (float)WC_DIRTY_Y1;
-            if (py > (float)(WC_DIRTY_Y2 - 2)) py = (float)(WC_DIRTY_Y2 - 2);
-            int16_t ix = (int16_t)bx;
-            int16_t iy = (int16_t)py;
+            // Normalized x in [-1.0 .. +1.0]
+            float x3 = (((float)c / (float)(WC_COLS - 1)) * 2.0f - 1.0f) * 122.0f;
+            // Vertical height y3 above the ground plane (-14 baseline centers the 3D terrain vertically)
+            float y3 = (float)s_wc_wave[r][c] * 1.12f - 14.0f;
+
+            // 1) Yaw around Y axis
+            float x1 =  x3 * cy + z3 * sy;
+            float z1 = -x3 * sy + z3 * cy;
+            float y1 =  y3;
+
+            // 2) Pitch around X axis (camera elevated looking down at ground plane:
+            //    z1 < 0 [r=0] projects to bottom foreground; z1 > 0 [r=25] projects to top horizon)
+            float x2 =  x1;
+            float y2 =  y1 * cp + z1 * sp;
+            float z2 = -y1 * sp + z1 * cp;
+
+            // 3) Roll around Z axis
+            float x_rot = x2 * cr - y2 * sr;
+            float y_rot = x2 * sr + y2 * cr;
+
+            // 4) Perspective projection
+            float dist = 340.0f + z2;
+            if (dist < 130.0f) dist = 130.0f;
+            float persp = 325.0f / dist;
+
+            float sx = 180.0f + x_rot * persp;
+            float sy_scr = 160.0f - y_rot * persp;
+
+            if (sx < 6.0f) sx = 6.0f;
+            if (sx > 353.0f) sx = 353.0f;
+            if (sy_scr < 12.0f) sy_scr = 12.0f;
+            if (sy_scr > 347.0f) sy_scr = 347.0f;
+
+            int16_t ix = (int16_t)sx;
+            int16_t iy = (int16_t)sy_scr;
             s_wc_vx[r][c] = ix;
             s_wc_vy[r][c] = iy;
+
             if (iy < r_min_y) r_min_y = iy;
             if (iy > r_max_y) r_max_y = iy;
             if (r > 0) {
@@ -350,9 +389,13 @@ static void step_whitecap_simulation(const int8_t *wl, const int8_t *wr, const u
         s_wc_row_ymin[r] = r_min_y - 2;
         s_wc_row_ymax[r] = r_max_y + 2;
         if (s_wc_row_ymin[r] < frame_min_y) frame_min_y = s_wc_row_ymin[r];
+        if (s_wc_row_ymax[r] > frame_max_y) frame_max_y = s_wc_row_ymax[r];
     }
-    if (frame_min_y < WC_DIRTY_Y1) frame_min_y = WC_DIRTY_Y1;
+
+    if (frame_min_y < 0) frame_min_y = 0;
+    if (frame_max_y >= WC_H) frame_max_y = WC_H - 1;
     s_wc_cur_frame_ymin = frame_min_y;
+    s_wc_cur_frame_ymax = frame_max_y;
 }
 
 // LVGL custom draw callback: rasterizes visible 3D wireframe segments directly into internal DMA SRAM!
@@ -363,14 +406,17 @@ static void wc_layer_draw_event_cb(lv_event_t *e) {
     uint16_t *buf = (uint16_t *)draw_ctx->buf;
     const int by1 = draw_ctx->buf_area->y1;
     const int by2 = draw_ctx->buf_area->y2;
-    const int preset = s_wc_cur_preset;
 
-    // Render back-to-front (painter's order r = WC_ROWS - 1 down to 1)
-    for (int r = WC_ROWS - 1; r >= 1; r--) {
+    // Render from farthest depth row to nearest depth row (painter's order)
+    int r_start = s_wc_front_to_back ? 1 : (WC_ROWS - 1);
+    int r_end   = s_wc_front_to_back ? WC_ROWS : 0;
+    int r_step  = s_wc_front_to_back ? 1 : -1;
+
+    for (int r = r_start; r != r_end; r += r_step) {
         if (s_wc_row_ymax[r] < by1 || s_wc_row_ymin[r] > by2) continue;
 
-        uint16_t col_long = 0;
-        uint16_t col_ridge = wc_row_color(r, preset, &col_long);
+        uint16_t col_long  = s_wc_col_long[r];
+        uint16_t col_ridge = s_wc_col_ridge[r];
 
         // Longitudinal depth lines connecting row r to row r-1
         for (int c = 0; c < WC_COLS; c++) {
@@ -389,17 +435,14 @@ static void wc_layer_draw_event_cb(lv_event_t *e) {
         }
     }
 
-    // Crisp neon green front baseline along row 0 (exact match to reference screenshot)
+    // Draw Row 0 (the live real-time front oscilloscope waveform!) on top in its bright highlight color
     if (s_wc_row_ymax[0] >= by1 && s_wc_row_ymin[0] <= by2) {
-        uint16_t baseline_col = (preset == 0) ? rgb_to_swapped565(32, 255, 32)
-                              : (preset == 1) ? rgb_to_swapped565(0, 245, 212)
-                              : (preset == 2) ? rgb_to_swapped565(255, 180, 0)
-                                              : rgb_to_swapped565(16, 185, 129);
+        uint16_t front_col = s_wc_col_ridge[0];
         for (int c = 1; c < WC_COLS; c++) {
             wc_strip_line(buf, by1, by2,
                           s_wc_vx[0][c - 1], s_wc_vy[0][c - 1],
                           s_wc_vx[0][c],     s_wc_vy[0][c],
-                          baseline_col);
+                          front_col);
         }
     }
 }
@@ -432,8 +475,10 @@ static void whitecap_lv_timer_cb(lv_timer_t *timer) {
 
     // Only invalidate the exact vertical bounding band of the previous + current 3D terrain mesh
     int16_t inv_y1 = (s_wc_cur_frame_ymin < s_wc_prev_frame_ymin) ? s_wc_cur_frame_ymin : s_wc_prev_frame_ymin;
+    int16_t inv_y2 = (s_wc_cur_frame_ymax > s_wc_prev_frame_ymax) ? s_wc_cur_frame_ymax : s_wc_prev_frame_ymax;
     s_wc_prev_frame_ymin = s_wc_cur_frame_ymin;
-    lv_area_t dirty = {0, inv_y1, WC_W - 1, WC_DIRTY_Y2};
+    s_wc_prev_frame_ymax = s_wc_cur_frame_ymax;
+    lv_area_t dirty = {0, inv_y1, WC_W - 1, inv_y2};
     _lv_inv_area(lv_disp_get_default(), &dirty);
 }
 
@@ -635,16 +680,17 @@ static void set_whitecap_visible(bool visible) {
     if (!s_wc_layer) return;
     if (visible) {
         // Pre-seed terrain history with gentle organic waves so frame 1 looks alive immediately
-        memset(s_wc_grid, 0, sizeof(s_wc_grid));
-        for (int r = 1; r < WC_ROWS; r++) {
+        memset(s_wc_wave, 0, sizeof(s_wc_wave));
+        for (int r = 0; r < WC_ROWS; r++) {
             for (int c = 1; c < WC_COLS - 1; c++) {
-                s_wc_grid[r][c] = (uint8_t)(6.0f + 5.0f * sinf(c * 0.35f + r * 0.25f));
+                s_wc_wave[r][c] = (int8_t)(8.0f * sinf(c * 0.35f + r * 0.28f));
             }
         }
         int8_t zero_w[128] = {0};
         uint8_t zero_vu[12] = {0};
         step_whitecap_simulation(zero_w, zero_w, zero_vu, 18, g_app.whitecap_preset & 3);
         s_wc_prev_frame_ymin = 0;
+        s_wc_prev_frame_ymax = WC_H - 1;
 
         // Hide underlying page and perimeter arc while full-screen WhiteCap is running so LVGL
         // does zero redundant background/arc composition work during 60 FPS frame blits!
