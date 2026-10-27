@@ -330,8 +330,16 @@ static void network_manager_task(void *arg) {
         xSemaphoreGive(g_app.mutex);
     }
 
-    Serial.printf("[WIFI] Connecting to SSID: %s\n", ssid);
-    WiFi.begin(ssid, pass);
+    if (ssid[0] != '\0') {
+        Serial.printf("[WIFI] Connecting to SSID: %s\n", ssid);
+        WiFi.begin(ssid, pass);
+    } else {
+        Serial.println("[WIFI] No saved Wi-Fi SSID. Swipe Down on touchscreen -> Wi-Fi Scan to connect.");
+        if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            strncpy(g_app.status_text, "Swipe Down -> Wi-Fi Scan", sizeof(g_app.status_text) - 1);
+            xSemaphoreGive(g_app.mutex);
+        }
+    }
 
     uint32_t last_mdns_scan_ms = 0;
 

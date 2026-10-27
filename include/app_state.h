@@ -9,8 +9,16 @@
 #define MAX_SPEAKERS       32
 #define MAX_WIFI_SCAN      20
 
+#if __has_include("secrets.h")
+#include "secrets.h"
+#endif
+
+#ifndef DEFAULT_WIFI_SSID
 #define DEFAULT_WIFI_SSID  ""
+#endif
+#ifndef DEFAULT_WIFI_PASS
 #define DEFAULT_WIFI_PASS  ""
+#endif
 
 enum KnobMode {
     KNOB_MODE_VOLUME = 0,

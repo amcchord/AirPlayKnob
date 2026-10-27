@@ -6,3 +6,4 @@
 .DS_Store
 *.pyc
 __pycache__/
+include/secrets.h
