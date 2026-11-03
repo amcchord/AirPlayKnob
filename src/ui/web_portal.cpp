@@ -183,14 +183,37 @@ static const char WEB_UI_HTML[] PROGMEM = R"rawliteral(
     <div>
       <div class="panel">
         <div class="panel-hdr">
-          <div class="panel-title">AirPlay Speakers</div>
-          <button class="btn btn-purple btn-sm" onclick="scanSpeakers()">Rescan AirPlay</button>
+          <div class="panel-title">AirPlay Speakers (Auto-Scanning)</div>
+          <div style="display:flex;gap:6px;">
+            <button class="btn btn-secondary btn-sm" onclick="requestPinPair()">🔑 Pair 4-Digit PIN</button>
+            <button class="btn btn-purple btn-sm" onclick="scanSpeakers()">Rescan</button>
+          </div>
+        </div>
+        <div id="pinBox" style="display:none;background:rgba(245,158,11,0.12);border:1px solid #f59e0b;border-radius:12px;padding:12px;margin-bottom:12px;">
+          <div style="font-size:12px;font-weight:700;color:#f59e0b;margin-bottom:6px;" id="pinTitle">ENTER 4-DIGIT AIRPLAY PIN</div>
+          <div style="display:flex;gap:8px;">
+            <input type="text" id="pinInput" maxlength="4" placeholder="4-Digit PIN (e.g. 1234)" style="flex:1;letter-spacing:4px;font-weight:700;text-align:center;">
+            <button class="btn btn-primary btn-sm" onclick="submitPin()">Pair</button>
+            <button class="btn btn-secondary btn-sm" onclick="cancelPin()">Cancel</button>
+          </div>
         </div>
         <div id="speakerList"></div>
         <label style="display:flex;align-items:center;gap:8px;margin-top:12px;font-size:13px;color:var(--muted);cursor:pointer;">
           <input type="checkbox" id="localDacChk" onchange="toggleLocalDac(this.checked)">
           Also output audio to onboard 3.5mm stereo jack
         </label>
+      </div>
+
+      <div class="panel">
+        <div class="panel-hdr">
+          <div class="panel-title">Live Buffers & Streaming Telemetry</div>
+        </div>
+        <div style="font-size:12px;color:var(--muted);display:flex;flex-direction:column;gap:8px;">
+          <div style="display:flex;justify-content:space-between;"><span>Wi-Fi Negotiated Link:</span><strong id="telWifi" style="color:#10b981;">—</strong></div>
+          <div style="display:flex;justify-content:space-between;"><span>PCM Ringbuffer (2 MB PSRAM):</span><strong id="telPcm" style="color:#f8fafc;">—</strong></div>
+          <div style="display:flex;justify-content:space-between;"><span>MP3 Stream Buffer (64 KB):</span><strong id="telMp3" style="color:#38bdf8;">—</strong></div>
+          <div style="display:flex;justify-content:space-between;"><span>AirPlay RAOP Engine:</span><strong id="telRaop" style="color:#f8fafc;">—</strong></div>
+        </div>
       </div>
 
       <div class="panel">
@@ -258,13 +281,25 @@ async function refreshState() {
     document.getElementById('nowStatus').textContent = s.status_text || '';
     document.getElementById('playBtn').textContent = s.playing ? '⏸ Pause' : '▶ Play';
     document.getElementById('wcBtn').textContent = s.whitecap_active ? '✨ Exit WhiteCap' : '✨ WhiteCap Visualizer';
-    document.getElementById('wifiBadge').textContent = `${s.wifi_ssid} • ${s.wifi_ip}`;
+    document.getElementById('wifiBadge').textContent = `${s.wifi_ssid} • ${s.wifi_speed_mbps || 72} Mbps • ${s.wifi_ip}`;
     document.getElementById('localDacChk').checked = !!s.also_local_dac;
     if (s.artwork_url && document.getElementById('nowArt').src !== s.artwork_url) {
       document.getElementById('nowArt').src = s.artwork_url;
     }
     const modes = ['VOL', 'TUNE', 'SPKR'];
     document.getElementById('knobModeBtn').textContent = modes[s.knob_mode] || 'VOL';
+
+    document.getElementById('telWifi').textContent = `${s.wifi_speed_mbps || 72} Mbps • ${s.wifi_phy_mode || '802.11n'} • Ch ${s.wifi_channel || 1} (${s.wifi_rssi || -55} dBm)`;
+    document.getElementById('telPcm').textContent = `${s.pcm_buf_kb || 0} / 2048 KB (${((s.pcm_buf_ms || 0)/1000).toFixed(1)}s)`;
+    document.getElementById('telMp3').textContent = `${((s.mp3_buf_bytes || 0)/1024).toFixed(1)} / 64 KB • ${s.bitrate_kbps || 128} kbps`;
+    document.getElementById('telRaop').textContent = `${s.raop_connected ? (s.raop_is_ap2 ? 'AP2 ChaCha20' : 'AP1 AES') : 'Idle'} • Pkts ${s.raop_pkts_sent || 0} • NTP ${s.raop_ntp_replies || 0} • Retx ${s.raop_retransmits || 0}`;
+
+    if (s.pin_prompt_active) {
+      document.getElementById('pinBox').style.display = 'block';
+      document.getElementById('pinTitle').textContent = `ENTER 4-DIGIT PIN FOR ${(s.pin_speaker_name || 'SPEAKER').toUpperCase()}`;
+    } else {
+      document.getElementById('pinBox').style.display = 'none';
+    }
 
     if (!draggingVol) {
       document.getElementById('volSlider').value = s.volume;
@@ -301,7 +336,7 @@ function renderSpeakers(s) {
     <div class="spk-item ${i === s.current_speaker ? 'active' : ''}" onclick="selectSpeaker(${i})">
       <div>
         <div style="font-weight:600;font-size:14px;">${sp.name}</div>
-        <div style="font-size:11px;color:var(--muted);">${sp.is_local_dac ? 'Onboard 3.5mm Stereo Jack' : (sp.ip + ':' + sp.port + ' ' + sp.am)}</div>
+        <div style="font-size:11px;color:var(--muted);">${sp.is_local_dac ? 'Onboard 3.5mm Stereo Jack' : (sp.ip + ':' + sp.port + ' ' + sp.am + (sp.is_ap2 ? ' • AirPlay 2' : ' • AirPlay 1'))}</div>
       </div>
       <span style="font-size:12px;color:#38bdf8;font-weight:600;">${i === s.current_speaker ? 'Active' : 'Select'}</span>
     </div>
@@ -361,6 +396,27 @@ async function scanSpeakers() {
 
 async function toggleLocalDac(val) {
   await api('/api/control', 'POST', { also_local_dac: val });
+}
+
+async function requestPinPair() {
+  await api('/api/control', 'POST', { request_pin_pair: true });
+  showToast('Requesting 4-digit PIN on speaker...');
+  setTimeout(refreshState, 600);
+}
+
+async function submitPin() {
+  const pin = document.getElementById('pinInput').value.trim();
+  if (pin.length !== 4) return showToast('Enter a 4-digit PIN');
+  await api('/api/control', 'POST', { airplay_pin: pin });
+  document.getElementById('pinBox').style.display = 'none';
+  document.getElementById('pinInput').value = '';
+  showToast('Submitting PIN ' + pin + '...');
+  setTimeout(refreshState, 1500);
+}
+
+async function cancelPin() {
+  document.getElementById('pinBox').style.display = 'none';
+  await api('/api/control', 'POST', { cancel_pin: true });
 }
 
 function editPreset(idx) {
@@ -541,6 +597,24 @@ static void handle_status() {
         json_escape(g_app.wifi_ssid, esc1, sizeof(esc1));
         json += "\"wifi_ssid\":\""; json += esc1; json += "\",";
         json += "\"wifi_ip\":\""; json += g_app.wifi_ip; json += "\",";
+        json += "\"wifi_rssi\":"; json += String(g_app.wifi_rssi); json += ",";
+        json += "\"wifi_speed_mbps\":"; json += String(g_app.wifi_speed_mbps); json += ",";
+        json_escape(g_app.wifi_phy_mode, esc1, sizeof(esc1));
+        json += "\"wifi_phy_mode\":\""; json += esc1; json += "\",";
+        json += "\"wifi_channel\":"; json += String(g_app.wifi_channel); json += ",";
+        json += "\"pcm_buf_ms\":"; json += String(g_app.pcm_buf_ms); json += ",";
+        json += "\"pcm_buf_kb\":"; json += String(g_app.pcm_buf_kb); json += ",";
+        json += "\"mp3_buf_bytes\":"; json += String(g_app.mp3_buf_bytes); json += ",";
+        json += "\"bitrate_kbps\":"; json += String(g_app.bitrate_kbps); json += ",";
+        json += "\"stream_underruns\":"; json += String(g_app.stream_underruns); json += ",";
+        json += "\"raop_connected\":"; json += (g_app.raop_connected ? "true" : "false"); json += ",";
+        json += "\"raop_is_ap2\":"; json += (g_app.raop_is_ap2 ? "true" : "false"); json += ",";
+        json += "\"raop_pkts_sent\":"; json += String(g_app.raop_pkts_sent); json += ",";
+        json += "\"raop_ntp_replies\":"; json += String(g_app.raop_ntp_replies); json += ",";
+        json += "\"raop_retransmits\":"; json += String(g_app.raop_retransmits); json += ",";
+        json += "\"pin_prompt_active\":"; json += (g_app.pin_prompt_active ? "true" : "false"); json += ",";
+        json_escape(g_app.pin_speaker_name, esc1, sizeof(esc1));
+        json += "\"pin_speaker_name\":\""; json += esc1; json += "\",";
 
         json += "\"presets\":[";
         for (int i = 0; i < g_app.preset_count; i++) {
@@ -564,6 +638,7 @@ static void handle_status() {
             json += "\",\"port\":"; json += String(g_app.speakers[i].port);
             json += ",\"am\":\""; json += esc2;
             json += "\",\"is_local_dac\":"; json += (g_app.speakers[i].is_local_dac ? "true" : "false");
+            json += ",\"is_ap2\":"; json += (g_app.speakers[i].is_ap2 ? "true" : "false");
             json += "}";
         }
         json += "]}";
@@ -590,6 +665,7 @@ static void handle_control() {
             g_app.whitecap_active = !g_app.whitecap_active;
             xSemaphoreGive(g_app.mutex);
         }
+        app_state_save_playback();
     }
     int preset = extract_json_int(body, "preset", -1);
     if (preset >= 0) {
@@ -611,6 +687,7 @@ static void handle_control() {
             g_app.knob_mode = (KnobMode)km;
             xSemaphoreGive(g_app.mutex);
         }
+        app_state_save_playback();
     }
     bool has_scan = false;
     if (extract_json_bool(body, "scan_speakers", &has_scan) && has_scan) {
@@ -626,6 +703,7 @@ static void handle_control() {
             g_app.also_local_dac = dac_val;
             xSemaphoreGive(g_app.mutex);
         }
+        app_state_save_playback();
     }
     int tab = extract_json_int(body, "tab", -1);
     if (tab >= 0 && tab <= 3) {
@@ -634,6 +712,18 @@ static void handle_control() {
     int rot = extract_json_int(body, "rotate", 0);
     if (rot != 0) {
         knob_ui_on_rotate(rot);
+    }
+    String pin_str = extract_json_str(body, "airplay_pin");
+    if (pin_str.length() > 0) {
+        app_submit_airplay_pin(pin_str.c_str());
+    }
+    bool req_pin = false;
+    if (extract_json_bool(body, "request_pin_pair", &req_pin) && req_pin) {
+        app_request_airplay_pin_pair();
+    }
+    bool cancel_pin = false;
+    if (extract_json_bool(body, "cancel_pin", &cancel_pin) && cancel_pin) {
+        app_cancel_airplay_pin();
     }
     s_server.send(200, "application/json", "{\"ok\":true}");
 }

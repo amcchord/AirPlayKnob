@@ -34,6 +34,8 @@ void bsp_lvgl_unlock(void);
 const uint16_t *bsp_get_screen_fb(void);
 bsp_swipe_dir_t bsp_pop_swipe_gesture(void);
 void bsp_push_swipe_gesture(bsp_swipe_dir_t dir);
+void bsp_suppress_swipe_gesture(void);
+bool bsp_is_swipe_consumed(void);
 bool bsp_was_touch_dragged(void);
 uint32_t bsp_get_fps(void);
 uint32_t bsp_get_frame_us(void);

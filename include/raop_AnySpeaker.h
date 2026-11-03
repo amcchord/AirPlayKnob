@@ -16,6 +16,9 @@ public:
     void disconnect();
     bool isConnected() const { return m_connected; }
     bool isAirPlay2() const { return m_ap2; }
+    uint32_t getPktsSent() const { return m_pkts_sent; }
+    uint32_t getNtpReplies() const { return m_ntp_replies; }
+    uint32_t getRetransmits() const { return m_retransmits; }
 
     // Returns true when the NTP-locked RTP clock is ready to accept the next 352-frame chunk
     bool acceptFrames() const;
@@ -23,15 +26,19 @@ public:
     // Sends 352 stereo 16-bit PCM frames (1408 bytes)
     bool sendChunk(const int16_t *stereo_pcm_352);
 
-    bool setVolume(int volume_pct);
+    bool setVolume(int volume_pct, bool sync_wait = false);
     bool setMetadata(const char *title, const char *artist, const char *album);
+    bool setArtwork(const uint8_t *jpeg_data, size_t jpeg_len);
+    void resyncTimestamp();
     void pollControlAndKeepalive();
 
 private:
+    bool reconnectRtspSocket();
     bool execRtsp(const char *cmd, const char *uri_override,
                   const char *content_type, const uint8_t *content, int content_len,
                   const char *extra_headers, char *resp_headers_out, int resp_headers_max,
-                  uint8_t **resp_body_out, int *resp_body_len_out);
+                  uint8_t **resp_body_out, int *resp_body_len_out,
+                  int *status_code_out = NULL);
     bool sendRtspAsync(const char *cmd, const char *uri_override,
                        const char *content_type, const uint8_t *content, int content_len,
                        const char *extra_headers);
@@ -40,8 +47,14 @@ private:
     int rtspSend(const uint8_t *data, int len);
     bool rtspFillPlain(int timeout_ms);
 
-    bool doGetInfo(bool *supports_transient_out);
-    bool doAp2PairTransient();
+    bool doGetInfo(bool *supports_transient_out, bool *pin_required_out);
+    bool doAp2PairTransient(const char *pin_override = "3939", bool *auth_rejected_out = NULL);
+    bool doAp2StartPin(int *status_code_out = NULL);
+    bool doAp2PairPinPersistent(const char *pin_code,
+                                const uint8_t *pre_salt = NULL, int pre_salt_len = 0,
+                                const uint8_t *pre_pkB = NULL, int pre_pkB_len = 0);
+    bool doAp2PairVerify();
+    bool promptAndPairWithPin();
     bool doAp2SetupSession(uint16_t *event_port_out);
     bool doAp2SetupStream();
     void connectEventChannel(uint16_t event_port);
@@ -136,4 +149,6 @@ private:
         uint8_t data[1480];
     };
     BacklogSlot *m_backlog; // allocated in PSRAM
+    uint8_t *m_alac_buf;    // 1424B allocated in PSRAM
+    uint8_t *m_rtp_pkt;     // 1484B allocated in PSRAM
 };

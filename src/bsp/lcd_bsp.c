@@ -13,6 +13,7 @@ static uint16_t *s_screen_fb = NULL; // 360x360 live screen mirror in PSRAM (rig
 static volatile bsp_swipe_dir_t s_pending_swipe = BSP_SWIPE_NONE;
 static bool s_tp_pressed = false;
 static bool s_tp_dragged = false;
+static bool s_tp_swipe_consumed = false;
 static int16_t s_tp_start_x = 180;
 static int16_t s_tp_start_y = 180;
 static int16_t s_tp_last_x = 180;
@@ -281,6 +282,8 @@ void lcd_lvgl_Init(void) {
     disp_drv.sw_rotate = 0;
     disp_drv.rotated = LV_DISP_ROT_NONE;
     lv_disp_t *disp = lv_disp_drv_register(&disp_drv);
+    lv_obj_set_style_bg_color(lv_scr_act(), lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(lv_scr_act(), LV_OPA_COVER, 0);
 
     static lv_indev_drv_t indev_drv;
     lv_indev_drv_init(&indev_drv);
@@ -361,6 +364,15 @@ void bsp_push_swipe_gesture(bsp_swipe_dir_t dir) {
     s_pending_swipe = dir;
 }
 
+void bsp_suppress_swipe_gesture(void) {
+    s_tp_swipe_consumed = true;
+    s_pending_swipe = BSP_SWIPE_NONE;
+}
+
+bool bsp_is_swipe_consumed(void) {
+    return s_tp_swipe_consumed;
+}
+
 bool bsp_was_touch_dragged(void) {
     return s_tp_dragged;
 }
@@ -434,10 +446,9 @@ static void example_lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_
 
 static void example_lvgl_rounder_cb(struct _lv_disp_drv_t *disp_drv, lv_area_t *area) {
     (void)disp_drv;
-    // Always round to full-width even-row horizontal bands so sub_area chunks
-    // are guaranteed to have even x1/y1 and odd x2/y2 for SH8601 CASET/RASET.
-    area->x1 = 0;
-    area->x2 = EXAMPLE_LCD_H_RES - 1;
+    // Round x1/y1 down to even and x2/y2 up to odd for SH8601 QSPI CASET/RASET alignment
+    area->x1 = area->x1 & ~1;
+    area->x2 = area->x2 | 1;
     area->y1 = area->y1 & ~1;
     area->y2 = area->y2 | 1;
 }
@@ -458,6 +469,7 @@ static void example_lvgl_touch_cb(lv_indev_drv_t *drv, lv_indev_data_t *data) {
         if (!s_tp_pressed) {
             s_tp_pressed = true;
             s_tp_dragged = false;
+            s_tp_swipe_consumed = false;
             s_tp_start_x = rx;
             s_tp_start_y = ry;
             s_tp_last_x = rx;
@@ -468,8 +480,23 @@ static void example_lvgl_touch_cb(lv_indev_drv_t *drv, lv_indev_data_t *data) {
             s_tp_last_y = ry;
             int dx = (int)rx - (int)s_tp_start_x;
             int dy = (int)ry - (int)s_tp_start_y;
-            if (dx * dx + dy * dy >= 18 * 18) {
+            if (dx * dx + dy * dy >= 14 * 14) {
                 s_tp_dragged = true;
+            }
+            if (!s_tp_swipe_consumed) {
+                int adx = dx < 0 ? -dx : dx;
+                int ady = dy < 0 ? -dy : dy;
+                int64_t dt_ms = (esp_timer_get_time() - s_tp_start_us) / 1000LL;
+                // Trigger menu swipe immediately while finger is moving once threshold is crossed
+                if ((adx >= 44 || ady >= 44) && dt_ms <= 850) {
+                    if (adx >= ady + 8) {
+                        s_pending_swipe = (dx < 0) ? BSP_SWIPE_LEFT : BSP_SWIPE_RIGHT;
+                        s_tp_swipe_consumed = true;
+                    } else if (ady >= adx + 8) {
+                        s_pending_swipe = (dy < 0) ? BSP_SWIPE_UP : BSP_SWIPE_DOWN;
+                        s_tp_swipe_consumed = true;
+                    }
+                }
             }
         }
     } else {
@@ -479,16 +506,19 @@ static void example_lvgl_touch_cb(lv_indev_drv_t *drv, lv_indev_data_t *data) {
 
         if (s_tp_pressed) {
             s_tp_pressed = false;
-            int dx = (int)s_tp_last_x - (int)s_tp_start_x;
-            int dy = (int)s_tp_last_y - (int)s_tp_start_y;
-            int adx = dx < 0 ? -dx : dx;
-            int ady = dy < 0 ? -dy : dy;
-            int64_t dt_ms = (esp_timer_get_time() - s_tp_start_us) / 1000LL;
-            if ((adx >= 38 || ady >= 38) && dt_ms <= 900) {
-                if (adx >= ady) {
-                    s_pending_swipe = (dx < 0) ? BSP_SWIPE_LEFT : BSP_SWIPE_RIGHT;
-                } else {
-                    s_pending_swipe = (dy < 0) ? BSP_SWIPE_UP : BSP_SWIPE_DOWN;
+            if (!s_tp_swipe_consumed) {
+                int dx = (int)s_tp_last_x - (int)s_tp_start_x;
+                int dy = (int)s_tp_last_y - (int)s_tp_start_y;
+                int adx = dx < 0 ? -dx : dx;
+                int ady = dy < 0 ? -dy : dy;
+                int64_t dt_ms = (esp_timer_get_time() - s_tp_start_us) / 1000LL;
+                if ((adx >= 26 || ady >= 26) && dt_ms <= 900) {
+                    if (adx >= ady) {
+                        s_pending_swipe = (dx < 0) ? BSP_SWIPE_LEFT : BSP_SWIPE_RIGHT;
+                    } else {
+                        s_pending_swipe = (dy < 0) ? BSP_SWIPE_UP : BSP_SWIPE_DOWN;
+                    }
+                    s_tp_swipe_consumed = true;
                 }
             }
         }

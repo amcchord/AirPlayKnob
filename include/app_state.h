@@ -6,7 +6,7 @@
 #include "somafm_presets.h"
 
 #define MAX_PRESETS        48
-#define MAX_SPEAKERS       32
+#define MAX_SPEAKERS       48
 #define MAX_WIFI_SCAN      20
 
 #if __has_include("secrets.h")
@@ -44,6 +44,9 @@ struct AirPlaySpeaker {
     char md[24];
     char am[32];
     bool is_local_dac;
+    bool is_ap2;
+    bool requires_pin;
+    uint32_t last_seen_ms;
 };
 
 struct WifiScanItem {
@@ -87,6 +90,31 @@ struct AppState {
     int8_t wave_r[128];
     char artwork_url[256]; // Current live Album Art or SomaFM Stream Art URL
 
+    // Live Buffers & Streaming Telemetry
+    uint32_t pcm_buf_ms;
+    uint32_t pcm_buf_kb;
+    uint32_t mp3_buf_bytes;
+    uint32_t stream_underruns;
+    bool raop_connected;
+    bool raop_is_ap2;
+    uint32_t raop_pkts_sent;
+    uint32_t raop_ntp_replies;
+    uint32_t raop_retransmits;
+
+    // AirPlay 4-Digit PIN Pairing State
+    bool pin_prompt_active;
+    bool pin_submitted;
+    bool pin_cancelled;
+    bool pin_manual_request;
+    char pin_code[8];
+    char pin_speaker_name[48];
+    char pin_speaker_ip[20];
+    char pin_halted_ip[20];
+    bool pin_toast_pending;
+    char pin_toast_title[32];
+    char pin_toast_msg[48];
+    uint32_t pin_toast_color;
+
     // WhiteCap Visualizer & OTA status
     bool whitecap_active;
     int whitecap_preset;
@@ -102,9 +130,16 @@ struct AppState {
     bool wifi_connected;
     char wifi_ip[20];
     int32_t wifi_rssi;
+    int wifi_speed_mbps;
+    char wifi_phy_mode[24];
+    uint8_t wifi_channel;
+    uint32_t wifi_connect_start_ms;
+    uint32_t wifi_connected_since_ms;
     bool wifi_reconnect_requested;
     bool wifi_scan_requested;
     bool wifi_scanning;
+    bool wifi_modal_open;
+    uint32_t wifi_scan_done_seq;
     WifiScanItem wifi_scan[MAX_WIFI_SCAN];
     int wifi_scan_count;
 };
@@ -120,3 +155,10 @@ void app_select_preset(int index, bool auto_play);
 void app_select_speaker(int index);
 void app_set_volume(int vol);
 void app_toggle_play(void);
+void app_submit_airplay_pin(const char *pin);
+void app_cancel_airplay_pin(void);
+void app_request_airplay_pin_pair(void);
+void app_notify_pin_toast(const char *title, const char *msg, uint32_t color);
+void app_get_ap2_client_identity(char id_out[37], uint8_t ltpk_out[32], uint8_t ltsk_out[64]);
+bool app_is_ap2_speaker_paired(const char *ip);
+void app_mark_ap2_speaker_paired(const char *ip);

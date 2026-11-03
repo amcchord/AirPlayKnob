@@ -3,6 +3,7 @@
 #include "minimp3.h"
 
 #include "radio_streamer.h"
+#include "artwork_fetcher.h"
 #include "app_state.h"
 #include "raop_AnySpeaker.h"
 #include "bsp/local_dac.h"
@@ -19,6 +20,7 @@
 static int16_t *s_pcm_ring = NULL;
 static volatile uint32_t s_ring_write = 0;
 static volatile uint32_t s_ring_read = 0;
+static volatile uint32_t s_ring_seq = 0;
 static portMUX_TYPE s_ring_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static uint32_t ring_available_frames() {
@@ -40,34 +42,62 @@ static void ring_clear() {
     portENTER_CRITICAL(&s_ring_mux);
     s_ring_write = 0;
     s_ring_read = 0;
+    s_ring_seq = s_ring_seq + 1;
     portEXIT_CRITICAL(&s_ring_mux);
 }
 
 static void ring_push_frames(const int16_t *stereo_frames, uint32_t count) {
-    if (!s_pcm_ring) return;
-    for (uint32_t i = 0; i < count; i++) {
-        uint32_t w = s_ring_write;
-        uint32_t next_w = (w + 1) & (PCM_RING_FRAMES - 1);
-        if (next_w == s_ring_read) {
-            break; // full
-        }
-        s_pcm_ring[w * 2]     = stereo_frames[i * 2];
-        s_pcm_ring[w * 2 + 1] = stereo_frames[i * 2 + 1];
-        s_ring_write = next_w;
+    if (!s_pcm_ring || count == 0) return;
+    portENTER_CRITICAL(&s_ring_mux);
+    uint32_t avail = (s_ring_write - s_ring_read) & (PCM_RING_FRAMES - 1);
+    uint32_t free_f = (PCM_RING_FRAMES - 1) - avail;
+    uint32_t w = s_ring_write;
+    uint32_t seq = s_ring_seq;
+    portEXIT_CRITICAL(&s_ring_mux);
+
+    if (count > free_f) count = free_f;
+    if (count == 0) return;
+
+    uint32_t first = PCM_RING_FRAMES - w;
+    if (first >= count) {
+        memcpy(&s_pcm_ring[w * 2], stereo_frames, count * 2 * sizeof(int16_t));
+    } else {
+        memcpy(&s_pcm_ring[w * 2], stereo_frames, first * 2 * sizeof(int16_t));
+        memcpy(&s_pcm_ring[0], &stereo_frames[first * 2], (count - first) * 2 * sizeof(int16_t));
     }
+
+    portENTER_CRITICAL(&s_ring_mux);
+    if (s_ring_seq == seq) {
+        s_ring_write = (w + count) & (PCM_RING_FRAMES - 1);
+    }
+    portEXIT_CRITICAL(&s_ring_mux);
 }
 
 static bool ring_pop_352(int16_t *out_stereo_352) {
-    if (!s_pcm_ring || ring_available_frames() < RAOP_CHUNK_FRAMES) {
+    if (!s_pcm_ring) return false;
+    portENTER_CRITICAL(&s_ring_mux);
+    uint32_t avail = (s_ring_write - s_ring_read) & (PCM_RING_FRAMES - 1);
+    uint32_t r = s_ring_read;
+    uint32_t seq = s_ring_seq;
+    portEXIT_CRITICAL(&s_ring_mux);
+
+    if (avail < RAOP_CHUNK_FRAMES) {
         return false;
     }
-    uint32_t r = s_ring_read;
-    for (int i = 0; i < RAOP_CHUNK_FRAMES; i++) {
-        out_stereo_352[i * 2]     = s_pcm_ring[r * 2];
-        out_stereo_352[i * 2 + 1] = s_pcm_ring[r * 2 + 1];
-        r = (r + 1) & (PCM_RING_FRAMES - 1);
+
+    uint32_t first = PCM_RING_FRAMES - r;
+    if (first >= RAOP_CHUNK_FRAMES) {
+        memcpy(out_stereo_352, &s_pcm_ring[r * 2], RAOP_CHUNK_FRAMES * 2 * sizeof(int16_t));
+    } else {
+        memcpy(out_stereo_352, &s_pcm_ring[r * 2], first * 2 * sizeof(int16_t));
+        memcpy(&out_stereo_352[first * 2], &s_pcm_ring[0], (RAOP_CHUNK_FRAMES - first) * 2 * sizeof(int16_t));
     }
-    s_ring_read = r;
+
+    portENTER_CRITICAL(&s_ring_mux);
+    if (s_ring_seq == seq) {
+        s_ring_read = (r + RAOP_CHUNK_FRAMES) & (PCM_RING_FRAMES - 1);
+    }
+    portEXIT_CRITICAL(&s_ring_mux);
     return true;
 }
 
@@ -145,14 +175,18 @@ static void parse_icy_metadata(const char *meta_buf, int meta_len) {
 
 // Task 1: HTTP Icecast reader + MP3 decoder -> 2MB PSRAM ringbuffer (~12 seconds cushion)
 static void http_decoder_task(void *arg) {
-    mp3dec_t *mp3d = (mp3dec_t *)heap_caps_malloc(sizeof(mp3dec_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    int16_t *pcm_out = (int16_t *)heap_caps_malloc(MINIMP3_MAX_SAMPLES_PER_FRAME * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    // Allocate hot MP3 decoder state & frame buffer in fast 240MHz internal SRAM for 3x faster decoding
+    mp3dec_t *mp3d = (mp3dec_t *)heap_caps_malloc(sizeof(mp3dec_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!mp3d) mp3d = (mp3dec_t *)heap_caps_malloc(sizeof(mp3dec_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    int16_t *pcm_out = (int16_t *)heap_caps_malloc(MINIMP3_MAX_SAMPLES_PER_FRAME * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!pcm_out) pcm_out = (int16_t *)heap_caps_malloc(MINIMP3_MAX_SAMPLES_PER_FRAME * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     int16_t *stereo_tmp = (int16_t *)heap_caps_malloc(MINIMP3_MAX_SAMPLES_PER_FRAME * 2 * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     uint8_t *mp3_buf = (uint8_t *)heap_caps_malloc(MP3_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     char *meta_buf = (char *)heap_caps_malloc(4096, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
     int mirror_idx = 0;
-    const char *somafm_mirrors[] = {"ice6.somafm.com", "ice2.somafm.com", "ice4.somafm.com"};
+    // Ordered by fastest measured TTFB (ice4: 212ms, ice2: 222ms, ice6: 230ms, ice1: 257ms)
+    const char *somafm_mirrors[] = {"ice4.somafm.com", "ice2.somafm.com", "ice6.somafm.com", "ice1.somafm.com"};
 
     for (;;) {
         bool want_play = false;
@@ -176,6 +210,9 @@ static void http_decoder_task(void *arg) {
             if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
                 memset(g_app.vu_bars, 0, sizeof(g_app.vu_bars));
                 g_app.vu_peak = 0;
+                g_app.mp3_buf_bytes = 0;
+                g_app.pcm_buf_ms = 0;
+                g_app.pcm_buf_kb = 0;
                 if (!want_play) {
                     g_app.status = STREAM_STOPPED;
                     strncpy(g_app.status_text, "Paused", sizeof(g_app.status_text));
@@ -185,26 +222,34 @@ static void http_decoder_task(void *arg) {
                 }
                 xSemaphoreGive(g_app.mutex);
             }
-            vTaskDelay(pdMS_TO_TICKS(100));
+            vTaskDelay(pdMS_TO_TICKS(40));
             continue;
         }
 
-        // Apply mirror rotation if URL is a somafm ice server
+        // Apply mirror selection if URL is a somafm ice server
         char effective_url[140];
         strncpy(effective_url, target_url, sizeof(effective_url) - 1);
+        effective_url[sizeof(effective_url) - 1] = '\0';
         char *ice_pos = strstr(effective_url, "ice6.somafm.com");
         if (!ice_pos) ice_pos = strstr(effective_url, "ice1.somafm.com");
-        if (ice_pos && mirror_idx > 0) {
-            memcpy(ice_pos, somafm_mirrors[mirror_idx % 3], 15);
+        if (!ice_pos) ice_pos = strstr(effective_url, "ice2.somafm.com");
+        if (!ice_pos) ice_pos = strstr(effective_url, "ice4.somafm.com");
+        if (ice_pos) {
+            memcpy(ice_pos, somafm_mirrors[mirror_idx % 4], 15);
         }
 
         if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
             g_app.status = STREAM_CONNECTING_RADIO;
+            g_app.pcm_buf_ms = 0;
+            g_app.pcm_buf_kb = 0;
+            g_app.mp3_buf_bytes = 0;
             snprintf(g_app.status_text, sizeof(g_app.status_text), "Tuning %s...", station_name);
             snprintf(g_app.track_title, sizeof(g_app.track_title), "Connecting to %s...", station_name);
             xSemaphoreGive(g_app.mutex);
         }
 
+        ring_clear();
+        uint32_t t_open_ms = millis();
         Serial.printf("[RADIO] Opening stream: %s\n", effective_url);
 
         WiFiClient plain_client;
@@ -212,8 +257,8 @@ static void http_decoder_task(void *arg) {
         HTTPClient http;
         http.setUserAgent("VLC/3.0.20");
         http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-        http.setConnectTimeout(8000);
-        http.setTimeout(12000);
+        http.setConnectTimeout(2500);
+        http.setTimeout(3500);
 
         const char *header_keys[] = {"icy-metaint", "icy-name", "icy-br"};
         http.collectHeaders(header_keys, 3);
@@ -230,23 +275,24 @@ static void http_decoder_task(void *arg) {
         if (!begun) {
             if (secure_client) delete secure_client;
             mirror_idx++;
-            vTaskDelay(pdMS_TO_TICKS(500));
+            vTaskDelay(pdMS_TO_TICKS(150));
             continue;
         }
 
         http.addHeader("Icy-MetaData", "1");
         int code = http.GET();
         if (code != HTTP_CODE_OK) {
-            Serial.printf("[RADIO] HTTP GET failed (%d) on %s\n", code, effective_url);
+            Serial.printf("[RADIO] HTTP GET failed (%d) on %s after %lums\n",
+                          code, effective_url, (unsigned long)(millis() - t_open_ms));
             http.end();
             if (secure_client) delete secure_client;
             mirror_idx++;
             if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
                 g_app.status = STREAM_ERROR;
-                snprintf(g_app.status_text, sizeof(g_app.status_text), "Stream error (%d)", code);
+                snprintf(g_app.status_text, sizeof(g_app.status_text), "Retrying %s...", station_name);
                 xSemaphoreGive(g_app.mutex);
             }
-            vTaskDelay(pdMS_TO_TICKS(800));
+            vTaskDelay(pdMS_TO_TICKS(150));
             continue;
         }
 
@@ -259,7 +305,8 @@ static void http_decoder_task(void *arg) {
             br = http.header("icy-br").toInt();
         }
         String icy_name = http.header("icy-name");
-        Serial.printf("[RADIO] Stream connected! metaint=%d br=%d name=%s\n", metaint, br, icy_name.c_str());
+        Serial.printf("[RADIO] Stream connected in %lums! metaint=%d br=%d name=%s\n",
+                      (unsigned long)(millis() - t_open_ms), metaint, br, icy_name.c_str());
 
         if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
             g_app.bitrate_kbps = (br > 0) ? br : 128;
@@ -278,33 +325,60 @@ static void http_decoder_task(void *arg) {
         WiFiClient *stream = http.getStreamPtr();
         int bytes_until_meta = metaint;
         int mp3_fill = 0;
+        int mp3_off = 0;
         uint32_t last_data_ms = millis();
+        uint32_t last_state_check_ms = 0;
 
         while (http.connected()) {
-            bool keep_going = true;
-            if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                if (!g_app.playing || !g_app.wifi_connected || g_app.stream_reconfig_needed || g_app.ota_in_progress) {
-                    keep_going = false;
+            uint32_t now_ms = millis();
+            if (now_ms - last_state_check_ms >= 20) {
+                last_state_check_ms = now_ms;
+                bool keep_going = true;
+                if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                    if (!g_app.playing || !g_app.wifi_connected || g_app.stream_reconfig_needed || g_app.ota_in_progress) {
+                        keep_going = false;
+                    }
+                    g_app.mp3_buf_bytes = (uint32_t)(mp3_fill - mp3_off);
+                    uint32_t af = ring_available_frames();
+                    g_app.pcm_buf_ms = (uint32_t)(((uint64_t)af * 1000ULL) / 44100ULL);
+                    g_app.pcm_buf_kb = (af * 4U) / 1024U;
+                    xSemaphoreGive(g_app.mutex);
                 }
-                xSemaphoreGive(g_app.mutex);
+                if (!keep_going) break;
             }
-            if (!keep_going) break;
 
-            // Throttle reading only when the 12-second ringbuffer is nearly full
+            // Throttle reading only when the 12-second PCM ringbuffer is nearly full
             if (ring_free_frames() < 4608) {
                 vTaskDelay(pdMS_TO_TICKS(5));
                 continue;
+            }
+
+            // Compact sliding MP3 buffer when needed
+            if (mp3_off > 0 && (mp3_off >= 16384 || (MP3_BUF_SIZE - mp3_fill) < 8192)) {
+                int rem = mp3_fill - mp3_off;
+                if (rem > 0) {
+                    memmove(mp3_buf, mp3_buf + mp3_off, rem);
+                }
+                mp3_fill = rem;
+                mp3_off = 0;
             }
 
             int avail = stream->available();
             if (avail > 0) {
                 last_data_ms = millis();
                 int space = MP3_BUF_SIZE - mp3_fill;
+                if (space <= 0 && mp3_off > 0) {
+                    int rem = mp3_fill - mp3_off;
+                    if (rem > 0) memmove(mp3_buf, mp3_buf + mp3_off, rem);
+                    mp3_fill = rem;
+                    mp3_off = 0;
+                    space = MP3_BUF_SIZE - mp3_fill;
+                }
                 if (space <= 0) {
-                    // Drop oldest half if MP3 buffer couldn't sync
                     int drop = MP3_BUF_SIZE / 2;
                     memmove(mp3_buf, mp3_buf + drop, mp3_fill - drop);
                     mp3_fill -= drop;
+                    mp3_off = 0;
                     space = MP3_BUF_SIZE - mp3_fill;
                 }
 
@@ -320,9 +394,8 @@ static void http_decoder_task(void *arg) {
                     if (metaint > 0) {
                         bytes_until_meta -= n;
                         if (bytes_until_meta == 0) {
-                            // Read 1-byte ICY metadata length
                             uint32_t t0 = millis();
-                            while (stream->available() < 1 && millis() - t0 < 2500) {
+                            while (stream->available() < 1 && millis() - t0 < 2000) {
                                 vTaskDelay(pdMS_TO_TICKS(2));
                             }
                             int len_byte = stream->read();
@@ -330,7 +403,7 @@ static void http_decoder_task(void *arg) {
                                 int mlen = len_byte * 16;
                                 int mread = 0;
                                 t0 = millis();
-                                while (mread < mlen && millis() - t0 < 3000) {
+                                while (mread < mlen && millis() - t0 < 2500) {
                                     int c = stream->read((uint8_t *)meta_buf + mread, mlen - mread);
                                     if (c > 0) mread += c;
                                     else vTaskDelay(pdMS_TO_TICKS(2));
@@ -342,19 +415,25 @@ static void http_decoder_task(void *arg) {
                         }
                     }
                 }
-            } else if (mp3_fill < 2048) {
-                if (millis() - last_data_ms > 15000) {
-                    Serial.println("[RADIO] Stream read timeout (15s), reconnecting...");
+            } else {
+                if (millis() - last_data_ms > 10000) {
+                    Serial.println("[RADIO] Stream read timeout (10s), reconnecting...");
+                    mirror_idx++;
                     break;
                 }
                 vTaskDelay(pdMS_TO_TICKS(2));
+            }
+
+            if ((mp3_fill - mp3_off) < 640) {
+                if (avail <= 0) {
+                    vTaskDelay(pdMS_TO_TICKS(2));
+                }
                 continue;
             }
 
-            // Decode up to 6 MP3 frames per iteration using a rolling offset (single memmove per batch)
-            int mp3_off = 0;
+            // Decode up to 6 frames per iteration so we keep draining the TCP socket promptly
             int decoded_batches = 0;
-            while ((mp3_fill - mp3_off) >= 1440 && ring_free_frames() >= 1152 && decoded_batches < 6) {
+            while ((mp3_fill - mp3_off) >= 640 && ring_free_frames() >= 1152 && decoded_batches < 6) {
                 mp3dec_frame_info_t info = {};
                 int samples = mp3dec_decode_frame(mp3d, mp3_buf + mp3_off, mp3_fill - mp3_off, pcm_out, &info);
                 if (info.frame_bytes == 0) {
@@ -374,29 +453,31 @@ static void http_decoder_task(void *arg) {
                 mp3_off += info.frame_bytes;
                 decoded_batches++;
             }
-            if (mp3_off > 0) {
-                mp3_fill -= mp3_off;
-                if (mp3_fill > 0) {
-                    memmove(mp3_buf, mp3_buf + mp3_off, mp3_fill);
-                }
+
+            if (decoded_batches == 0) {
+                vTaskDelay(pdMS_TO_TICKS(2));
             }
         }
 
         http.end();
         if (secure_client) delete secure_client;
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
 // Task 2: Real-time 44.1kHz RAOP AirPlay + Local DAC sender
 static void raop_sender_task(void *arg) {
     RaopClient *raop = new RaopClient();
-    int active_speaker_idx = -1;
+    char active_speaker_ip[20] = {0};
+    bool active_is_local_dac = true;
+    bool speaker_initialized = false;
+    int connect_failures = 0;
     char last_sent_title[128] = {0};
-    int16_t chunk_pcm[RAOP_CHUNK_FRAMES * 2];
-    bool prebuffering = true;
-
+    uint32_t last_sent_art_seq = 0;
+    uint8_t *art_jpg_buf = (uint8_t *)heap_caps_malloc(64 * 1024, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    int16_t *chunk_pcm = (int16_t *)heap_caps_calloc(RAOP_CHUNK_FRAMES * 2, sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     uint64_t next_send_us = esp_timer_get_time();
+    bool prebuffering = true;
 
     for (;;) {
         bool want_play = false;
@@ -405,6 +486,10 @@ static void raop_sender_task(void *arg) {
         int vol = 65;
         bool vol_dirty = false;
         bool also_local = false;
+        bool force_pin_reconnect = false;
+        bool pin_halted = false;
+        bool radio_connecting = false;
+        uint32_t mp3_bytes_buffered = 0;
         AirPlaySpeaker spk = {};
         char cur_title[128] = {0};
         char cur_station[40] = {0};
@@ -417,13 +502,35 @@ static void raop_sender_task(void *arg) {
             vol_dirty = g_app.volume_dirty;
             g_app.volume_dirty = false;
             also_local = g_app.also_local_dac;
+            force_pin_reconnect = g_app.pin_manual_request;
+            radio_connecting = (g_app.status == STREAM_CONNECTING_RADIO || g_app.stream_reconfig_needed);
+            mp3_bytes_buffered = g_app.mp3_buf_bytes;
             if (spk_idx >= 0 && spk_idx < g_app.speaker_count) {
                 spk = g_app.speakers[spk_idx];
+            } else {
+                spk.is_local_dac = true;
+                strncpy(spk.name, "Local 3.5mm Jack", sizeof(spk.name) - 1);
+            }
+            if (spk.is_local_dac && force_pin_reconnect) {
+                g_app.pin_manual_request = false;
+                force_pin_reconnect = false;
+            }
+            if (!spk.is_local_dac && spk.ip[0] != '\0' && g_app.pin_halted_ip[0] != '\0' &&
+                strcmp(spk.ip, g_app.pin_halted_ip) == 0 && !force_pin_reconnect) {
+                pin_halted = true;
             }
             strncpy(cur_title, g_app.track_title, sizeof(cur_title) - 1);
             if (g_app.current_preset >= 0 && g_app.current_preset < g_app.preset_count) {
                 strncpy(cur_station, g_app.presets[g_app.current_preset].name, sizeof(cur_station) - 1);
             }
+            uint32_t af = ring_available_frames();
+            g_app.pcm_buf_ms = (uint32_t)(((uint64_t)af * 1000ULL) / 44100ULL);
+            g_app.pcm_buf_kb = (af * 4U) / 1024U;
+            g_app.raop_connected = raop->isConnected();
+            g_app.raop_is_ap2 = raop->isAirPlay2();
+            g_app.raop_pkts_sent = raop->getPktsSent();
+            g_app.raop_ntp_replies = raop->getNtpReplies();
+            g_app.raop_retransmits = raop->getRetransmits();
             xSemaphoreGive(g_app.mutex);
         }
 
@@ -431,38 +538,75 @@ static void raop_sender_task(void *arg) {
             if (raop->isConnected()) {
                 raop->disconnect();
             }
-            active_speaker_idx = -1;
+            speaker_initialized = false;
             prebuffering = true;
             vTaskDelay(pdMS_TO_TICKS(40));
             next_send_us = esp_timer_get_time();
             continue;
         }
 
-        // Check if speaker changed
-        if (spk_idx != active_speaker_idx || (!spk.is_local_dac && !raop->isConnected())) {
+        // Compare speaker by IP / is_local_dac so background mDNS scans never trigger false reconnects!
+        bool speaker_changed = !speaker_initialized ||
+                               (spk.is_local_dac != active_is_local_dac) ||
+                               (!spk.is_local_dac && strcmp(spk.ip, active_speaker_ip) != 0);
+
+        if (pin_halted && !force_pin_reconnect) {
             if (raop->isConnected()) {
                 raop->disconnect();
             }
-            active_speaker_idx = spk_idx;
+            speaker_initialized = true;
+            active_is_local_dac = spk.is_local_dac;
+            strncpy(active_speaker_ip, spk.ip, sizeof(active_speaker_ip) - 1);
+            prebuffering = true;
+            vTaskDelay(pdMS_TO_TICKS(80));
+            next_send_us = esp_timer_get_time();
+            continue;
+        } else if (force_pin_reconnect || speaker_changed || (!spk.is_local_dac && !raop->isConnected())) {
+            if (raop->isConnected()) {
+                raop->disconnect();
+            }
+            speaker_initialized = true;
+            active_is_local_dac = spk.is_local_dac;
+            strncpy(active_speaker_ip, spk.ip, sizeof(active_speaker_ip) - 1);
             last_sent_title[0] = '\0';
+            last_sent_art_seq = 0;
             prebuffering = true;
 
-            if (!spk.is_local_dac && spk.ip[0] != '\0') {
+            if (!spk.is_local_dac) {
+                if (spk.ip[0] == '\0') {
+                    if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+                        g_app.status = STREAM_CONNECTING_AIRPLAY;
+                        snprintf(g_app.status_text, sizeof(g_app.status_text), "Finding %s...", spk.name);
+                        xSemaphoreGive(g_app.mutex);
+                    }
+                    speaker_initialized = false;
+                    vTaskDelay(pdMS_TO_TICKS(150));
+                    next_send_us = esp_timer_get_time();
+                    continue;
+                }
                 if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
                     g_app.status = STREAM_CONNECTING_AIRPLAY;
                     snprintf(g_app.status_text, sizeof(g_app.status_text), "AirPlay -> %s...", spk.name);
                     xSemaphoreGive(g_app.mutex);
                 }
                 if (!raop->connect(spk, vol)) {
+                    connect_failures++;
                     if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
                         g_app.status = STREAM_ERROR;
-                        snprintf(g_app.status_text, sizeof(g_app.status_text), "AirPlay retry: %s", spk.name);
+                        bool now_halted = (g_app.pin_halted_ip[0] != '\0' && strcmp(spk.ip, g_app.pin_halted_ip) == 0);
+                        if (!now_halted) {
+                            snprintf(g_app.status_text, sizeof(g_app.status_text), "AirPlay retry: %s", spk.name);
+                            if (connect_failures >= 2) {
+                                g_app.speaker_scan_requested = true;
+                            }
+                        }
                         xSemaphoreGive(g_app.mutex);
                     }
-                    vTaskDelay(pdMS_TO_TICKS(1500));
+                    vTaskDelay(pdMS_TO_TICKS(1200));
                     next_send_us = esp_timer_get_time();
                     continue;
                 }
+                connect_failures = 0;
             }
             next_send_us = esp_timer_get_time();
         }
@@ -478,22 +622,45 @@ static void raop_sender_task(void *arg) {
             raop->setMetadata(cur_title, cur_station, "SomaFM Radio");
         }
 
+        uint32_t cur_art_seq = artwork_get_jpeg_seq();
+        if (raop->isConnected() && !prebuffering && art_jpg_buf &&
+            cur_art_seq != 0 && cur_art_seq != last_sent_art_seq) {
+            uint32_t copied_seq = 0;
+            size_t jpg_len = artwork_copy_jpeg(art_jpg_buf, 64 * 1024, &copied_seq);
+            if (jpg_len > 0) {
+                last_sent_art_seq = copied_seq;
+                raop->setArtwork(art_jpg_buf, jpg_len);
+            }
+        }
+
         raop->pollControlAndKeepalive();
 
-        // Pre-buffer ~0.65s (28665 frames) before starting burst; background decoder continues filling up to ~12s!
+        // Start playback as soon as 300ms (13230 frames) of PCM is decoded + >=8KB MP3 is in buffer (or 500ms PCM),
+        // while the remaining ~40KB Icecast burst continues decoding into the 2MB PSRAM ringbuffer!
         uint32_t avail = ring_available_frames();
         if (prebuffering) {
-            if (avail < 28665) {
-                vTaskDelay(pdMS_TO_TICKS(5));
+            uint32_t min_start_frames = (mp3_bytes_buffered >= 8192) ? 13230 : 22050;
+            if (avail < min_start_frames) {
+                vTaskDelay(pdMS_TO_TICKS(4));
                 next_send_us = esp_timer_get_time();
                 continue;
             }
             prebuffering = false;
+            if (!spk.is_local_dac && raop->isConnected()) {
+                raop->resyncTimestamp();
+            }
             next_send_us = esp_timer_get_time();
         } else if (avail < RAOP_CHUNK_FRAMES) {
-            Serial.println("[RADIO] PCM ringbuffer underrun; re-buffering...");
+            if (!radio_connecting) {
+                Serial.println("[RADIO] PCM ringbuffer underrun; re-buffering...");
+                if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                    g_app.stream_underruns++;
+                    xSemaphoreGive(g_app.mutex);
+                }
+            }
             prebuffering = true;
             vTaskDelay(pdMS_TO_TICKS(5));
+            next_send_us = esp_timer_get_time();
             continue;
         }
 
@@ -517,23 +684,29 @@ static void raop_sender_task(void *arg) {
                     local_dac_write_frames(chunk_pcm, RAOP_CHUNK_FRAMES, vol);
                 }
             }
-        } else {
+        } else if (spk.is_local_dac) {
             uint64_t now_us = esp_timer_get_time();
             if (now_us < next_send_us) {
                 uint64_t wait_us = next_send_us - now_us;
-                if (wait_us > 2000) {
-                    vTaskDelay(pdMS_TO_TICKS(wait_us / 1000));
-                }
+                uint32_t delay_ms = (uint32_t)(wait_us / 1000ULL);
+                vTaskDelay(pdMS_TO_TICKS(delay_ms > 0 ? delay_ms : 1));
                 continue;
             }
             if (ring_pop_352(chunk_pcm)) {
                 update_vu_meters(chunk_pcm);
                 local_dac_write_frames(chunk_pcm, RAOP_CHUNK_FRAMES, vol);
                 next_send_us += 7982ULL;
-                if (now_us > next_send_us + 50000ULL) {
-                    next_send_us = now_us;
+                uint64_t after_us = esp_timer_get_time();
+                if (after_us > next_send_us + 50000ULL) {
+                    next_send_us = after_us;
+                } else if (after_us < next_send_us) {
+                    uint64_t wait_us = next_send_us - after_us;
+                    uint32_t delay_ms = (uint32_t)(wait_us / 1000ULL);
+                    vTaskDelay(pdMS_TO_TICKS(delay_ms > 0 ? delay_ms : 1));
                 }
             }
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
 }
@@ -549,7 +722,6 @@ void radio_streamer_start(void) {
     StaticTask_t *http_tcb  = (StaticTask_t *)heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     xTaskCreateStaticPinnedToCore(http_decoder_task, "radio_http", 28672 / sizeof(StackType_t), NULL, 4, http_stack, http_tcb, 0);
 
-    StackType_t *raop_stack = (StackType_t *)heap_caps_malloc(24576, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    StaticTask_t *raop_tcb  = (StaticTask_t *)heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    xTaskCreateStaticPinnedToCore(raop_sender_task, "raop_tx", 24576 / sizeof(StackType_t), NULL, 6, raop_stack, raop_tcb, 1);
+    // Run RAOP sender + I2S DAC task on a genuine Internal SRAM stack so it never panics during flash/driver operations
+    xTaskCreatePinnedToCore(raop_sender_task, "raop_tx", 14336, NULL, 6, NULL, 1);
 }

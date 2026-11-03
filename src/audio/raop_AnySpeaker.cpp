@@ -49,9 +49,21 @@ static const char APPLE_RSA_PUBKEY_PEM[] =
     "ewIDAQAB\n"
     "-----END PUBLIC KEY-----\n";
 
+static void *raop_alloc(size_t sz) {
+    void *p = heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) p = malloc(sz);
+    return p;
+}
+
+static void *raop_realloc(void *ptr, size_t sz) {
+    void *p = heap_caps_realloc(ptr, sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) p = realloc(ptr, sz);
+    return p;
+}
+
 static uint64_t get_ntp_now(uint32_t *sec_out, uint32_t *frac_out) {
     // Standard NTP epoch offset (0x83aa7e80 = 2208988800s) + monotonic clock
-    uint64_t us = (uint64_t)esp_timer_get_time() + 3910000000ULL * 1000000ULL;
+    uint64_t us = (uint64_t)esp_timer_get_time() + 2208988800ULL * 1000000ULL;
     uint32_t sec = (uint32_t)(us / 1000000ULL);
     uint32_t frac = (uint32_t)(((us % 1000000ULL) << 32) / 1000000ULL);
     if (sec_out) *sec_out = sec;
@@ -67,41 +79,28 @@ static inline uint64_t ts_to_ntp(uint64_t ts, uint32_t rate) {
     return (((ts << 16) / rate) << 16);
 }
 
-// Encodes 352 stereo 16-bit little-endian frames into raw uncompressed ALAC packet
+// Encodes 352 stereo 16-bit little-endian frames into 1412-byte raw uncompressed ALAC packet (hassize=0)
 static int encode_pcm_to_alac_raw(const int16_t *stereo_pcm, int frames, uint8_t *out) {
-    uint8_t *p = out;
-    const uint32_t *in = (const uint32_t *)stereo_pcm;
-    int bsize = RAOP_CHUNK_FRAMES;
-    if (frames > bsize) frames = bsize;
+    if (frames > RAOP_CHUNK_FRAMES) frames = RAOP_CHUNK_FRAMES;
+    const uint8_t *src = (const uint8_t *)stereo_pcm;
+    const int samples_size = frames * 4; // 352 * 4 = 1408 bytes
 
-    *p++ = (1 << 5);
-    *p++ = 0;
-    *p++ = (1 << 4) | (1 << 1) | ((bsize & 0x80000000) >> 31);
-    *p++ = ((bsize & 0x7f800000) << 1) >> 24;
-    *p++ = ((bsize & 0x007f8000) << 1) >> 16;
-    *p++ = ((bsize & 0x00007f80) << 1) >> 8;
-    *p   = ((bsize & 0x0000007f) << 1);
-    *p++ |= (*in & 0x00008000) >> 15;
+    // 20-bit ALAC uncompressed frame header (tag=1 [CPE], reserved=0, hassize=0, uncompressed=1)
+    out[0] = (1 << 5); // 0x20: 3-bit CPE tag = 1
+    out[1] = 0;        // 0x00: 4-bit tag + 12-bit reserved = 0
+    out[2] = (1 << 1); // 0x02: hassize(1b)=0, bytes_not_used(2b)=0, is_uncompressed(1b)=1
 
-    int count = frames - 1;
-    while (count-- > 0) {
-        *p++ = ((*in & 0x00007f80) >> 7);
-        *p++ = ((*in & 0x0000007f) << 1) | ((*in & 0x80000000) >> 31);
-        *p++ = ((*in & 0x7f800000) >> 23);
-        *p++ = ((*in & 0x007f0000) >> 15) | ((*(in + 1) & 0x00008000) >> 15);
-        in++;
+    // 16-bit stereo samples in big-endian byte order, shifted by 1 bit into bit position 20
+    for (int i = 0; i < samples_size; i += 2) {
+        out[i + 2] |= (src[i + 1] >> 7);
+        out[i + 3]  = (src[i + 1] << 1) | (src[i] >> 7);
+        out[i + 4]  = (src[i] << 1);
     }
-    *p++ = ((*in & 0x00007f80) >> 7);
-    *p++ = ((*in & 0x0000007f) << 1) | ((*in & 0x80000000) >> 31);
-    *p++ = ((*in & 0x7f800000) >> 23);
-    *p++ = ((*in & 0x007f0000) >> 15);
 
-    count = (bsize - frames) * 4;
-    while (count-- > 0) *p++ = 0;
-
-    *(p - 1) |= 1;
-    *p = (7 >> 1) << 6;
-    return (int)(p - out + 1);
+    // 3-bit ID_END (7 = 0b111) trailer -> total 1412 bytes for 352 frames
+    out[samples_size + 2] |= 1;
+    out[samples_size + 3]  = (7 >> 1) << 6;
+    return samples_size + 4;
 }
 
 // --- SRP-6a + HKDF + ChaCha20-Poly1305 Helpers for AirPlay 2 ---
@@ -173,7 +172,7 @@ static bool hap_chacha_encrypt(uint8_t **out_buf, size_t *out_len,
     if (!plain || plain_len == 0) return false;
     size_t nblocks = 1 + ((plain_len - 1) / AP2_BLOCK_MAX);
     *out_len = nblocks * (2 + AP2_TAG_SIZE) + plain_len;
-    *out_buf = (uint8_t *)malloc(*out_len);
+    *out_buf = (uint8_t *)raop_alloc(*out_len);
     if (!*out_buf) return false;
 
     const uint8_t *p = plain;
@@ -210,7 +209,7 @@ static ssize_t hap_chacha_decrypt(uint8_t **plain_out, size_t *plain_len_out,
     *plain_len_out = 0;
     if (!cipher || cipher_len < 2) return 0;
 
-    uint8_t *plain = (uint8_t *)malloc(cipher_len + 1);
+    uint8_t *plain = (uint8_t *)raop_alloc(cipher_len + 1);
     if (!plain) return -1;
 
     const uint8_t *c = cipher;
@@ -289,7 +288,7 @@ static int tlv8_append(uint8_t *dst, uint8_t type, const uint8_t *val, int len) 
 }
 
 static bool buf_append(uint8_t **buf, size_t *len, const uint8_t *data, size_t n) {
-    uint8_t *tmp = (uint8_t *)realloc(*buf, *len + n + 1);
+    uint8_t *tmp = (uint8_t *)raop_realloc(*buf, *len + n + 1);
     if (!tmp) return false;
     memcpy(tmp + *len, data, n);
     *len += n;
@@ -343,17 +342,20 @@ RaopClient::RaopClient()
       m_retransmits(0),
       m_timing_running(false),
       m_timing_task(NULL),
-      m_backlog(NULL) {
+      m_backlog(NULL),
+      m_alac_buf(NULL),
+      m_rtp_pkt(NULL) {
     memset(m_session, 0, sizeof(m_session));
-    m_backlog = (BacklogSlot *)heap_caps_calloc(BACKLOG_SIZE, sizeof(BacklogSlot), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    m_backlog  = (BacklogSlot *)heap_caps_calloc(BACKLOG_SIZE, sizeof(BacklogSlot), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    m_alac_buf = (uint8_t *)heap_caps_calloc(1424, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    m_rtp_pkt  = (uint8_t *)heap_caps_calloc(1484, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 }
 
 RaopClient::~RaopClient() {
     disconnect();
-    if (m_backlog) {
-        heap_caps_free(m_backlog);
-        m_backlog = NULL;
-    }
+    if (m_backlog)  { heap_caps_free(m_backlog);  m_backlog  = NULL; }
+    if (m_alac_buf) { heap_caps_free(m_alac_buf); m_alac_buf = NULL; }
+    if (m_rtp_pkt)  { heap_caps_free(m_rtp_pkt);  m_rtp_pkt  = NULL; }
 }
 
 static int bind_udp_ephemeral(uint16_t *port_out) {
@@ -427,30 +429,48 @@ bool RaopClient::connect(const AirPlaySpeaker &spk, int initial_volume_pct) {
     m_local_ip_addr = local_in.sin_addr.s_addr;
 
     uint32_t r1 = esp_random(), r2 = esp_random(), r3 = esp_random();
-    m_ssrc = esp_random();
     m_seq_num = (uint16_t)(esp_random() & 0x7FFF);
     m_sid_int = (r1 % 1000000000UL) + 100000000UL;
+    m_ssrc = m_sid_int;
     snprintf(m_sid, sizeof(m_sid), "%010lu", (unsigned long)m_sid_int);
     snprintf(m_sci, sizeof(m_sci), "%08lX%08lX", (unsigned long)r2, (unsigned long)r3);
     snprintf(m_dacp_id, sizeof(m_dacp_id), "%08lX%08lX", (unsigned long)r3, (unsigned long)r2);
     snprintf(m_active_remote, sizeof(m_active_remote), "%010lu", (unsigned long)(r2 % 1000000000UL + 100000000UL));
 
-    struct in_addr paddr = {.s_addr = m_peer_ip_addr};
-    snprintf(m_rtsp_url, sizeof(m_rtsp_url), "rtsp://%s/%s", inet_ntoa(paddr), m_sid);
+    struct in_addr laddr_init = {.s_addr = m_local_ip_addr};
+    snprintf(m_rtsp_url, sizeof(m_rtsp_url), "rtsp://%s/%s", inet_ntoa(laddr_init), m_sid);
 
-    bool is_apple_ap2_candidate =
+    bool is_hard_ap2 =
         (strcasestr(spk.am, "AudioAccessory") != NULL ||
          strcasestr(spk.am, "AppleTV") != NULL ||
          strcasestr(spk.am, "HomePod") != NULL ||
-         strchr(spk.et, '5') != NULL);
+         strcasestr(spk.am, "Mac") != NULL ||
+         strcasestr(spk.am, "Five") != NULL ||
+         strcasestr(spk.am, "One") != NULL ||
+         strcasestr(spk.am, "Era") != NULL ||
+         strcasestr(spk.am, "Arc") != NULL ||
+         strcasestr(spk.am, "Beam") != NULL ||
+         strcasestr(spk.am, "Ray") != NULL ||
+         strcasestr(spk.am, "Roam") != NULL ||
+         strcasestr(spk.am, "Move") != NULL ||
+         strcasestr(spk.am, "SYMFONISK") != NULL ||
+         strcasestr(spk.am, "Sonos") != NULL ||
+         strcasestr(spk.host, "Sonos-") != NULL ||
+         strchr(spk.et, '5') != NULL ||
+         spk.is_ap2);
 
-    if (is_apple_ap2_candidate) {
-        strncpy(m_user_agent, "AirPlay/999.0.0", sizeof(m_user_agent));
+    bool is_ap2_candidate =
+        (is_hard_ap2 ||
+         strchr(spk.et, '4') != NULL ||
+         spk.requires_pin);
+
+    if (is_ap2_candidate) {
+        strncpy(m_user_agent, "AirPlay/366.0", sizeof(m_user_agent));
     } else {
         strncpy(m_user_agent, "iTunes/7.6.2 (Windows; N;)", sizeof(m_user_agent));
     }
 
-    // Open UDP sockets for timing, control, and audio BEFORE SETUP (required by HomePod/AppleTV)
+    // Open UDP sockets for timing, control, and audio BEFORE SETUP (required by HomePod/AppleTV/Sonos)
     m_time_sock = bind_udp_ephemeral(&m_local_time_port);
     m_ctrl_sock = bind_udp_ephemeral(&m_local_ctrl_port);
     m_audio_sock = bind_udp_ephemeral(&m_local_audio_port);
@@ -467,24 +487,66 @@ bool RaopClient::connect(const AirPlaySpeaker &spk, int initial_volume_pct) {
     m_timing_running = true;
     xTaskCreatePinnedToCore(timingTaskTrampoline, "raop_ntp", 4096, this, 5, &m_timing_task, 0);
 
-    if (is_apple_ap2_candidate) {
-        bool supports_transient = false;
-        if (doGetInfo(&supports_transient) && supports_transient) {
+    bool supports_transient = false;
+    bool pin_required = spk.requires_pin;
+    if (is_ap2_candidate) {
+        bool info_ok = doGetInfo(&supports_transient, &pin_required);
+        if (info_ok && (supports_transient || pin_required)) {
             m_ap2 = true;
-        } else if (strcasestr(spk.am, "AudioAccessory") || strcasestr(spk.am, "AppleTV")) {
+        } else if (is_hard_ap2) {
             m_ap2 = true;
+        } else {
+            // Non-AP2 speaker rejected /info; reconnect clean RTSP socket for RAOP AirPlay 1
+            strncpy(m_user_agent, "iTunes/7.6.2 (Windows; N;)", sizeof(m_user_agent));
+            reconnectRtspSocket();
         }
     }
 
-    if (m_ap2) {
-        Serial.println("[RAOP] Using AirPlay 2 (HomeKit transient pairing + ChaCha20-Poly1305)");
+    bool manual_pin_req = false;
+    if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        manual_pin_req = g_app.pin_manual_request;
+        g_app.pin_manual_request = false;
+        xSemaphoreGive(g_app.mutex);
+    }
+
+    if (m_ap2 || manual_pin_req) {
+        m_ap2 = true;
+        Serial.println("[RAOP] Using AirPlay 2 (HomeKit pairing + ChaCha20-Poly1305)");
         struct in_addr laddr = {.s_addr = m_local_ip_addr};
         snprintf(m_rtsp_url, sizeof(m_rtsp_url), "rtsp://%s/%s", inet_ntoa(laddr), m_sid);
         m_encrypt_aes = false;
-        m_latency_frames = 44100;
+        m_latency_frames = 88200;
 
-        if (!doAp2PairTransient()) {
-            Serial.println("[RAOP] AirPlay 2 transient pairing failed");
+        bool paired_ok = false;
+        if (manual_pin_req) {
+            paired_ok = promptAndPairWithPin();
+        } else {
+            // 1. If we previously completed 4-digit PIN pairing with this device, try fast Pair-Verify first
+            bool had_saved_pair = app_is_ap2_speaker_paired(m_speaker.ip);
+            if (had_saved_pair) {
+                paired_ok = doAp2PairVerify();
+                if (!paired_ok) {
+                    reconnectRtspSocket();
+                }
+            }
+            if (!paired_ok) {
+                if (pin_required) {
+                    paired_ok = promptAndPairWithPin();
+                } else {
+                    // 2. Try standard transient pairing ("3939"); if rejected by PIN policy, prompt for 4-digit code
+                    bool auth_rejected = false;
+                    paired_ok = doAp2PairTransient("3939", &auth_rejected);
+                    if (!paired_ok && auth_rejected) {
+                        Serial.println("[RAOP] Transient 3939 rejected by auth policy; falling back to 4-digit PIN prompt...");
+                        reconnectRtspSocket();
+                        paired_ok = promptAndPairWithPin();
+                    }
+                }
+            }
+        }
+
+        if (!paired_ok) {
+            Serial.println("[RAOP] AirPlay 2 pairing failed");
             disconnect();
             return false;
         }
@@ -498,6 +560,23 @@ bool RaopClient::connect(const AirPlaySpeaker &spk, int initial_volume_pct) {
 
         if (event_port > 0) {
             connectEventChannel(event_port);
+        }
+
+        // Allow Sonos & AirPlay 2 receivers to complete initial UDP NTP timing exchange
+        if (m_remote_time_port > 0) {
+            for (int w = 0; w < 30 && m_ntp_replies < 2; w++) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+            vTaskDelay(pdMS_TO_TICKS(25));
+        }
+
+        // Follow owntone's Sonos-verified AirPlay 2 startup sequence:
+        // SETUP (session) -> RECORD -> SETUP (stream) -> SET_PARAMETER (volume)
+        m_head_ts = ntp_to_ts(get_ntp_now(NULL, NULL), RAOP_SAMPLE_RATE);
+        if (!doRecord()) {
+            Serial.println("[RAOP] AirPlay 2 RECORD failed");
+            disconnect();
+            return false;
         }
 
         if (!doAp2SetupStream()) {
@@ -529,20 +608,28 @@ bool RaopClient::connect(const AirPlaySpeaker &spk, int initial_volume_pct) {
             disconnect();
             return false;
         }
+
+        if (m_remote_time_port > 0) {
+            for (int w = 0; w < 25 && m_ntp_replies < 1; w++) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+        }
+
+        m_head_ts = ntp_to_ts(get_ntp_now(NULL, NULL), RAOP_SAMPLE_RATE);
+
+        if (!doRecord()) {
+            disconnect();
+            return false;
+        }
     }
 
-    if (!doRecord()) {
-        disconnect();
-        return false;
-    }
-
-    m_head_ts = ntp_to_ts(get_ntp_now(NULL, NULL), RAOP_SAMPLE_RATE);
     m_first_pkt = true;
     m_connected = true;
     m_last_sync_us = esp_timer_get_time();
     m_last_keepalive_us = esp_timer_get_time();
 
-    setVolume(initial_volume_pct);
+    // Send initial volume synchronously as the final step of startup (required by Sonos)
+    setVolume(initial_volume_pct, true);
     Serial.printf("[RAOP] Connected (%s) -> %s (audio=%u ctrl=%u time=%u latency=%lu)\n",
                   m_ap2 ? "AirPlay 2" : "AirPlay 1",
                   spk.name, m_remote_audio_port, m_remote_ctrl_port, m_remote_time_port,
@@ -554,7 +641,9 @@ void RaopClient::disconnect() {
     m_connected = false;
     if (m_timing_running) {
         m_timing_running = false;
-        vTaskDelay(pdMS_TO_TICKS(150));
+        for (int i = 0; i < 25 && m_timing_task != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
         m_timing_task = NULL;
     }
     if (m_event_sock >= 0) {
@@ -603,7 +692,12 @@ void RaopClient::disconnect() {
 int RaopClient::rtspSend(const uint8_t *data, int len) {
     if (m_rtsp_sock < 0) return -1;
     if (!m_rtsp_encrypted) {
-        return send(m_rtsp_sock, data, len, 0);
+        int n = send(m_rtsp_sock, data, len, 0);
+        if (n <= 0 && m_connected) {
+            Serial.println("[RAOP] RTSP socket send failed; marking disconnected");
+            m_connected = false;
+        }
+        return n;
     }
 
     uint8_t *enc = NULL;
@@ -620,6 +714,10 @@ int RaopClient::rtspSend(const uint8_t *data, int len) {
         sent += (size_t)n;
     }
     free(enc);
+    if (sent != enc_len && m_connected) {
+        Serial.println("[RAOP] Encrypted RTSP send failed; marking disconnected");
+        m_connected = false;
+    }
     return (sent == enc_len) ? len : -1;
 }
 
@@ -633,7 +731,15 @@ bool RaopClient::rtspFillPlain(int timeout_ms) {
 
     uint8_t raw[1536];
     int n = recv(m_rtsp_sock, raw, sizeof(raw), 0);
-    if (n <= 0) return false;
+    if (n <= 0) {
+        if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
+            if (m_connected) {
+                Serial.println("[RAOP] RTSP socket closed by peer; marking disconnected");
+                m_connected = false;
+            }
+        }
+        return false;
+    }
 
     if (!m_rtsp_encrypted) {
         return buf_append(&m_rx_plain_buf, &m_rx_plain_len, raw, (size_t)n);
@@ -665,7 +771,7 @@ bool RaopClient::sendRtspAsync(const char *cmd, const char *uri_override,
     if (m_rtsp_sock < 0) return false;
 
     int req_cap = 1024 + content_len;
-    uint8_t *req = (uint8_t *)malloc(req_cap);
+    uint8_t *req = (uint8_t *)raop_alloc(req_cap);
     if (!req) return false;
 
     int hdr_len = snprintf((char *)req, 1024,
@@ -679,7 +785,9 @@ bool RaopClient::sendRtspAsync(const char *cmd, const char *uri_override,
         ++m_cseq, m_user_agent, m_sci, m_dacp_id, m_active_remote);
 
     if (m_ap2) {
-        hdr_len += snprintf((char *)req + hdr_len, 1024 - hdr_len, "X-Apple-Client-Name: AirPlay\r\n");
+        hdr_len += snprintf((char *)req + hdr_len, 1024 - hdr_len,
+            "X-Apple-Client-Name: AirPlayKnob\r\n"
+            "X-Apple-ProtocolVersion: 1\r\n");
     }
     if (m_session[0]) {
         hdr_len += snprintf((char *)req + hdr_len, 1024 - hdr_len, "Session: %s\r\n", m_session);
@@ -690,6 +798,9 @@ bool RaopClient::sendRtspAsync(const char *cmd, const char *uri_override,
     if (content_type && content && content_len > 0) {
         hdr_len += snprintf((char *)req + hdr_len, 1024 - hdr_len,
             "Content-Type: %s\r\nContent-Length: %d\r\n", content_type, content_len);
+    } else if (strcasecmp(cmd, "POST") == 0 || strcasecmp(cmd, "SETUP") == 0 ||
+               strcasecmp(cmd, "SET_PARAMETER") == 0 || strcasecmp(cmd, "GET_PARAMETER") == 0) {
+        hdr_len += snprintf((char *)req + hdr_len, 1024 - hdr_len, "Content-Length: 0\r\n");
     }
     hdr_len += snprintf((char *)req + hdr_len, 1024 - hdr_len, "\r\n");
 
@@ -727,15 +838,17 @@ void RaopClient::drainRtspResponses() {
 bool RaopClient::execRtsp(const char *cmd, const char *uri_override,
                           const char *content_type, const uint8_t *content, int content_len,
                           const char *extra_headers, char *resp_headers_out, int resp_headers_max,
-                          uint8_t **resp_body_out, int *resp_body_len_out) {
+                          uint8_t **resp_body_out, int *resp_body_len_out,
+                          int *status_code_out) {
     if (resp_body_out) *resp_body_out = NULL;
     if (resp_body_len_out) *resp_body_len_out = 0;
+    if (status_code_out) *status_code_out = 0;
     if (m_rtsp_sock < 0) return false;
 
     drainRtspResponses();
 
     int req_cap = 1024 + content_len;
-    uint8_t *req = (uint8_t *)malloc(req_cap);
+    uint8_t *req = (uint8_t *)raop_alloc(req_cap);
     if (!req) return false;
 
     int hdr_len = snprintf((char *)req, 1024,
@@ -749,7 +862,9 @@ bool RaopClient::execRtsp(const char *cmd, const char *uri_override,
         ++m_cseq, m_user_agent, m_sci, m_dacp_id, m_active_remote);
 
     if (m_ap2) {
-        hdr_len += snprintf((char *)req + hdr_len, 1024 - hdr_len, "X-Apple-Client-Name: AirPlay\r\n");
+        hdr_len += snprintf((char *)req + hdr_len, 1024 - hdr_len,
+            "X-Apple-Client-Name: AirPlayKnob\r\n"
+            "X-Apple-ProtocolVersion: 1\r\n");
     }
     if (m_session[0]) {
         hdr_len += snprintf((char *)req + hdr_len, 1024 - hdr_len, "Session: %s\r\n", m_session);
@@ -757,9 +872,14 @@ bool RaopClient::execRtsp(const char *cmd, const char *uri_override,
     if (extra_headers && extra_headers[0]) {
         hdr_len += snprintf((char *)req + hdr_len, 1024 - hdr_len, "%s", extra_headers);
     }
-    if (content_type && content && content_len > 0) {
-        hdr_len += snprintf((char *)req + hdr_len, 1024 - hdr_len,
-            "Content-Type: %s\r\nContent-Length: %d\r\n", content_type, content_len);
+    if (content_type && content_type[0]) {
+        hdr_len += snprintf((char *)req + hdr_len, 1024 - hdr_len, "Content-Type: %s\r\n", content_type);
+    }
+    if (content && content_len > 0) {
+        hdr_len += snprintf((char *)req + hdr_len, 1024 - hdr_len, "Content-Length: %d\r\n", content_len);
+    } else if (strcasecmp(cmd, "POST") == 0 || strcasecmp(cmd, "SETUP") == 0 ||
+               strcasecmp(cmd, "SET_PARAMETER") == 0 || strcasecmp(cmd, "GET_PARAMETER") == 0) {
+        hdr_len += snprintf((char *)req + hdr_len, 1024 - hdr_len, "Content-Length: 0\r\n");
     }
     hdr_len += snprintf((char *)req + hdr_len, 1024 - hdr_len, "\r\n");
 
@@ -798,6 +918,7 @@ bool RaopClient::execRtsp(const char *cmd, const char *uri_override,
     size_t hdr_bytes = (size_t)(hdr_end_ptr + 4 - (char *)m_rx_plain_buf);
     int status_code = 0;
     sscanf((char *)m_rx_plain_buf, "RTSP/%*s %d", &status_code);
+    if (status_code_out) *status_code_out = status_code;
     if (status_code != 200) {
         Serial.printf("[RAOP] RTSP %s (%s) returned status %d\n",
                       cmd, uri_override ? uri_override : "", status_code);
@@ -826,8 +947,38 @@ bool RaopClient::execRtsp(const char *cmd, const char *uri_override,
     return status_code == 200;
 }
 
-bool RaopClient::doGetInfo(bool *supports_transient_out) {
-    *supports_transient_out = false;
+bool RaopClient::reconnectRtspSocket() {
+    if (m_rtsp_sock >= 0) {
+        close(m_rtsp_sock);
+        m_rtsp_sock = -1;
+    }
+    free(m_rx_enc_buf);   m_rx_enc_buf = NULL;   m_rx_enc_len = 0;
+    free(m_rx_plain_buf); m_rx_plain_buf = NULL; m_rx_plain_len = 0;
+    m_rtsp_encrypted = false;
+
+    m_rtsp_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (m_rtsp_sock < 0) return false;
+
+    struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
+    setsockopt(m_rtsp_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(m_rtsp_sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in peer_in = {};
+    peer_in.sin_family = AF_INET;
+    peer_in.sin_addr.s_addr = m_peer_ip_addr;
+    peer_in.sin_port = htons(m_rtsp_port);
+
+    if (::connect(m_rtsp_sock, (struct sockaddr *)&peer_in, sizeof(peer_in)) < 0) {
+        close(m_rtsp_sock);
+        m_rtsp_sock = -1;
+        return false;
+    }
+    return true;
+}
+
+bool RaopClient::doGetInfo(bool *supports_transient_out, bool *pin_required_out) {
+    if (supports_transient_out) *supports_transient_out = false;
+    if (pin_required_out) *pin_required_out = false;
     uint8_t *body = NULL;
     int body_len = 0;
     if (!execRtsp("GET", "/info", NULL, NULL, 0, NULL, NULL, 0, &body, &body_len) || !body || body_len <= 0) {
@@ -859,19 +1010,32 @@ bool RaopClient::doGetInfo(bool *supports_transient_out) {
     const char *model = plb_get_string(root, "model");
     const char *src_ver = plb_get_string(root, "sourceVersion");
 
-    // Bit 52 = SupportsUnifiedPairSetupAndMFi (transient pairing)
-    bool transient = ((features & (1ULL << 52)) != 0);
-    *supports_transient_out = transient;
+    // AirPlay 2 transient pairing feature bits:
+    // Bit 52 = SupportsUnifiedPairSetupAndMFi (Apple HomePod / AppleTV)
+    // Bit 48 = SupportsTransientPairing (Sonos & AirPlay 2 receivers)
+    // Bit 47 = SupportsCoreUtilsPairingAndEncryption
+    // Bit 46 = SupportsHKPairingAndAccessControl
+    // Bit 38 = SupportsUnifiedMediaControl
+    const uint64_t AP2_TRANSIENT_MASK =
+        (1ULL << 52) | (1ULL << 48) | (1ULL << 47) | (1ULL << 46) | (1ULL << 38);
+    bool transient = ((features & AP2_TRANSIENT_MASK) != 0) || ((status_flags & 0x04) != 0);
+    // statusFlags: 0x08 = PinRequired, 0x200 = OneTimePairingRequired
+    bool pin_req = ((status_flags & 0x208) != 0);
+    if (supports_transient_out) *supports_transient_out = transient;
+    if (pin_required_out) *pin_required_out = pin_req;
 
-    Serial.printf("[RAOP] /info: model=%s ver=%s features=0x%llx statusFlags=0x%llx transient=%d\n",
+    Serial.printf("[RAOP] /info: model=%s ver=%s features=0x%llx statusFlags=0x%llx transient=%d pinReq=%d\n",
                   model ? model : "?", src_ver ? src_ver : "?",
-                  (unsigned long long)features, (unsigned long long)status_flags, transient ? 1 : 0);
+                  (unsigned long long)features, (unsigned long long)status_flags,
+                  transient ? 1 : 0, pin_req ? 1 : 0);
 
     plb_free(root);
     return true;
 }
 
-bool RaopClient::doAp2PairTransient() {
+bool RaopClient::doAp2PairTransient(const char *pin_override, bool *auth_rejected_out) {
+    if (auth_rejected_out) *auth_rejected_out = false;
+    const char *pin = (pin_override && pin_override[0]) ? pin_override : "3939";
     // M1: State=1, Method=0 (PairSetup), Flags=0x10 (Transient)
     const uint8_t m1_tlv[] = {
         0x06, 0x01, 0x01, // TLVType_State = 1
@@ -881,9 +1045,21 @@ bool RaopClient::doAp2PairTransient() {
 
     uint8_t *m2_body = NULL;
     int m2_len = 0;
+    int m1_status = 0;
     if (!execRtsp("POST", "/pair-setup", "application/octet-stream", m1_tlv, sizeof(m1_tlv),
-                  "X-Apple-HKP: 4\r\n", NULL, 0, &m2_body, &m2_len) || !m2_body || m2_len <= 0) {
-        Serial.println("[RAOP] pair-setup M1->M2 HTTP failed");
+                  "X-Apple-HKP: 4\r\n", NULL, 0, &m2_body, &m2_len, &m1_status) || !m2_body || m2_len <= 0) {
+        Serial.printf("[RAOP] pair-setup M1->M2 HTTP failed (status=%d)\n", m1_status);
+        if (auth_rejected_out && (m1_status == 470 || m1_status == 401)) {
+            *auth_rejected_out = true;
+        }
+        if (m1_status == 403) {
+            if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                strncpy(g_app.pin_halted_ip, m_speaker.ip, sizeof(g_app.pin_halted_ip) - 1);
+                snprintf(g_app.status_text, sizeof(g_app.status_text), "AirPlay Locked (%s)", m_speaker.name);
+                xSemaphoreGive(g_app.mutex);
+            }
+            app_notify_pin_toast("AIRPLAY LOCKED", "Allow Anyone on Network", 0xEF4444);
+        }
         free(m2_body);
         return false;
     }
@@ -892,6 +1068,9 @@ bool RaopClient::doAp2PairTransient() {
     int err_len = 0;
     if (tlv8_extract(m2_body, m2_len, 0x07, &err_code, 1, &err_len) && err_len > 0) {
         Serial.printf("[RAOP] pair-setup M2 returned TLV error %u\n", err_code);
+        if (auth_rejected_out && (err_code == 2 || err_code == 6)) {
+            *auth_rejected_out = true;
+        }
         free(m2_body);
         return false;
     }
@@ -909,7 +1088,7 @@ bool RaopClient::doAp2PairTransient() {
         return false;
     }
 
-    // Compute SRP-6a M3 (3072-bit group, SHA-512, I="Pair-Setup", P="3939")
+    // Compute SRP-6a M3 (3072-bit group, SHA-512, I="Pair-Setup", P=pin)
     mbedtls_mpi N, g, s, B, a, A, k, u, x, v, S, tmp1, tmp2, tmp3, RR;
     mbedtls_mpi_init(&N); mbedtls_mpi_init(&g); mbedtls_mpi_init(&s); mbedtls_mpi_init(&B);
     mbedtls_mpi_init(&a); mbedtls_mpi_init(&A); mbedtls_mpi_init(&k); mbedtls_mpi_init(&u);
@@ -933,8 +1112,8 @@ bool RaopClient::doAp2PairTransient() {
     srp_h_nn_pad(&k, &N, &g, 384);
     srp_h_nn_pad(&u, &A, &B, 384);
 
-    // x = H(s || H("Pair-Setup:3939"))
-    srp_calc_x(&x, &s, "Pair-Setup", "3939");
+    // x = H(s || H("Pair-Setup:<pin>"))
+    srp_calc_x(&x, &s, "Pair-Setup", pin);
 
     // v = g^x mod N
     mbedtls_mpi_exp_mod(&v, &g, &x, &N, &RR);
@@ -1017,6 +1196,9 @@ bool RaopClient::doAp2PairTransient() {
 
     if (tlv8_extract(m4_body, m4_len, 0x07, &err_code, 1, &err_len) && err_len > 0) {
         Serial.printf("[RAOP] pair-setup M4 returned TLV error %u\n", err_code);
+        if (auth_rejected_out && err_code == 2) {
+            *auth_rejected_out = true;
+        }
         free(m4_body);
         return false;
     }
@@ -1032,6 +1214,7 @@ bool RaopClient::doAp2PairTransient() {
     }
 
     // Derive Control and Event channel keys via HKDF-SHA-512
+    memcpy(m_shk, session_key, 32);
     hkdf_sha512(m_ctrl_write_key, 32, session_key, 64, "Control-Salt", "Control-Write-Encryption-Key");
     hkdf_sha512(m_ctrl_read_key,  32, session_key, 64, "Control-Salt", "Control-Read-Encryption-Key");
     hkdf_sha512(m_ev_write_key,   32, session_key, 64, "Events-Salt",  "Events-Read-Encryption-Key");
@@ -1048,6 +1231,529 @@ bool RaopClient::doAp2PairTransient() {
 
     Serial.println("[RAOP] AirPlay 2 transient pairing succeeded! Control channel encrypted.");
     return true;
+}
+
+static void get_or_create_client_identity(char id_out[37], uint8_t ltpk_out[32], uint8_t ltsk_out[64]) {
+    app_get_ap2_client_identity(id_out, ltpk_out, ltsk_out);
+}
+
+bool RaopClient::doAp2StartPin(int *status_code_out) {
+    int st = 0;
+    bool ok = execRtsp("POST", "/pair-pin-start", "application/octet-stream", NULL, 0,
+                       "X-Apple-HKP: 3\r\n", NULL, 0, NULL, NULL, &st);
+    if (!ok && st == 0) {
+        if (reconnectRtspSocket()) {
+            ok = execRtsp("POST", "/pair-pin-start", "application/octet-stream", NULL, 0,
+                          "X-Apple-HKP: 3\r\n", NULL, 0, NULL, NULL, &st);
+        }
+    }
+    if (status_code_out) *status_code_out = st;
+    Serial.printf("[RAOP] /pair-pin-start: %s (status=%d)\n",
+                  ok ? "OK (4-digit PIN displayed on target)" : "HTTP non-200", st);
+    return ok;
+}
+
+bool RaopClient::doAp2PairPinPersistent(const char *pin_code,
+                                        const uint8_t *pre_salt, int pre_salt_len,
+                                        const uint8_t *pre_pkB, int pre_pkB_len) {
+    if (!pin_code || strlen(pin_code) < 4) return false;
+
+    uint8_t *pkB_bytes = (uint8_t *)malloc(384);
+    if (!pkB_bytes) return false;
+    uint8_t salt_bytes[32] = {0};
+    int pkB_len = 0, salt_len = 0;
+    uint8_t err_code = 0;
+    int err_len = 0;
+
+    if (pre_salt && pre_salt_len == 16 && pre_pkB && pre_pkB_len > 0 && pre_pkB_len <= 384) {
+        memcpy(salt_bytes, pre_salt, 16);
+        salt_len = 16;
+        memcpy(pkB_bytes, pre_pkB, (size_t)pre_pkB_len);
+        pkB_len = pre_pkB_len;
+    } else {
+        // M1: State=1, Method=0 (Non-transient Pair-Setup with 4-digit PIN)
+        const uint8_t m1_tlv[] = {
+            0x06, 0x01, 0x01, // TLVType_State = 1
+            0x00, 0x01, 0x00  // TLVType_Method = 0
+        };
+
+        uint8_t *m2_body = NULL;
+        int m2_len = 0;
+        if (!execRtsp("POST", "/pair-setup", "application/octet-stream", m1_tlv, sizeof(m1_tlv),
+                      "X-Apple-HKP: 3\r\n", NULL, 0, &m2_body, &m2_len) || !m2_body || m2_len <= 0) {
+            free(m2_body);
+            free(pkB_bytes);
+            return false;
+        }
+
+        if (tlv8_extract(m2_body, m2_len, 0x07, &err_code, 1, &err_len) && err_len > 0) {
+            Serial.printf("[RAOP] PIN pair-setup M2 returned TLV error %u\n", err_code);
+            free(m2_body);
+            free(pkB_bytes);
+            return false;
+        }
+
+        bool ok_m2 = tlv8_extract(m2_body, m2_len, 0x03, pkB_bytes, 384, &pkB_len) &&
+                     tlv8_extract(m2_body, m2_len, 0x02, salt_bytes, sizeof(salt_bytes), &salt_len);
+        free(m2_body);
+
+        if (!ok_m2 || pkB_len == 0 || salt_len != 16) {
+            free(pkB_bytes);
+            return false;
+        }
+    }
+
+    mbedtls_mpi N, g, s, B, a, A, k, u, x, v, S, tmp1, tmp2, tmp3, RR;
+    mbedtls_mpi_init(&N); mbedtls_mpi_init(&g); mbedtls_mpi_init(&s); mbedtls_mpi_init(&B);
+    mbedtls_mpi_init(&a); mbedtls_mpi_init(&A); mbedtls_mpi_init(&k); mbedtls_mpi_init(&u);
+    mbedtls_mpi_init(&x); mbedtls_mpi_init(&v); mbedtls_mpi_init(&S);
+    mbedtls_mpi_init(&tmp1); mbedtls_mpi_init(&tmp2); mbedtls_mpi_init(&tmp3); mbedtls_mpi_init(&RR);
+
+    mbedtls_mpi_read_string(&N, 16, SRP_N_3072_HEX);
+    mbedtls_mpi_lset(&g, 5);
+    mbedtls_mpi_read_binary(&s, salt_bytes, (size_t)salt_len);
+    mbedtls_mpi_read_binary(&B, pkB_bytes, (size_t)pkB_len);
+    free(pkB_bytes);
+
+    uint8_t rand_a[32];
+    esp_fill_random(rand_a, sizeof(rand_a));
+    mbedtls_mpi_read_binary(&a, rand_a, sizeof(rand_a));
+
+    mbedtls_mpi_exp_mod(&A, &g, &a, &N, &RR);
+    srp_h_nn_pad(&k, &N, &g, 384);
+    srp_h_nn_pad(&u, &A, &B, 384);
+    srp_calc_x(&x, &s, "Pair-Setup", pin_code);
+    mbedtls_mpi_exp_mod(&v, &g, &x, &N, &RR);
+
+    mbedtls_mpi_mul_mpi(&tmp1, &u, &x);
+    mbedtls_mpi_add_mpi(&tmp2, &a, &tmp1);
+
+    mbedtls_mpi_mul_mpi(&tmp3, &k, &v);
+    mbedtls_mpi_mod_mpi(&tmp3, &tmp3, &N);
+    mbedtls_mpi_mod_mpi(&tmp1, &B, &N);
+    if (mbedtls_mpi_cmp_mpi(&tmp1, &tmp3) < 0) {
+        mbedtls_mpi_add_mpi(&tmp1, &tmp1, &N);
+    }
+    mbedtls_mpi_sub_mpi(&tmp1, &tmp1, &tmp3);
+    mbedtls_mpi_exp_mod(&S, &tmp1, &tmp2, &N, &RR);
+
+    uint8_t session_key[64];
+    sha512_mpi_hash(&S, session_key);
+
+    uint8_t H_N[64], H_g[64], H_I[64], H_xor[64], M1_proof[64], H_AMK[64];
+    sha512_mpi_hash(&N, H_N);
+    sha512_mpi_hash(&g, H_g);
+    mbedtls_sha512((const uint8_t *)"Pair-Setup", 10, H_I, 0);
+    for (int i = 0; i < 64; i++) H_xor[i] = H_N[i] ^ H_g[i];
+
+    mbedtls_sha512_context sha_ctx;
+    mbedtls_sha512_init(&sha_ctx);
+    mbedtls_sha512_starts(&sha_ctx, 0);
+    mbedtls_sha512_update(&sha_ctx, H_xor, 64);
+    mbedtls_sha512_update(&sha_ctx, H_I, 64);
+    sha512_mpi_update(&sha_ctx, &s);
+    sha512_mpi_update(&sha_ctx, &A);
+    sha512_mpi_update(&sha_ctx, &B);
+    mbedtls_sha512_update(&sha_ctx, session_key, 64);
+    mbedtls_sha512_finish(&sha_ctx, M1_proof);
+
+    mbedtls_sha512_starts(&sha_ctx, 0);
+    sha512_mpi_update(&sha_ctx, &A);
+    mbedtls_sha512_update(&sha_ctx, M1_proof, 64);
+    mbedtls_sha512_update(&sha_ctx, session_key, 64);
+    mbedtls_sha512_finish(&sha_ctx, H_AMK);
+    mbedtls_sha512_free(&sha_ctx);
+
+    size_t pkA_len = mbedtls_mpi_size(&A);
+    uint8_t *pkA_bytes = (uint8_t *)malloc(pkA_len ? pkA_len : 1);
+    mbedtls_mpi_write_binary(&A, pkA_bytes, pkA_len);
+
+    mbedtls_mpi_free(&N); mbedtls_mpi_free(&g); mbedtls_mpi_free(&s); mbedtls_mpi_free(&B);
+    mbedtls_mpi_free(&a); mbedtls_mpi_free(&A); mbedtls_mpi_free(&k); mbedtls_mpi_free(&u);
+    mbedtls_mpi_free(&x); mbedtls_mpi_free(&v); mbedtls_mpi_free(&S);
+    mbedtls_mpi_free(&tmp1); mbedtls_mpi_free(&tmp2); mbedtls_mpi_free(&tmp3); mbedtls_mpi_free(&RR);
+
+    uint8_t *m3_tlv = (uint8_t *)malloc(512);
+    int m3_pos = 0;
+    uint8_t state3 = 0x03;
+    m3_pos += tlv8_append(m3_tlv + m3_pos, 0x06, &state3, 1);
+    m3_pos += tlv8_append(m3_tlv + m3_pos, 0x03, pkA_bytes, (int)pkA_len);
+    m3_pos += tlv8_append(m3_tlv + m3_pos, 0x04, M1_proof, 64);
+    free(pkA_bytes);
+
+    uint8_t *m4_body = NULL;
+    int m4_len = 0;
+    bool ok_m4 = execRtsp("POST", "/pair-setup", "application/octet-stream", m3_tlv, m3_pos,
+                          "X-Apple-HKP: 3\r\n", NULL, 0, &m4_body, &m4_len);
+    free(m3_tlv);
+
+    if (!ok_m4 || !m4_body || m4_len <= 0) {
+        free(m4_body);
+        return false;
+    }
+
+    if (tlv8_extract(m4_body, m4_len, 0x07, &err_code, 1, &err_len) && err_len > 0) {
+        Serial.printf("[RAOP] PIN pair-setup M4 returned TLV error %u (invalid PIN?)\n", err_code);
+        free(m4_body);
+        return false;
+    }
+
+    uint8_t M2_proof[64] = {0};
+    int m2_proof_len = 0;
+    bool has_proof = tlv8_extract(m4_body, m4_len, 0x04, M2_proof, 64, &m2_proof_len);
+    free(m4_body);
+
+    if (!has_proof || m2_proof_len != 64 || memcmp(M2_proof, H_AMK, 64) != 0) {
+        Serial.println("[RAOP] PIN pair-setup M4 server proof mismatch");
+        return false;
+    }
+
+    // M5: Exchange Ed25519 Long-Term Identity Key
+    char client_id[37] = {0};
+    uint8_t client_ltpk[32] = {0};
+    uint8_t client_ltsk[64] = {0};
+    get_or_create_client_identity(client_id, client_ltpk, client_ltsk);
+
+    uint8_t ios_device_x[32];
+    hkdf_sha512(ios_device_x, 32, session_key, 64,
+                "Pair-Setup-Controller-Sign-Salt", "Pair-Setup-Controller-Sign-Info");
+
+    size_t id_len = strlen(client_id);
+    uint8_t device_info[128];
+    memcpy(device_info, ios_device_x, 32);
+    memcpy(device_info + 32, client_id, id_len);
+    memcpy(device_info + 32 + id_len, client_ltpk, 32);
+
+    uint8_t sig64[64];
+    unsigned long long sig_len = 0;
+    crypto_sign_ed25519_detached(sig64, &sig_len, device_info, 32 + id_len + 32, client_ltsk);
+
+    uint8_t sub_tlv[256];
+    int sub_pos = 0;
+    sub_pos += tlv8_append(sub_tlv + sub_pos, 0x01, (const uint8_t *)client_id, (int)id_len);
+    sub_pos += tlv8_append(sub_tlv + sub_pos, 0x03, client_ltpk, 32);
+    sub_pos += tlv8_append(sub_tlv + sub_pos, 0x0A, sig64, 64);
+
+    uint8_t ps_enc_key[32];
+    hkdf_sha512(ps_enc_key, 32, session_key, 64,
+                "Pair-Setup-Encrypt-Salt", "Pair-Setup-Encrypt-Info");
+
+    uint8_t nonce_m5[12] = {0, 0, 0, 0, 'P', 'S', '-', 'M', 's', 'g', '0', '5'};
+    uint8_t enc_m5[280];
+    unsigned long long enc_m5_len = 0;
+    crypto_aead_chacha20poly1305_ietf_encrypt(
+        enc_m5, &enc_m5_len, sub_tlv, (unsigned long long)sub_pos,
+        NULL, 0, NULL, nonce_m5, ps_enc_key);
+
+    uint8_t m5_tlv[320];
+    int m5_pos = 0;
+    uint8_t state5 = 0x05;
+    m5_pos += tlv8_append(m5_tlv + m5_pos, 0x06, &state5, 1);
+    m5_pos += tlv8_append(m5_tlv + m5_pos, 0x05, enc_m5, (int)enc_m5_len);
+
+    uint8_t *m6_body = NULL;
+    int m6_len = 0;
+    bool ok_m6 = execRtsp("POST", "/pair-setup", "application/octet-stream", m5_tlv, m5_pos,
+                          "X-Apple-HKP: 3\r\n", NULL, 0, &m6_body, &m6_len);
+    if (!ok_m6 || !m6_body || m6_len <= 0) {
+        free(m6_body);
+        return false;
+    }
+
+    if (tlv8_extract(m6_body, m6_len, 0x07, &err_code, 1, &err_len) && err_len > 0) {
+        Serial.printf("[RAOP] PIN pair-setup M6 returned TLV error %u\n", err_code);
+        free(m6_body);
+        return false;
+    }
+    free(m6_body);
+
+    // Mark in app state (deferred NVS flush on loopTask) that this speaker IP is paired
+    app_mark_ap2_speaker_paired(m_speaker.ip);
+
+    Serial.printf("[RAOP] Persistent 4-digit PIN Pair-Setup M1..M6 succeeded for %s! Running Pair-Verify...\n",
+                  m_speaker.name);
+    if (doAp2PairVerify()) {
+        return true;
+    }
+    if (reconnectRtspSocket()) {
+        return doAp2PairVerify();
+    }
+    return false;
+}
+
+bool RaopClient::doAp2PairVerify() {
+    if (!app_is_ap2_speaker_paired(m_speaker.ip)) return false;
+
+    char client_id[37] = {0};
+    uint8_t client_ltpk[32] = {0};
+    uint8_t client_ltsk[64] = {0};
+    get_or_create_client_identity(client_id, client_ltpk, client_ltsk);
+
+    uint8_t cv_sk[32], cv_pk[32];
+    esp_fill_random(cv_sk, sizeof(cv_sk));
+    cv_sk[0] &= 248;
+    cv_sk[31] &= 127;
+    cv_sk[31] |= 64;
+    const uint8_t basepoint[32] = {9};
+    curve25519_donna(cv_pk, cv_sk, basepoint);
+
+    uint8_t m1_tlv[64];
+    int m1_pos = 0;
+    uint8_t state1 = 0x01;
+    m1_pos += tlv8_append(m1_tlv + m1_pos, 0x06, &state1, 1);
+    m1_pos += tlv8_append(m1_tlv + m1_pos, 0x03, cv_pk, 32);
+
+    uint8_t *m2_body = NULL;
+    int m2_len = 0;
+    if (!execRtsp("POST", "/pair-verify", "application/octet-stream", m1_tlv, m1_pos,
+                  "X-Apple-HKP: 3\r\n", NULL, 0, &m2_body, &m2_len) || !m2_body || m2_len <= 0) {
+        free(m2_body);
+        return false;
+    }
+
+    uint8_t srv_cv_pk[32] = {0};
+    uint8_t enc_m2[256] = {0};
+    int srv_pk_len = 0, enc_m2_len = 0;
+    bool ok_m2 = tlv8_extract(m2_body, m2_len, 0x03, srv_cv_pk, 32, &srv_pk_len) &&
+                 tlv8_extract(m2_body, m2_len, 0x05, enc_m2, sizeof(enc_m2), &enc_m2_len);
+    free(m2_body);
+    if (!ok_m2 || srv_pk_len != 32 || enc_m2_len < 16) {
+        return false;
+    }
+
+    uint8_t shared_v[32];
+    curve25519_donna(shared_v, cv_sk, srv_cv_pk);
+
+    uint8_t pv_enc_key[32];
+    hkdf_sha512(pv_enc_key, 32, shared_v, 32,
+                "Pair-Verify-Encrypt-Salt", "Pair-Verify-Encrypt-Info");
+
+    uint8_t dec_m2[256];
+    unsigned long long dec_m2_len = 0;
+    uint8_t nonce_m2[12] = {0, 0, 0, 0, 'P', 'V', '-', 'M', 's', 'g', '0', '2'};
+    if (crypto_aead_chacha20poly1305_ietf_decrypt(
+            dec_m2, &dec_m2_len, NULL, enc_m2, (unsigned long long)enc_m2_len,
+            NULL, 0, nonce_m2, pv_enc_key) != 0) {
+        return false;
+    }
+
+    size_t id_len = strlen(client_id);
+    uint8_t client_info[128];
+    memcpy(client_info, cv_pk, 32);
+    memcpy(client_info + 32, client_id, id_len);
+    memcpy(client_info + 32 + id_len, srv_cv_pk, 32);
+
+    uint8_t sig64[64];
+    unsigned long long sig_len = 0;
+    crypto_sign_ed25519_detached(sig64, &sig_len, client_info, 32 + id_len + 32, client_ltsk);
+
+    uint8_t sub_m3[160];
+    int sub_pos = 0;
+    sub_pos += tlv8_append(sub_m3 + sub_pos, 0x01, (const uint8_t *)client_id, (int)id_len);
+    sub_pos += tlv8_append(sub_m3 + sub_pos, 0x0A, sig64, 64);
+
+    uint8_t enc_m3[192];
+    unsigned long long enc_m3_len = 0;
+    uint8_t nonce_m3[12] = {0, 0, 0, 0, 'P', 'V', '-', 'M', 's', 'g', '0', '3'};
+    crypto_aead_chacha20poly1305_ietf_encrypt(
+        enc_m3, &enc_m3_len, sub_m3, (unsigned long long)sub_pos,
+        NULL, 0, NULL, nonce_m3, pv_enc_key);
+
+    uint8_t m3_tlv[220];
+    int m3_pos = 0;
+    uint8_t state3 = 0x03;
+    m3_pos += tlv8_append(m3_tlv + m3_pos, 0x06, &state3, 1);
+    m3_pos += tlv8_append(m3_tlv + m3_pos, 0x05, enc_m3, (int)enc_m3_len);
+
+    uint8_t *m4_body = NULL;
+    int m4_len = 0;
+    bool ok_m4 = execRtsp("POST", "/pair-verify", "application/octet-stream", m3_tlv, m3_pos,
+                          "X-Apple-HKP: 3\r\n", NULL, 0, &m4_body, &m4_len);
+    uint8_t err_code = 0;
+    int err_len = 0;
+    bool has_err = (m4_body && m4_len > 0 && tlv8_extract(m4_body, m4_len, 0x07, &err_code, 1, &err_len) && err_len > 0);
+    free(m4_body);
+    if (!ok_m4 || has_err) {
+        return false;
+    }
+
+    memcpy(m_shk, shared_v, 32);
+    hkdf_sha512(m_ctrl_write_key, 32, shared_v, 32, "Control-Salt", "Control-Write-Encryption-Key");
+    hkdf_sha512(m_ctrl_read_key,  32, shared_v, 32, "Control-Salt", "Control-Read-Encryption-Key");
+    hkdf_sha512(m_ev_write_key,   32, shared_v, 32, "Events-Salt",  "Events-Read-Encryption-Key");
+    hkdf_sha512(m_ev_read_key,    32, shared_v, 32, "Events-Salt",  "Events-Write-Encryption-Key");
+
+    m_ctrl_write_counter = 0;
+    m_ctrl_read_counter = 0;
+    m_ev_write_counter = 0;
+    m_ev_read_counter = 0;
+
+    free(m_rx_enc_buf);   m_rx_enc_buf = NULL;   m_rx_enc_len = 0;
+    free(m_rx_plain_buf); m_rx_plain_buf = NULL; m_rx_plain_len = 0;
+    m_rtsp_encrypted = true;
+
+    Serial.println("[RAOP] AirPlay 2 Pair-Verify succeeded! Control channel encrypted.");
+    return true;
+}
+
+bool RaopClient::promptAndPairWithPin() {
+    // 1. Trigger 4-digit PIN display on the target speaker / Apple TV / Mac
+    int pin_start_status = 0;
+    bool start_ok = doAp2StartPin(&pin_start_status);
+    if (pin_start_status == 403) {
+        Serial.printf("[RAOP] Target '%s' returned 403 Forbidden to /pair-pin-start (locked to Apple ID / Current User)\n",
+                      m_speaker.name);
+        if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            g_app.pin_prompt_active = false;
+            g_app.pin_manual_request = false;
+            strncpy(g_app.pin_halted_ip, m_speaker.ip, sizeof(g_app.pin_halted_ip) - 1);
+            g_app.pin_halted_ip[sizeof(g_app.pin_halted_ip) - 1] = '\0';
+            snprintf(g_app.status_text, sizeof(g_app.status_text),
+                     "AirPlay Locked on %s (Set 'Anyone on Network')", m_speaker.name);
+            xSemaphoreGive(g_app.mutex);
+        }
+        app_notify_pin_toast("AIRPLAY LOCKED", "Set Target: Anyone on Network", 0xEF4444);
+        return false;
+    }
+
+    // 2. Immediately send /pair-setup M1 (State=1, Method=0) and receive M2 (salt + pkB)
+    // BEFORE waiting for user input so the target displays and locks the 4-digit PIN challenge!
+    const uint8_t m1_tlv[] = {
+        0x06, 0x01, 0x01, // TLVType_State = 1
+        0x00, 0x01, 0x00  // TLVType_Method = 0 (Pair-Setup with PIN)
+    };
+    uint8_t *m2_body = NULL;
+    int m2_len = 0;
+    int m1_status = 0;
+    bool m1_ok = execRtsp("POST", "/pair-setup", "application/octet-stream", m1_tlv, sizeof(m1_tlv),
+                          "X-Apple-HKP: 3\r\n", NULL, 0, &m2_body, &m2_len, &m1_status);
+    uint8_t err_code = 0;
+    int err_len = 0;
+    if (m2_body && m2_len > 0 && tlv8_extract(m2_body, m2_len, 0x07, &err_code, 1, &err_len) && err_len > 0) {
+        Serial.printf("[RAOP] PIN pair-setup M1->M2 returned TLV error %u\n", err_code);
+        m1_ok = false;
+    }
+
+    uint8_t *pkB_bytes = (uint8_t *)malloc(384);
+    uint8_t salt_bytes[32] = {0};
+    int pkB_len = 0, salt_len = 0;
+    bool ok_m2 = m1_ok && pkB_bytes && m2_body && m2_len > 0 &&
+                 tlv8_extract(m2_body, m2_len, 0x03, pkB_bytes, 384, &pkB_len) &&
+                 tlv8_extract(m2_body, m2_len, 0x02, salt_bytes, sizeof(salt_bytes), &salt_len) &&
+                 pkB_len > 0 && salt_len == 16;
+    free(m2_body);
+
+    if (!start_ok && !ok_m2) {
+        free(pkB_bytes);
+        Serial.printf("[RAOP] Target '%s' did not start PIN session (pin_start=%d, m1=%d, err=%u)\n",
+                      m_speaker.name, pin_start_status, m1_status, err_code);
+        if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            g_app.pin_prompt_active = false;
+            g_app.pin_manual_request = false;
+            strncpy(g_app.pin_halted_ip, m_speaker.ip, sizeof(g_app.pin_halted_ip) - 1);
+            g_app.pin_halted_ip[sizeof(g_app.pin_halted_ip) - 1] = '\0';
+            if (m1_status == 403) {
+                snprintf(g_app.status_text, sizeof(g_app.status_text),
+                         "AirPlay Locked on %s (Set 'Anyone on Network')", m_speaker.name);
+            } else {
+                snprintf(g_app.status_text, sizeof(g_app.status_text),
+                         "PIN Not Supported (%s)", m_speaker.name);
+            }
+            xSemaphoreGive(g_app.mutex);
+        }
+        app_notify_pin_toast(m1_status == 403 ? "AIRPLAY LOCKED" : "AIRPLAY PIN",
+                             m1_status == 403 ? "Set Target: Anyone on Network" : "Target Refused PIN Request",
+                             0xEF4444);
+        return false;
+    }
+
+    // 3. Notify UI & Web Portal to prompt user for the 4-digit code now displayed on the target
+    if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        g_app.pin_prompt_active = true;
+        g_app.pin_submitted = false;
+        g_app.pin_cancelled = false;
+        g_app.pin_code[0] = '\0';
+        strncpy(g_app.pin_speaker_name, m_speaker.name, sizeof(g_app.pin_speaker_name) - 1);
+        strncpy(g_app.pin_speaker_ip, m_speaker.ip, sizeof(g_app.pin_speaker_ip) - 1);
+        snprintf(g_app.status_text, sizeof(g_app.status_text), "Enter 4-Digit PIN (%s)", m_speaker.name);
+        xSemaphoreGive(g_app.mutex);
+    }
+
+    Serial.printf("[RAOP] Waiting for user to enter 4-digit AirPlay code for '%s'...\n", m_speaker.name);
+    char entered_pin[8] = {0};
+    bool got_pin = false;
+    bool cancelled = false;
+    bool speaker_changed = false;
+    uint32_t t0 = millis();
+    while (millis() - t0 < 90000) {
+        if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+            bool cur_Diff = (g_app.current_speaker < 0 ||
+                             g_app.current_speaker >= g_app.speaker_count ||
+                             g_app.speakers[g_app.current_speaker].is_local_dac ||
+                             strcmp(g_app.speakers[g_app.current_speaker].ip, m_speaker.ip) != 0);
+            if (cur_Diff) {
+                speaker_changed = true;
+                g_app.pin_prompt_active = false;
+                g_app.pin_cancelled = false;
+            } else if (g_app.pin_submitted && strlen(g_app.pin_code) == 4) {
+                strncpy(entered_pin, g_app.pin_code, sizeof(entered_pin) - 1);
+                got_pin = true;
+                g_app.pin_prompt_active = false;
+                g_app.pin_submitted = false;
+            } else if (g_app.pin_cancelled || !g_app.playing) {
+                cancelled = true;
+                g_app.pin_prompt_active = false;
+                g_app.pin_cancelled = false;
+            }
+            xSemaphoreGive(g_app.mutex);
+        }
+        if (got_pin || cancelled || speaker_changed) break;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    if (!got_pin) {
+        free(pkB_bytes);
+        if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            g_app.pin_prompt_active = false;
+            g_app.pin_manual_request = false;
+            if (!speaker_changed) {
+                strncpy(g_app.pin_halted_ip, m_speaker.ip, sizeof(g_app.pin_halted_ip) - 1);
+                g_app.pin_halted_ip[sizeof(g_app.pin_halted_ip) - 1] = '\0';
+                snprintf(g_app.status_text, sizeof(g_app.status_text),
+                         cancelled ? "PIN Cancelled (%s)" : "PIN Timed Out (%s)", m_speaker.name);
+            }
+            xSemaphoreGive(g_app.mutex);
+        }
+        Serial.println("[RAOP] 4-digit PIN entry cancelled or timed out");
+        return false;
+    }
+
+    Serial.printf("[RAOP] Attempting AirPlay pairing with 4-digit PIN '%s'...\n", entered_pin);
+    // Complete persistent HomeKit Pair-Setup (M3..M6 + Pair-Verify) using the M2 salt & pkB from above
+    bool paired = false;
+    if (ok_m2 && doAp2PairPinPersistent(entered_pin, salt_bytes, salt_len, pkB_bytes, pkB_len)) {
+        paired = true;
+    } else if (!ok_m2 && doAp2PairPinPersistent(entered_pin)) {
+        paired = true;
+    } else {
+        reconnectRtspSocket();
+        paired = doAp2PairTransient(entered_pin);
+    }
+    free(pkB_bytes);
+
+    if (paired) {
+        app_notify_pin_toast("AIRPLAY PIN", "Speaker Paired!", 0x10B981);
+        return true;
+    }
+
+    if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        strncpy(g_app.pin_halted_ip, m_speaker.ip, sizeof(g_app.pin_halted_ip) - 1);
+        g_app.pin_halted_ip[sizeof(g_app.pin_halted_ip) - 1] = '\0';
+        snprintf(g_app.status_text, sizeof(g_app.status_text), "PIN Failed (%s)", m_speaker.name);
+        xSemaphoreGive(g_app.mutex);
+    }
+    app_notify_pin_toast("AIRPLAY PIN", "Incorrect PIN Code", 0xEF4444);
+    return false;
 }
 
 bool RaopClient::doAp2SetupSession(uint16_t *event_port_out) {
@@ -1190,8 +1896,6 @@ void RaopClient::pollEventChannel() {
 }
 
 bool RaopClient::doAp2SetupStream() {
-    esp_fill_random(m_shk, sizeof(m_shk));
-
     plb_t *stream = plb_dict();
     // 0x40000 = ALAC 44100Hz 16-bit stereo
     plb_dict_set(stream, "audioFormat", plb_int(0x40000));
@@ -1365,15 +2069,16 @@ bool RaopClient::doSetup() {
 }
 
 bool RaopClient::doRecord() {
-    uint64_t now_ts = ntp_to_ts(get_ntp_now(NULL, NULL), RAOP_SAMPLE_RATE);
-    char hdr[160];
-    snprintf(hdr, sizeof(hdr),
-        "Range: npt=0-\r\n"
-        "RTP-Info: seq=%u;rtptime=%u\r\n",
-        (unsigned)(m_seq_num + 1), (unsigned)now_ts);
+    char hdr[160] = {0};
+    if (!m_ap2) {
+        snprintf(hdr, sizeof(hdr),
+            "Range: npt=0-\r\n"
+            "RTP-Info: seq=%u;rtptime=%u\r\n",
+            (unsigned)(m_seq_num + 1), (unsigned)m_head_ts);
+    }
 
     char resp_hdrs[1024] = {0};
-    if (!execRtsp("RECORD", NULL, NULL, NULL, 0, hdr, resp_hdrs, sizeof(resp_hdrs), NULL, NULL)) {
+    if (!execRtsp("RECORD", NULL, NULL, NULL, 0, m_ap2 ? NULL : hdr, resp_hdrs, sizeof(resp_hdrs), NULL, NULL)) {
         return false;
     }
     char *lat = strcasestr(resp_hdrs, "Audio-Latency:");
@@ -1384,13 +2089,18 @@ bool RaopClient::doRecord() {
     return true;
 }
 
-bool RaopClient::setVolume(int volume_pct) {
+bool RaopClient::setVolume(int volume_pct, bool sync_wait) {
     if (!m_connected || m_rtsp_sock < 0) return false;
     if (volume_pct < 0) volume_pct = 0;
     if (volume_pct > 100) volume_pct = 100;
-    float db = (volume_pct == 0) ? -144.0f : (-28.0f + (28.0f * (float)volume_pct) / 100.0f);
+    // Standard RAOP/AirPlay 2 volume scale: 0% -> -144.0 (muted), 1..100% -> -30.0..0.0 dB
+    float db = (volume_pct == 0) ? -144.0f : (-30.0f + (30.0f * (float)volume_pct) / 100.0f);
     char body[64];
     int blen = snprintf(body, sizeof(body), "volume: %.6f\r\n", db);
+    if (sync_wait) {
+        return execRtsp("SET_PARAMETER", NULL, "text/parameters", (const uint8_t *)body, blen,
+                        NULL, NULL, 0, NULL, NULL);
+    }
     return sendRtspAsync("SET_PARAMETER", NULL, "text/parameters", (const uint8_t *)body, blen, NULL);
 }
 
@@ -1406,7 +2116,9 @@ static int write_dmap_str(uint8_t *dst, const char *tag, const char *str) {
 }
 
 bool RaopClient::setMetadata(const char *title, const char *artist, const char *album) {
-    if (!m_connected || m_rtsp_sock < 0 || !strchr(m_speaker.md, '0')) return false;
+    if (!m_connected || m_rtsp_sock < 0) return false;
+    if (m_speaker.md[0] != '\0' && !strchr(m_speaker.md, '0')) return false;
+
     uint8_t dmap[512];
     int pos = 8; // mlit header
     memcpy(dmap + pos, "mikd\x00\x00\x00\x01\x02", 9);
@@ -1421,9 +2133,39 @@ bool RaopClient::setMetadata(const char *title, const char *artist, const char *
     dmap[6] = (inner_len >> 8) & 0xFF;
     dmap[7] = inner_len & 0xFF;
 
+    uint32_t rtptime = (uint32_t)m_head_ts;
     char hdr[64];
-    snprintf(hdr, sizeof(hdr), "RTP-Info: rtptime=%u\r\n", (unsigned)(m_head_ts + m_latency_frames));
+    snprintf(hdr, sizeof(hdr), "RTP-Info: rtptime=%u\r\n", (unsigned)rtptime);
+
+    if (strchr(m_speaker.md, '2')) {
+        char prog_body[64];
+        uint32_t disp = rtptime - 15360U;
+        uint32_t end_ts = rtptime + (180U * RAOP_SAMPLE_RATE);
+        int plen = snprintf(prog_body, sizeof(prog_body), "progress: %u/%u/%u\r\n",
+                            (unsigned)disp, (unsigned)rtptime, (unsigned)end_ts);
+        sendRtspAsync("SET_PARAMETER", NULL, "text/parameters", (const uint8_t *)prog_body, plen, hdr);
+    }
+
     return sendRtspAsync("SET_PARAMETER", NULL, "application/x-dmap-tagged", dmap, pos, hdr);
+}
+
+bool RaopClient::setArtwork(const uint8_t *jpeg_data, size_t jpeg_len) {
+    if (!m_connected || m_rtsp_sock < 0 || !jpeg_data || jpeg_len == 0) return false;
+    if (m_speaker.md[0] != '\0' && !strchr(m_speaker.md, '1')) return false;
+
+    char hdr[64];
+    snprintf(hdr, sizeof(hdr), "RTP-Info: rtptime=%u\r\n", (unsigned)m_head_ts);
+    bool ok = sendRtspAsync("SET_PARAMETER", NULL, "image/jpeg", jpeg_data, (int)jpeg_len, hdr);
+    if (ok) {
+        Serial.printf("[RAOP] Sent album artwork (%u bytes JPEG) to %s\n",
+                      (unsigned)jpeg_len, m_speaker.name);
+    }
+    return ok;
+}
+
+void RaopClient::resyncTimestamp() {
+    m_head_ts = ntp_to_ts(get_ntp_now(NULL, NULL), RAOP_SAMPLE_RATE);
+    m_first_pkt = true;
 }
 
 void RaopClient::sendSyncPacket(bool first) {
@@ -1439,13 +2181,14 @@ void RaopClient::sendSyncPacket(bool first) {
         uint32_t rtp_ts;
     } pkt;
 
-    uint64_t now_ntp = ts_to_ntp(m_head_ts, RAOP_SAMPLE_RATE);
+    uint32_t ntp_sec = 0, ntp_frac = 0;
+    get_ntp_now(&ntp_sec, &ntp_frac);
     pkt.proto = 0x80 | (first ? 0x10 : 0x00);
     pkt.type = 0x54 | 0x80;
     pkt.seq = htons(7);
     pkt.rtp_ts_latency = htonl((uint32_t)(m_head_ts - m_latency_frames));
-    pkt.ntp_sec = htonl((uint32_t)(now_ntp >> 32));
-    pkt.ntp_frac = htonl((uint32_t)(now_ntp & 0xFFFFFFFFULL));
+    pkt.ntp_sec = htonl(ntp_sec);
+    pkt.ntp_frac = htonl(ntp_frac);
     pkt.rtp_ts = htonl((uint32_t)m_head_ts);
 
     struct sockaddr_in dst = {};
@@ -1463,16 +2206,18 @@ bool RaopClient::acceptFrames() const {
 }
 
 bool RaopClient::sendChunk(const int16_t *stereo_pcm_352) {
-    if (!m_connected || m_audio_sock < 0) return false;
+    if (!m_connected || m_audio_sock < 0 || !m_alac_buf || !m_rtp_pkt) return false;
 
     uint64_t now_ts = ntp_to_ts(get_ntp_now(NULL, NULL), RAOP_SAMPLE_RATE);
-    if (m_first_pkt || now_ts > m_head_ts + 88200ULL) {
+    // Resync if first packet after connect/rebuffer or if clock drifted by >100ms (4410 frames)
+    bool resync = m_first_pkt || (now_ts > m_head_ts + 4410ULL) || (m_head_ts > now_ts + 4410ULL);
+    if (resync) {
         m_head_ts = now_ts;
         sendSyncPacket(true);
         m_last_sync_us = esp_timer_get_time();
     }
 
-    uint8_t alac_buf[1424];
+    uint8_t *alac_buf = m_alac_buf;
     int alac_len = encode_pcm_to_alac_raw(stereo_pcm_352, RAOP_CHUNK_FRAMES, alac_buf);
 
     if (!m_ap2 && m_encrypt_aes) {
@@ -1489,7 +2234,7 @@ bool RaopClient::sendChunk(const int16_t *stereo_pcm_352) {
     }
 
     m_seq_num++;
-    uint8_t rtp_pkt[1480];
+    uint8_t *rtp_pkt = m_rtp_pkt;
     rtp_pkt[0] = 0x80;
     rtp_pkt[1] = 0x60 | (m_first_pkt ? 0x80 : 0x00);
     m_first_pkt = false;
@@ -1578,19 +2323,24 @@ void RaopClient::handleControlSocket() {
             struct sockaddr_in dst = {};
             dst.sin_family = AF_INET;
             dst.sin_addr.s_addr = m_peer_ip_addr;
-            dst.sin_port = htons(m_remote_ctrl_port);
+            dst.sin_port = htons(m_ap2 ? m_remote_audio_port : m_remote_ctrl_port);
 
             for (uint16_t i = 0; i < cnt; i++) {
                 uint16_t target = first + i;
                 BacklogSlot &slot = m_backlog[target % BACKLOG_SIZE];
-                if (slot.seq == target && slot.len > 0) {
-                    uint8_t retr[1484];
-                    retr[0] = 0x80;
-                    retr[1] = 0x56 | 0x80;
-                    retr[2] = 0x00;
-                    retr[3] = 0x01;
-                    memcpy(retr + 4, slot.data, slot.len);
-                    sendto(m_ctrl_sock, retr, 4 + slot.len, 0, (struct sockaddr *)&dst, sizeof(dst));
+                if (slot.seq == target && slot.len > 0 && m_rtp_pkt) {
+                    if (m_ap2) {
+                        // AirPlay 2 resends the encrypted RTP packet directly to dataPort
+                        sendto(m_audio_sock, slot.data, slot.len, 0, (struct sockaddr *)&dst, sizeof(dst));
+                    } else {
+                        uint8_t *retr = m_rtp_pkt;
+                        retr[0] = 0x80;
+                        retr[1] = 0x56 | 0x80;
+                        retr[2] = 0x00;
+                        retr[3] = 0x01;
+                        memcpy(retr + 4, slot.data, slot.len);
+                        sendto(m_ctrl_sock, retr, 4 + slot.len, 0, (struct sockaddr *)&dst, sizeof(dst));
+                    }
                     m_retransmits++;
                 }
             }
@@ -1606,18 +2356,26 @@ void RaopClient::pollControlAndKeepalive() {
         pollEventChannel();
     }
     uint64_t now_us = esp_timer_get_time();
-    if (now_us - m_last_keepalive_us >= 20000000ULL) {
+    uint64_t keepalive_us = m_ap2 ? 5000000ULL : 15000000ULL;
+    if (now_us - m_last_keepalive_us >= keepalive_us) {
         m_last_keepalive_us = now_us;
+        bool ok = false;
         if (m_ap2) {
-            sendRtspAsync("POST", "/feedback", NULL, NULL, 0, NULL);
+            ok = sendRtspAsync("POST", "/feedback", NULL, NULL, 0, NULL);
         } else {
-            sendRtspAsync("OPTIONS", "*", NULL, NULL, 0, NULL);
+            ok = sendRtspAsync("OPTIONS", "*", NULL, NULL, 0, NULL);
+        }
+        if (!ok) {
+            Serial.println("[RAOP] Keepalive send failed; marking disconnected");
+            m_connected = false;
         }
     }
 }
 
 void RaopClient::timingTaskTrampoline(void *arg) {
-    ((RaopClient *)arg)->timingTaskLoop();
+    RaopClient *self = (RaopClient *)arg;
+    self->timingTaskLoop();
+    self->m_timing_task = NULL;
     vTaskDelete(NULL);
 }
 

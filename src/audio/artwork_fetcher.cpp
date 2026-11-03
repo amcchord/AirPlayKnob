@@ -10,11 +10,47 @@
 #include <math.h>
 
 #define MAX_JPG_DIM 300
+#define MAX_JPG_BYTES (64 * 1024)
 
 static lv_color_t *s_art_pixels = NULL;
 static lv_color_t *s_station_cache_pixels = NULL;
 static lv_img_dsc_t s_art_dsc = {};
 static volatile uint32_t s_art_seq = 0;
+
+static uint8_t *s_station_jpg_buf = NULL;
+static size_t s_station_jpg_len = 0;
+static uint8_t *s_current_jpg_buf = NULL;
+static size_t s_current_jpg_len = 0;
+static volatile uint32_t s_current_jpg_seq = 0;
+static SemaphoreHandle_t s_jpg_mutex = NULL;
+
+static void store_current_jpeg(const uint8_t *data, size_t len, bool is_station_cover) {
+    if (!data || len == 0 || len > MAX_JPG_BYTES || !s_jpg_mutex) return;
+    if (xSemaphoreTake(s_jpg_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        if (is_station_cover && s_station_jpg_buf) {
+            memcpy(s_station_jpg_buf, data, len);
+            s_station_jpg_len = len;
+        }
+        if (s_current_jpg_buf) {
+            memcpy(s_current_jpg_buf, data, len);
+            s_current_jpg_len = len;
+            s_current_jpg_seq = s_current_jpg_seq + 1;
+        }
+        xSemaphoreGive(s_jpg_mutex);
+    }
+}
+
+static void restore_station_jpeg_as_current(void) {
+    if (!s_jpg_mutex) return;
+    if (xSemaphoreTake(s_jpg_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        if (s_station_jpg_buf && s_station_jpg_len > 0 && s_current_jpg_buf) {
+            memcpy(s_current_jpg_buf, s_station_jpg_buf, s_station_jpg_len);
+            s_current_jpg_len = s_station_jpg_len;
+            s_current_jpg_seq = s_current_jpg_seq + 1;
+        }
+        xSemaphoreGive(s_jpg_mutex);
+    }
+}
 
 struct JpgMemSession {
     const uint8_t *data;
@@ -216,14 +252,17 @@ static bool decode_jpeg_to_artwork(const uint8_t *jpg_data, size_t jpg_len, lv_c
 
 static bool download_url_to_buf(const char *url, uint8_t *buf, size_t max_len, size_t *out_len) {
     *out_len = 0;
+    if (g_app.stream_reconfig_needed || (g_app.playing && radio_get_buffered_ms() < 2000)) {
+        return false;
+    }
     WiFiClientSecure sc;
     sc.setInsecure();
     WiFiClient pc;
     HTTPClient http;
     http.setUserAgent("Mozilla/5.0 (AirPlayKnob/1.0)");
     http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-    http.setConnectTimeout(4500);
-    http.setTimeout(4500);
+    http.setConnectTimeout(3500);
+    http.setTimeout(3500);
 
     bool ok = false;
     if (strncmp(url, "https://", 8) == 0) {
@@ -249,6 +288,10 @@ static bool download_url_to_buf(const char *url, uint8_t *buf, size_t max_len, s
     size_t got = 0;
     uint32_t t0 = millis();
     while (http.connected() && (total < 0 || got < (size_t)total) && got < max_len) {
+        if (g_app.stream_reconfig_needed || (g_app.playing && radio_get_buffered_ms() < 1600)) {
+            http.end();
+            return false;
+        }
         int avail = s->available();
         if (avail > 0) {
             int to_read = (avail < (int)(max_len - got)) ? avail : (int)(max_len - got);
@@ -262,7 +305,7 @@ static bool download_url_to_buf(const char *url, uint8_t *buf, size_t max_len, s
     }
     http.end();
     *out_len = got;
-    return got > 256;
+    return got > 120;
 }
 
 static void url_encode_query(const char *src, char *dst, size_t dst_max) {
@@ -290,6 +333,7 @@ static void artwork_worker_task(void *arg) {
     int last_preset = -1;
     char last_track[128] = {0};
     bool station_jpg_loaded = false;
+    int station_jpg_tries = 0;
 
     for (;;) {
         bool wifi_ok = false;
@@ -311,7 +355,7 @@ static void artwork_worker_task(void *arg) {
             xSemaphoreGive(g_app.mutex);
         }
 
-        if (ota || spk_scan) {
+        if (ota) {
             vTaskDelay(pdMS_TO_TICKS(400));
             continue;
         }
@@ -321,6 +365,12 @@ static void artwork_worker_task(void *arg) {
             last_preset = cur_preset;
             last_track[0] = '\0';
             station_jpg_loaded = false;
+            station_jpg_tries = 0;
+            if (s_jpg_mutex && xSemaphoreTake(s_jpg_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                s_station_jpg_len = 0;
+                s_current_jpg_len = 0;
+                xSemaphoreGive(s_jpg_mutex);
+            }
 
             // Immediately display procedural SomaFM cover so UI responds in <5ms
             render_procedural_stream_art(s_station_cache_pixels, st);
@@ -335,33 +385,40 @@ static void artwork_worker_task(void *arg) {
             }
         }
 
-        // 2. If Wi-Fi is up and we haven't downloaded the SomaFM station JPEG yet, fetch it
-        //    Wait until at least 2.0s of audio is buffered so TLS handshake never starves initial playback!
-        if (wifi_ok && !station_jpg_loaded && st.id[0] != '\0' &&
-            (!g_app.playing || radio_get_buffered_ms() >= 2000)) {
+        // 2. Download SomaFM station cover over plain HTTP (zero TLS internal SRAM overhead)
+        //    once stream buffer has >= 2.2s cushion
+        uint32_t buf_ms_now = radio_get_buffered_ms();
+        if (wifi_ok && !spk_scan && !station_jpg_loaded && st.id[0] != '\0' &&
+            (!g_app.playing || (g_app.status == STREAM_PLAYING && buf_ms_now >= 2200))) {
             char somafm_art_url[128];
-            snprintf(somafm_art_url, sizeof(somafm_art_url), "https://somafm.com/img/%s120.jpg", st.id);
+            snprintf(somafm_art_url, sizeof(somafm_art_url), "http://somafm.com/img/%s120.jpg", st.id);
             size_t jpg_len = 0;
+            station_jpg_tries++;
             if (download_url_to_buf(somafm_art_url, dl_buf, MAX_DL, &jpg_len)) {
                 if (decode_jpeg_to_artwork(dl_buf, jpg_len, s_station_cache_pixels, st.color)) {
                     memcpy(s_art_pixels, s_station_cache_pixels, ARTWORK_SIZE * ARTWORK_SIZE * sizeof(lv_color_t));
                     s_art_seq = s_art_seq + 1;
+                    store_current_jpeg(dl_buf, jpg_len, true);
+                    station_jpg_loaded = true;
                     Serial.printf("[ART] Loaded SomaFM stream art for '%s' (%u bytes)\n", st.name, (unsigned)jpg_len);
                 }
             }
-            station_jpg_loaded = true;
+            if (station_jpg_tries >= 3) {
+                station_jpg_loaded = true;
+            }
         }
 
-        // 3. Did the live ICY track change? Query iTunes for Album Art once audio buffer has >= 2.2s cushion!
-        if (wifi_ok && cur_track[0] != '\0' && strcmp(cur_track, last_track) != 0 &&
-            (!g_app.playing || radio_get_buffered_ms() >= 2200)) {
-            strncpy(last_track, cur_track, sizeof(last_track) - 1);
+        // 3. Did the live ICY track change? Query iTunes when buffer cushion >= 3.0s and FreeHeap >= 35KB
+        if (wifi_ok && !spk_scan && cur_track[0] != '\0' && strcmp(cur_track, last_track) != 0 &&
+            (!g_app.playing || (g_app.status == STREAM_PLAYING && radio_get_buffered_ms() >= 3000)) &&
+            ESP.getFreeHeap() >= 35000) {
 
             bool is_real_song = (strstr(cur_track, " - ") != NULL) &&
                                 (strstr(cur_track, "Live Stream") == NULL) &&
                                 (strstr(cur_track, "Connecting") == NULL) &&
                                 (strstr(cur_track, "SomaFM") == NULL);
 
+            bool search_completed = false;
             bool got_track_art = false;
             if (is_real_song) {
                 char encoded[256];
@@ -372,6 +429,7 @@ static void artwork_worker_task(void *arg) {
 
                 size_t json_len = 0;
                 if (download_url_to_buf(search_url, dl_buf, 16384, &json_len)) {
+                    search_completed = true;
                     dl_buf[json_len] = '\0';
                     char *art_key = strstr((char *)dl_buf, "\"artworkUrl100\":\"");
                     if (art_key) {
@@ -385,11 +443,21 @@ static void artwork_worker_task(void *arg) {
                             if (sz_pos) {
                                 memcpy(sz_pos, "300x300bb.jpg", 13);
                             }
+                            // Save HTTPS URL for Web Portal, but download JPEG over plain HTTP from mzstatic CDN
+                            // to avoid a second TLS handshake!
+                            char dl_art_url[256];
+                            if (strncmp(art_url, "https://", 8) == 0) {
+                                snprintf(dl_art_url, sizeof(dl_art_url), "http://%s", art_url + 8);
+                            } else {
+                                strncpy(dl_art_url, art_url, sizeof(dl_art_url) - 1);
+                                dl_art_url[sizeof(dl_art_url) - 1] = '\0';
+                            }
                             size_t jpg_len = 0;
-                            if (download_url_to_buf(art_url, dl_buf, MAX_DL, &jpg_len)) {
+                            if (download_url_to_buf(dl_art_url, dl_buf, MAX_DL, &jpg_len)) {
                                 if (decode_jpeg_to_artwork(dl_buf, jpg_len, work_pixels, st.color)) {
                                     memcpy(s_art_pixels, work_pixels, ARTWORK_SIZE * ARTWORK_SIZE * sizeof(lv_color_t));
                                     s_art_seq = s_art_seq + 1;
+                                    store_current_jpeg(dl_buf, jpg_len, false);
                                     got_track_art = true;
                                     if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
                                         strncpy(g_app.artwork_url, art_url, sizeof(g_app.artwork_url) - 1);
@@ -397,20 +465,28 @@ static void artwork_worker_task(void *arg) {
                                     }
                                     Serial.printf("[ART] Loaded live Album Art for '%s' (%u bytes)\n", cur_track, (unsigned)jpg_len);
                                 }
+                            } else {
+                                search_completed = false; // Retry JPEG download on next tick
                             }
                         }
                     }
                 }
+            } else {
+                search_completed = true;
             }
 
-            if (!got_track_art) {
-                memcpy(s_art_pixels, s_station_cache_pixels, ARTWORK_SIZE * ARTWORK_SIZE * sizeof(lv_color_t));
-                s_art_seq = s_art_seq + 1;
-                char somafm_art_url[128];
-                snprintf(somafm_art_url, sizeof(somafm_art_url), "https://somafm.com/img/%s120.jpg", st.id);
-                if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-                    strncpy(g_app.artwork_url, somafm_art_url, sizeof(g_app.artwork_url) - 1);
-                    xSemaphoreGive(g_app.mutex);
+            if (search_completed) {
+                strncpy(last_track, cur_track, sizeof(last_track) - 1);
+                if (!got_track_art) {
+                    memcpy(s_art_pixels, s_station_cache_pixels, ARTWORK_SIZE * ARTWORK_SIZE * sizeof(lv_color_t));
+                    s_art_seq = s_art_seq + 1;
+                    restore_station_jpeg_as_current();
+                    char somafm_art_url[128];
+                    snprintf(somafm_art_url, sizeof(somafm_art_url), "https://somafm.com/img/%s120.jpg", st.id);
+                    if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+                        strncpy(g_app.artwork_url, somafm_art_url, sizeof(g_app.artwork_url) - 1);
+                        xSemaphoreGive(g_app.mutex);
+                    }
                 }
             }
         }
@@ -420,6 +496,15 @@ static void artwork_worker_task(void *arg) {
 }
 
 void artwork_fetcher_start(void) {
+    if (!s_jpg_mutex) {
+        s_jpg_mutex = xSemaphoreCreateMutex();
+    }
+    if (!s_station_jpg_buf) {
+        s_station_jpg_buf = (uint8_t *)heap_caps_malloc(MAX_JPG_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    if (!s_current_jpg_buf) {
+        s_current_jpg_buf = (uint8_t *)heap_caps_malloc(MAX_JPG_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
     if (!s_art_pixels) {
         s_art_pixels = (lv_color_t *)heap_caps_calloc(ARTWORK_SIZE * ARTWORK_SIZE, sizeof(lv_color_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     }
@@ -450,4 +535,22 @@ const lv_img_dsc_t *artwork_get_dsc(void) {
 
 uint32_t artwork_get_seq(void) {
     return s_art_seq;
+}
+
+uint32_t artwork_get_jpeg_seq(void) {
+    return s_current_jpg_seq;
+}
+
+size_t artwork_copy_jpeg(uint8_t *dst, size_t max_len, uint32_t *seq_out) {
+    if (!dst || max_len == 0 || !s_jpg_mutex) return 0;
+    size_t copied = 0;
+    if (xSemaphoreTake(s_jpg_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        if (s_current_jpg_buf && s_current_jpg_len > 0 && s_current_jpg_len <= max_len) {
+            memcpy(dst, s_current_jpg_buf, s_current_jpg_len);
+            copied = s_current_jpg_len;
+            if (seq_out) *seq_out = s_current_jpg_seq;
+        }
+        xSemaphoreGive(s_jpg_mutex);
+    }
+    return copied;
 }

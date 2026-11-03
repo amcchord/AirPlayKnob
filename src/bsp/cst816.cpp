@@ -71,19 +71,43 @@ void Touch_Init(void) {
     haptic_play_effect(HAPTIC_DOUBLE_CLICK);
 }
 
+static uint8_t s_last_touch_down = 0;
+static uint16_t s_last_touch_x = 180;
+static uint16_t s_last_touch_y = 180;
+
 uint8_t getTouch(uint16_t *x, uint16_t *y) {
     if (!s_i2c_mux) return 0;
-    if (xSemaphoreTake(s_i2c_mux, pdMS_TO_TICKS(10)) != pdTRUE) return 0;
+    if (xSemaphoreTake(s_i2c_mux, pdMS_TO_TICKS(10)) != pdTRUE) {
+        if (s_last_touch_down) {
+            *x = s_last_touch_x;
+            *y = s_last_touch_y;
+            return 1;
+        }
+        return 0;
+    }
 
     uint8_t data[7] = {0};
     uint8_t ret = i2c_read_regs(EXAMPLE_TOUCH_ADDR, 0x00, data, 7);
     xSemaphoreGive(s_i2c_mux);
 
-    if (ret == ESP_OK && data[2] > 0) {
-        *x = ((uint16_t)(data[3] & 0x0f) << 8) + (uint16_t)data[4];
-        *y = ((uint16_t)(data[5] & 0x0f) << 8) + (uint16_t)data[6];
+    if (ret != ESP_OK) {
+        if (s_last_touch_down) {
+            *x = s_last_touch_x;
+            *y = s_last_touch_y;
+            return 1;
+        }
+        return 0;
+    }
+
+    if (data[2] > 0) {
+        s_last_touch_x = ((uint16_t)(data[3] & 0x0f) << 8) + (uint16_t)data[4];
+        s_last_touch_y = ((uint16_t)(data[5] & 0x0f) << 8) + (uint16_t)data[6];
+        s_last_touch_down = 1;
+        *x = s_last_touch_x;
+        *y = s_last_touch_y;
         return 1;
     }
+    s_last_touch_down = 0;
     return 0;
 }
 
