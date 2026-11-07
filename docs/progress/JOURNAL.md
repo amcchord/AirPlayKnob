@@ -275,3 +275,24 @@
   deployed source. No AP selection, PHY or antenna changes. Broader AirPlay
   remains open/deferred in issue #2; local driver queue/allocation and blocking
   control writes are the next software diagnostics. No universal/RF conclusion.
+
+
+## 2026-11-07 — User HomePod test and PCM-sizing question (read-only)
+
+- User selected Workshop HomePod (AudioAccessory5,1), preset 19, volume 24,
+  and reported struggling playback after roughly a minute. Preserved the
+  user's selection/playback; firmware remains r8 in app1.
+- Snapshot interval 98.913 seconds: PCM 11,855 -> 11,865 ms; MP3 76,218 ->
+  79,937 bytes at 128 kbps; four new underruns, 10,190 new original attempts,
+  2,626 additional locally rejected originals and 14,413 all-traffic driver
+  rejections. These layer totals are not an RF loss rate. Both snapshots being
+  full does not rule out the observed intervening underruns.
+- Reviewed ring allocation/copies and thresholds. PCM uses fixed 2 MiB PSRAM;
+  the consumer copies 352-frame chunks, not the whole ring. Reducing capacity
+  can save external memory and queued latency but does not directly free
+  internal/DMA driver memory. A ~512 KiB PCM target would give 2.97 seconds;
+  retain compressed buffering for network jitter and revise 3-/6-second
+  startup/artwork assumptions together if implementing it. No buffer or
+  production configuration change was made in response to this question.
+- Private snapshots remain in ignored scratch. Software send-queue/control
+  scheduling investigation remains open; no new cause or fix is claimed.

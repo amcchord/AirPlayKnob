@@ -1,10 +1,20 @@
 # Current state — 2026-11-07
 
 Deployed: `art-network-20261107-r8`, source `c1fb82c`, via web OTA into **app1**.
-Workshop uses native Sonos radio, Groove Salad, volume 20, local monitoring
-off. User-selected volume was preserved. Album artwork is restored: the user
-confirmed it on the physical screen, and the final build served an actual
-album JPEG with HTTP 200 / decoder OK and active external TLS allocations.
+The user is now testing **Workshop (HomePod)** over AirPlay 2 rather than
+native Sonos radio (latest observed preset 19, volume 24). No firmware or
+selection change was made for this read-only check. Native Sonos remains the
+previously verified fallback. Album artwork was restored and user-confirmed.
+
+HomePod follow-up: two snapshots 98.913 seconds apart both had PCM near
+11.86 seconds and roughly 76–80 KB of MP3 queued at 128 kbps. The interval
+included four new source underruns and 2,626 rejected original submissions.
+Full snapshots do not exclude intervening starvation; output queue pressure
+remains present. The 2 MiB PCM ring is explicitly allocated in PSRAM, so
+reducing it does not directly release the driver's internal/DMA buffers.
+A smaller PCM target (~512 KiB / 2.97 seconds) is a reasonable design option,
+but startup and artwork thresholds must be changed coherently; the current
+6-second artwork gate cannot be met by that ring. No buffer change deployed.
 
 Latest scope: fix artwork and audit local network losses; broader AirPlay
 compatibility remains deferred at the user's request. See the
