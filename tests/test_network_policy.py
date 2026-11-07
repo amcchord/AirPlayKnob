@@ -14,6 +14,7 @@ raop = (ROOT / 'src/audio/raop_AnySpeaker.cpp').read_text()
 repair = raop[raop.index('void RaopClient::handleControlSocket()'):raop.index('void RaopClient::pollControlAndKeepalive(')]
 fixture = r'''
 #include "network_diagnostics.h"
+#include "audio_buffer_config.h"
 #include <atomic>
 #include <cassert>
 #include <cerrno>
@@ -66,6 +67,23 @@ public:
 '''
 cases = r'''
 int main() {
+    using namespace AudioBuffer;
+    static_assert(PCM_BYTES == 524288 && PCM_FRAMES == 131072 && PCM_USABLE_MS == 2972);
+    static_assert(MP3_BYTES == 262144);
+    assert(ready_to_connect(frames_for_ms(1000),0,3500));
+    assert(!ready_to_connect(frames_for_ms(500)-1,CONNECT_MP3_BYTES,7500));
+    assert(ready_to_connect(frames_for_ms(500),CONNECT_MP3_BYTES,3500));
+    assert(!ready_to_connect(frames_for_ms(500),0,7499));
+    assert(ready_to_connect(frames_for_ms(500),0,7500));
+    assert(playback_start_frames(START_MP3_BYTES)==frames_for_ms(1000));
+    assert(playback_start_frames(START_MP3_BYTES-1)==frames_for_ms(1500));
+    assert(artwork_network_allowed(true,false,false,2000,ARTWORK_START_PCM_MS,32768,ARTWORK_START_MP3_BYTES));
+    assert(!artwork_network_allowed(true,false,false,2000,ARTWORK_START_PCM_MS,32767,ARTWORK_START_MP3_BYTES));
+    assert(!artwork_network_allowed(true,false,false,1999,ARTWORK_START_PCM_MS,32768,ARTWORK_START_MP3_BYTES));
+    assert(artwork_network_allowed(true,true,false,0,ARTWORK_START_PCM_MS,0,ARTWORK_START_MP3_BYTES));
+    assert(artwork_network_allowed(false,false,false,0,ARTWORK_START_PCM_MS,0,ARTWORK_START_MP3_BYTES));
+    assert(artwork_network_allowed(true,false,false,1000,ARTWORK_ABORT_PCM_MS));
+    assert(!artwork_network_allowed(true,false,false,999,ARTWORK_ABORT_PCM_MS));
     // An empty native PCM buffer must not disable artwork; real relay audio
     // still needs a cushion and all jobs yield to discovery/OTA.
     assert(artwork_network_allowed(true,true,false,0,6000));

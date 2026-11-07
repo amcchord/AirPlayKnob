@@ -400,6 +400,7 @@ bool RaopClient::connect(const AirPlaySpeaker &spk, int initial_volume_pct) {
     m_audio_tx = {}; m_repair_tx = {};
     m_pending_repairs = 0; m_repair_cursor = 0;
     m_last_repair_us = 0; m_last_reject_us = 0;
+    m_max_audio_gap_ms = 0; m_audio_gap_events = 0; m_max_control_write_ms = 0;
     if (m_backlog) memset(m_backlog, 0, BACKLOG_SIZE * sizeof(BacklogSlot));
     m_latency_frames = 44100;
 
@@ -722,20 +723,26 @@ void RaopClient::disconnect() {
 
 int RaopClient::rtspSend(const uint8_t *data, int len) {
     if (m_rtsp_sock < 0) return -1;
+    const uint64_t write_start = esp_timer_get_time();
+    auto finish = [&](int result) {
+        uint32_t ms = (uint32_t)((esp_timer_get_time() - write_start + 999) / 1000);
+        if (ms > m_max_control_write_ms) m_max_control_write_ms = ms;
+        return result;
+    };
     if (!m_rtsp_encrypted) {
         int n = send(m_rtsp_sock, data, len, 0);
         if (n <= 0 && m_connected) {
             Serial.println("[RAOP] RTSP socket send failed; marking disconnected");
             m_connected = false;
         }
-        return n;
+        return finish(n);
     }
 
     uint8_t *enc = NULL;
     size_t enc_len = 0;
     if (!hap_chacha_encrypt(&enc, &enc_len, data, (size_t)len, m_ctrl_write_key, &m_ctrl_write_counter)) {
         Serial.println("[RAOP] Control channel ChaCha20 encryption failed");
-        return -1;
+        return finish(-1);
     }
 
     size_t sent = 0;
@@ -749,7 +756,7 @@ int RaopClient::rtspSend(const uint8_t *data, int len) {
         Serial.println("[RAOP] Encrypted RTSP send failed; marking disconnected");
         m_connected = false;
     }
-    return (sent == enc_len) ? len : -1;
+    return finish((sent == enc_len) ? len : -1);
 }
 
 bool RaopClient::rtspFillPlain(int timeout_ms) {
@@ -2305,7 +2312,13 @@ bool RaopClient::acceptFrames() const {
 bool RaopClient::sendChunk(const int16_t *stereo_pcm_352) {
     if (!m_connected || m_audio_sock < 0 || !m_alac_buf || !m_rtp_pkt) return false;
 
-    m_last_pkt_us = esp_timer_get_time();
+    const uint64_t packet_start = esp_timer_get_time();
+    if (m_last_pkt_us) {
+        uint32_t gap_ms = (uint32_t)((packet_start - m_last_pkt_us) / 1000);
+        if (gap_ms > m_max_audio_gap_ms) m_max_audio_gap_ms = gap_ms;
+        if (gap_ms > 50) ++m_audio_gap_events;
+    }
+    m_last_pkt_us = packet_start;
     uint64_t now_ts = ntp_to_ts(get_ntp_now(NULL, NULL), RAOP_SAMPLE_RATE);
     // Only force a hard RTP timestamp resync on the first packet or if clock drifted by >1000ms (44100 frames);
     // smaller scheduling jitter is absorbed seamlessly by the speaker's 2000ms buffer via continuous m_head_ts!

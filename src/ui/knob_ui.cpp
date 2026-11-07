@@ -2,6 +2,7 @@
 #include "ui_fonts.h"
 #include "app_state.h"
 #include "artwork_fetcher.h"
+#include "audio_buffer_config.h"
 #include "bsp/lcd_bsp.h"
 #include "bsp/lcd_config.h"
 #include "bsp/cst816.h"
@@ -2376,7 +2377,7 @@ void knob_ui_init(void) {
     lv_obj_align(pcm_hdr, LV_ALIGN_TOP_LEFT, 12, 6);
 
     s_lbl_buf_pcm = lv_label_create(pcm_card);
-    lv_label_set_text(s_lbl_buf_pcm, "0 KB / 2048 KB (0.0s)");
+    lv_label_set_text_fmt(s_lbl_buf_pcm, "0 KB / %u KB (0.0s)", (unsigned)AudioBuffer::PCM_KIB);
     lv_obj_set_style_text_font(s_lbl_buf_pcm, &ui_font_sm, 0);
     lv_obj_set_style_text_color(s_lbl_buf_pcm, hex_to_lv(0x10B981), 0);
     lv_obj_align(s_lbl_buf_pcm, LV_ALIGN_TOP_RIGHT, -12, 6);
@@ -3116,11 +3117,11 @@ void knob_ui_tick(void) {
             lv_label_set_text(s_lbl_wifi_ip, "Waiting for DHCP IP...");
         }
 
-        int pcm_pct = ((int)pcm_kb * 100) / 2048;
+        int pcm_pct = ((int)pcm_kb * 100) / AudioBuffer::PCM_KIB;
         if (pcm_pct > 100) pcm_pct = 100;
         lv_bar_set_value(s_bar_buf_pcm, pcm_pct, LV_ANIM_OFF);
-        lv_label_set_text_fmt(s_lbl_buf_pcm, "%u / 2048 KB (%u.%us)",
-                              (unsigned)pcm_kb, (unsigned)(pcm_ms / 1000), (unsigned)((pcm_ms % 1000) / 100));
+        lv_label_set_text_fmt(s_lbl_buf_pcm, "%u / %u KB (%u.%us)",
+                              (unsigned)pcm_kb, (unsigned)AudioBuffer::PCM_KIB, (unsigned)(pcm_ms / 1000), (unsigned)((pcm_ms % 1000) / 100));
 
         int mp3_kb_x10 = (int)((mp3_bytes * 10) / 1024);
         int mp3_pct = (int)((mp3_bytes * 100) / 262144);

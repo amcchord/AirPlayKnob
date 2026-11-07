@@ -13,6 +13,7 @@
 #include <esp_ota_ops.h>
 #include "network_diagnostics.h"
 #include "artwork_fetcher.h"
+#include "audio_buffer_config.h"
 
 static WebServer s_server(80);
 
@@ -300,7 +301,7 @@ async function refreshState() {
     document.getElementById('knobModeBtn').textContent = modes[s.knob_mode] || 'VOL';
 
     document.getElementById('telWifi').textContent = `${s.wifi_speed_mbps || 72} Mbps • ${s.wifi_phy_mode || '802.11n'} • Ch ${s.wifi_channel || 1} (${s.wifi_rssi || -55} dBm)`;
-    document.getElementById('telPcm').textContent = s.sonos_native && !s.local_monitor ? 'Audio buffered by Sonos' : `${s.pcm_buf_kb || 0} / 2048 KB (${((s.pcm_buf_ms || 0)/1000).toFixed(1)}s)`;
+    document.getElementById('telPcm').textContent = s.sonos_native && !s.local_monitor ? 'Audio buffered by Sonos' : `${s.pcm_buf_kb || 0} / ${s.pcm_capacity_kb || 512} KB (${((s.pcm_buf_ms || 0)/1000).toFixed(1)}s)`;
     document.getElementById('telMp3').textContent = s.sonos_native && !s.local_monitor ? 'Local monitoring off' : `${((s.mp3_buf_bytes || 0)/1024).toFixed(1)} / 256 KB • ${s.bitrate_kbps || 128} kbps`;
     document.getElementById('telRaop').textContent = s.sonos_native ? 'Sonos radio • playing directly on speaker' : `${s.raop_connected ? (s.raop_is_ap2 ? 'AP2 ChaCha20' : 'AP1 AES') : 'Idle'} • Accepted ${s.raop_tx_accepted || 0} • Local rejects ${s.raop_tx_rejected || 0} • NTP ${s.raop_ntp_replies || 0} • Retx ${s.raop_retransmits || 0}`;
 
@@ -664,6 +665,17 @@ static void handle_status() {
         json += "\"wifi_phy_mode\":\""; json += esc1; json += "\",";
         json += "\"wifi_channel\":"; json += String(g_app.wifi_channel); json += ",";
         json += "\"wifi_bssid\":\""; json += WiFi.BSSIDstr(); json += "\",";
+        json += "\"pcm_capacity_bytes\":"; json += String(AudioBuffer::PCM_BYTES); json += ",";
+        json += "\"pcm_capacity_kb\":"; json += String(AudioBuffer::PCM_KIB); json += ",";
+        json += "\"pcm_capacity_ms\":"; json += String(AudioBuffer::PCM_USABLE_MS); json += ",";
+        json += "\"mp3_capacity_bytes\":"; json += String(AudioBuffer::MP3_BYTES); json += ",";
+        json += "\"free_psram\":"; json += String(ESP.getFreePsram()); json += ",";
+        json += "\"pcm_start_ms\":"; json += String(AudioBuffer::START_PCM_MS); json += ",";
+        json += "\"artwork_start_pcm_ms\":"; json += String(AudioBuffer::ARTWORK_START_PCM_MS); json += ",";
+        json += "\"artwork_start_mp3_bytes\":"; json += String(AudioBuffer::ARTWORK_START_MP3_BYTES); json += ",";
+        json += "\"raop_max_audio_gap_ms\":"; json += String(g_app.raop_max_audio_gap_ms); json += ",";
+        json += "\"raop_audio_gap_events\":"; json += String(g_app.raop_audio_gap_events); json += ",";
+        json += "\"raop_max_control_write_ms\":"; json += String(g_app.raop_max_control_write_ms); json += ",";
         json += "\"pcm_buf_ms\":"; json += String(g_app.pcm_buf_ms); json += ",";
         json += "\"pcm_buf_kb\":"; json += String(g_app.pcm_buf_kb); json += ",";
         json += "\"mp3_buf_bytes\":"; json += String(g_app.mp3_buf_bytes); json += ",";

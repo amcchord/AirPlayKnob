@@ -8,7 +8,7 @@
 #define MAX_PRESETS        48
 #define MAX_SPEAKERS       48
 #define MAX_WIFI_SCAN      20
-#define AIRPLAYKNOB_BUILD_ID "art-network-20261107-r8"
+#define AIRPLAYKNOB_BUILD_ID "pcm512-20261107-r9"
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -114,6 +114,9 @@ struct AppState {
     uint32_t raop_repair_rejected;
     uint32_t raop_repair_pending;
     int raop_tx_last_error;
+    uint32_t raop_max_audio_gap_ms;
+    uint32_t raop_audio_gap_events;
+    uint32_t raop_max_control_write_ms;
 
     // AirPlay 4-Digit PIN Pairing State
     bool pin_prompt_active;

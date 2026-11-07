@@ -296,3 +296,24 @@
   production configuration change was made in response to this question.
 - Private snapshots remain in ignored scratch. Software send-queue/control
   scheduling investigation remains open; no new cause or fix is claimed.
+
+
+## 2026-11-07 — 512 KiB PCM change and sustained HomePod test (in progress)
+
+- User explicitly requested reducing PCM to 512 KB, adjusting startup/artwork
+  thresholds, deploying, and testing HomePod for several minutes beyond the
+  reported one-minute failure. Preserving Workshop HomePod, preset 19,
+  volume 24; baseline is r8, active app1. Native Sonos is not selected for this
+  experiment. Raw preflight evidence remains in ignored task scratch.
+- Centralized capacity and timing policy: PCM 524,288 bytes / 131,072 frames
+  (2,972 ms usable); MP3 remains 262,144 bytes. Connection needs 1 second PCM
+  or 0.5 seconds with compressed reserve/settled Wi-Fi; playback/rebuffering
+  needs 1 second with 16 KiB compressed input, otherwise 1.5 seconds.
+- Artwork starts at 2 seconds PCM plus 32 KiB compressed reserve, aborting
+  body writes below 1 second PCM. Native-only/paused behavior remains intact.
+  Physical/portal capacities and API telemetry derive from the same config.
+  Added count-only audio-gap and control-write timing to observe later stalls.
+- Host checks pass: ALAC/RTSP, network/threshold policy, and actual 512-KiB PCM
+  ring across eight simulated minutes with wraparound/stereo/saturation checks.
+  Credential-free firmware build, portal syntax and whitespace checks passed.
+  Candidate r9 is ready; deployment and five-minute live qualification follow.

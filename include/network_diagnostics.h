@@ -37,8 +37,10 @@ struct UdpTxStats {
 };
 
 inline bool artwork_network_allowed(bool playing, bool native_only, bool busy,
-                                    uint32_t buffered_ms, uint32_t minimum_ms) {
-    return !busy && (!playing || native_only || buffered_ms >= minimum_ms);
+                                    uint32_t buffered_ms, uint32_t minimum_ms,
+                                    uint32_t mp3_bytes = 0, uint32_t minimum_mp3_bytes = 0) {
+    return !busy && (!playing || native_only ||
+                     (buffered_ms >= minimum_ms && mp3_bytes >= minimum_mp3_bytes));
 }
 
 inline bool discovery_must_wait(bool playing, bool native_only, bool selected_needs_ip,

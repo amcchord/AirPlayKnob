@@ -3,6 +3,7 @@
 #include "minimp3.h"
 
 #include "radio_streamer.h"
+#include "audio_buffer_config.h"
 #include "artwork_fetcher.h"
 #include "app_state.h"
 #include "raop_AnySpeaker.h"
@@ -16,11 +17,11 @@
 #include <esp_heap_caps.h>
 #include <esp_timer.h>
 
-// 2MB stereo PCM ringbuffer in PSRAM (524288 stereo frames = ~11.89 seconds at 44.1kHz)
-#define PCM_RING_FRAMES 524288
+// 512 KiB stereo PCM ring in PSRAM: 131072 frames, ~2.97 seconds.
+constexpr uint32_t PCM_RING_FRAMES = AudioBuffer::PCM_FRAMES;
 // 256KB MP3 buffer in PSRAM (~16.4 seconds at 128kbps) absorbs the entire 260KB Icecast initial burst
 // so lwIP's TCP receive window never advertises ZeroWindow!
-#define MP3_BUF_SIZE    262144
+constexpr uint32_t MP3_BUF_SIZE = AudioBuffer::MP3_BYTES;
 static int16_t *s_pcm_ring = NULL;
 static volatile uint32_t s_ring_write = 0;
 static volatile uint32_t s_ring_read = 0;
@@ -177,7 +178,7 @@ static void parse_icy_metadata(const char *meta_buf, int meta_len) {
     }
 }
 
-// Task 1: HTTP Icecast reader + MP3 decoder -> 2MB PSRAM ringbuffer (~12 seconds cushion)
+// Task 1: HTTP Icecast reader + MP3 decoder -> 512 KiB PSRAM PCM ring
 static void http_decoder_task(void *arg) {
     // Allocate hot MP3 decoder state & frame buffer in fast 240MHz internal SRAM for 3x faster decoding
     mp3dec_t *mp3d = (mp3dec_t *)heap_caps_malloc(sizeof(mp3dec_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -439,7 +440,7 @@ static void http_decoder_task(void *arg) {
                 if (!keep_going) break;
             }
 
-            // Throttle reading only when the 12-second PCM ringbuffer is nearly full
+            // Keep compressed input buffered when the PCM ring is nearly full
             if (ring_free_frames() < 4608 && (mp3_fill - mp3_off) > (MP3_BUF_SIZE - 8192)) {
                 if (!g_app.raop_connected && stream && stream->available() >= 1400) {
                     // Slide live window forward while waiting for AirPlay speaker connection
@@ -683,6 +684,9 @@ static void raop_sender_task(void *arg) {
             g_app.raop_tx_last_error = raop->txStats().last_error;
             g_app.raop_repair_rejected = raop->repairStats().rejected;
             g_app.raop_repair_pending = raop->pendingRepairs();
+            g_app.raop_max_audio_gap_ms = raop->maxAudioGapMs();
+            g_app.raop_audio_gap_events = raop->audioGapEvents();
+            g_app.raop_max_control_write_ms = raop->maxControlWriteMs();
             xSemaphoreGive(g_app.mutex);
         } else {
             // A busy UI is not a playback/power-state change. Keep the current
@@ -785,16 +789,15 @@ static void raop_sender_task(void *arg) {
                     next_send_us = esp_timer_get_time();
                     continue;
                 }
-                // Wait for initial mDNS discovery (~2.5s after Wi-Fi link up) and initial Icecast prebuffer
-                // (~3s PCM or >=48KB MP3) before starting the blocking AirPlay RTSP/HomeKit handshake,
-                // so mDNS discovers all speakers and SomaFM fills the PSRAM ringbuffer without contention.
+                // Complete initial discovery and collect 1s PCM (or 0.5s plus
+                // compressed reserve) before the blocking pairing handshake.
+                // Thresholds must remain below the 2.97s PCM capacity.
                 uint32_t since_wifi_ms = (g_app.wifi_connected_since_ms > 0)
                                              ? (millis() - g_app.wifi_connected_since_ms)
                                              : 0;
                 bool mdns_ready = (g_app.speaker_count >= 10) || (since_wifi_ms >= 3500);
-                bool audio_prebuffered = (ring_available_frames() >= 44100 * 3) ||
-                                         (mp3_bytes_buffered >= 49152) ||
-                                         (ring_available_frames() >= 44100 && since_wifi_ms >= 7500);
+                bool audio_prebuffered = AudioBuffer::ready_to_connect(
+                    ring_available_frames(), mp3_bytes_buffered, since_wifi_ms);
                 if (!force_pin_reconnect && (!mdns_ready || !audio_prebuffered)) {
                     speaker_initialized = false;
                     vTaskDelay(pdMS_TO_TICKS(100));
@@ -852,11 +855,11 @@ static void raop_sender_task(void *arg) {
 
         raop->pollControlAndKeepalive(prebuffering || !raop->acceptFrames());
 
-        // Start playback once >= 1.5s of PCM + >= 16KB MP3 is buffered (or >= 2.0s PCM),
-        // while the remaining Icecast burst continues decoding into the 2MB PSRAM ringbuffer!
+        // Start/rebuffer at 1s PCM with compressed reserve, otherwise 1.5s.
+        // Keep the longer network-jitter cushion in the compressed MP3 buffer.
         uint32_t avail = ring_available_frames();
         if (prebuffering) {
-            uint32_t min_start_frames = (mp3_bytes_buffered >= 16384) ? 66150 : 88200;
+            uint32_t min_start_frames = AudioBuffer::playback_start_frames(mp3_bytes_buffered);
             if (avail < min_start_frames) {
                 vTaskDelay(pdMS_TO_TICKS(4));
                 next_send_us = esp_timer_get_time();

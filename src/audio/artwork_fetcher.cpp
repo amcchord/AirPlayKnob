@@ -1,5 +1,6 @@
 #include "artwork_fetcher.h"
 #include "radio_streamer.h"
+#include "audio_buffer_config.h"
 #include "app_state.h"
 #include <Arduino.h>
 #include <WiFi.h>
@@ -281,7 +282,7 @@ static bool decode_jpeg_to_artwork(const uint8_t *jpg_data, size_t jpg_len, lv_c
     return true;
 }
 
-static bool artwork_network_ready(uint32_t cushion_ms) {
+static bool artwork_network_ready(uint32_t cushion_ms, uint32_t min_mp3_bytes = 0) {
     if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(10)) != pdTRUE) return false;
     bool native_only = g_app.prefer_sonos_native && g_app.sonos_native &&
                        !g_app.also_local_dac && !g_app.whitecap_active;
@@ -289,7 +290,7 @@ static bool artwork_network_ready(uint32_t cushion_ms) {
                 g_app.wifi_scanning || g_app.stream_reconfig_needed ||
                 g_app.status == STREAM_CONNECTING_AIRPLAY;
     bool ok = artwork_network_allowed(g_app.playing, native_only, busy,
-                                       radio_get_buffered_ms(), cushion_ms);
+                                       radio_get_buffered_ms(), cushion_ms, g_app.mp3_buf_bytes, min_mp3_bytes);
     xSemaphoreGive(g_app.mutex);
     return ok && ESP.getFreeHeap() >= 32000;
 }
@@ -298,7 +299,7 @@ class ArtworkBufferStream : public Stream {
 public:
     ArtworkBufferStream(uint8_t *data, size_t cap) : data(data), cap(cap) {}
     size_t write(const uint8_t *p, size_t n) override {
-        if (n > cap - used || !artwork_network_ready(3000)) return 0;
+        if (n > cap - used || !artwork_network_ready(AudioBuffer::ARTWORK_ABORT_PCM_MS)) return 0;
         memcpy(data + used, p, n); used += n; return n;
     }
     size_t write(uint8_t c) override { return write(&c, 1); }
@@ -311,7 +312,7 @@ public:
 
 static bool download_url_to_buf(const char *url, uint8_t *buf, size_t max_len, size_t *out_len) {
     *out_len = 0;
-    if (!artwork_network_ready(6000)) return false;
+    if (!artwork_network_ready(AudioBuffer::ARTWORK_START_PCM_MS, AudioBuffer::ARTWORK_START_MP3_BYTES)) return false;
     ++s_attempts;
     bool secure = strncmp(url, "https://", 8) == 0;
     WiFiClient pc;
@@ -410,7 +411,7 @@ static void artwork_worker_task(void *arg) {
         char station_url[128];
         snprintf(station_url, sizeof(station_url), "http://somafm.com/img/%s120.jpg", st.id);
         if (!station_loaded && station_tries < 3 && st.id[0] &&
-            (int32_t)(millis() - next_station_ms) >= 0 && artwork_network_ready(6000)) {
+            (int32_t)(millis() - next_station_ms) >= 0 && artwork_network_ready(AudioBuffer::ARTWORK_START_PCM_MS, AudioBuffer::ARTWORK_START_MP3_BYTES)) {
             ++station_tries; next_station_ms = millis() + 15000;
             size_t n = 0;
             if (download_url_to_buf(station_url, dl_buf, MAX_DL, &n) &&
@@ -432,7 +433,7 @@ static void artwork_worker_task(void *arg) {
         bool song = strstr(track, " - ") && !strstr(track, "Live Stream") &&
                     !strstr(track, "Connecting") && !strstr(track, "SomaFM");
         if (song && !track_done && track_tries < 3 &&
-            (int32_t)(millis() - next_track_ms) >= 0 && artwork_network_ready(6000)) {
+            (int32_t)(millis() - next_track_ms) >= 0 && artwork_network_ready(AudioBuffer::ARTWORK_START_PCM_MS, AudioBuffer::ARTWORK_START_MP3_BYTES)) {
             ++track_tries; next_track_ms = millis() + 15000;
             char query[384], url[512];
             url_encode_query(track, query, sizeof(query));

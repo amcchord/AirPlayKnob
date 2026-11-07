@@ -23,6 +23,9 @@ public:
     const UdpTxStats &txStats() const { return m_audio_tx; }
     const UdpTxStats &repairStats() const { return m_repair_tx; }
     uint32_t pendingRepairs() const { return m_pending_repairs; }
+    uint32_t maxAudioGapMs() const { return m_max_audio_gap_ms; }
+    uint32_t audioGapEvents() const { return m_audio_gap_events; }
+    uint32_t maxControlWriteMs() const { return m_max_control_write_ms; }
 
     // Returns true when the NTP-locked RTP clock is ready to accept the next 352-frame chunk
     bool acceptFrames() const;
@@ -148,6 +151,7 @@ private:
     uint32_t m_pending_repairs = 0;
     uint16_t m_repair_cursor = 0;
     uint64_t m_last_repair_us = 0, m_last_reject_us = 0;
+    uint32_t m_max_audio_gap_ms = 0, m_audio_gap_events = 0, m_max_control_write_ms = 0;
     void sendPendingRepair();
 
     volatile bool m_timing_running;
