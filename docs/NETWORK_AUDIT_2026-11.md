@@ -170,3 +170,50 @@ GitHub validation passed for deployed source. These checks do not override
 the failed live audio result. The exact image/ELF/source manifest and raw
 private JSON/CSV are retained in ignored
 `artifacts/firmware/pcm512-2026-11-07-r9/`.
+
+## Unmodified original GitHub main HomePod comparison
+
+The user then requested flashing the original GitHub version. Selected
+pre-troubleshooting main `416c2ad`, rebuilt in `worktrees/og-main` without
+source or configuration changes, credentials or added instrumentation.
+Installed dependencies resolved to the same platform 55.03.38, Arduino 3.3.8 /
+IDF 5.5.4 and LVGL 8.4.0 as r9. This is a rebuild of committed source, not
+an identified historical listening-session binary. Original source uses
+2 MiB PCM and 64 KiB MP3. Web OTA returned HTTP 200 / OK; the expected legacy
+API appeared and connected Workshop HomePod, preserving preset 19 / volume 24.
+
+**The original main version also failed sustained playback.** The real monitor
+ran 307.24 seconds, collecting 70 successful snapshots spanning 297.462 seconds
+and 27 failed requests. User confirmed choppy/intermittent audio.
+
+| Observation | Original main result |
+| --- | ---: |
+| Observed PCM range | 0–10,115 ms |
+| Observed MP3 range | 0–630 bytes |
+| Observed positive underrun increments | At least 11 |
+| Underrun-counter decreases | 1 |
+| Packet-counter decreases | 1 |
+| Disconnect / reconnect observed | 52 s / 71 s |
+| Receiver changes | 0 |
+| Wi-Fi RSSI range | -88 to -71 dBm |
+
+The underrun endpoint difference was 6, but that omits events before the
+counter decrease. The sum of observed positive increments is 11; failed
+status requests make this a lower bound. Legacy API has no uptime/reset
+reason, so these counter changes do not establish a hardware reboot. Its
+packet/repair counts are attempts, not delivery or driver acceptance.
+
+The original source can reproduce struggling HomePod playback without the
+recent changes. This does not identify a cause or explain earlier Tree House
+success: original-run signal was weaker than r9's -69 to -61 dBm, and no BSSID
+field exists to verify AP identity. Buffer sizes, source behavior and network
+conditions were not isolated variables. The old November 3 encoder regression
+also remains present in this intentionally unmodified baseline.
+
+Original firmware remains installed for the user's comparison; r9's verified
+restoration image is retained. Exact original source/dependency manifest,
+image/ELF, build log and private JSON/CSV/assessment are in ignored
+`artifacts/firmware/og-main-2026-11-07/`. Original image SHA-256:
+`c9fb563e92e8c5a43f4ec37420f821a7e84988a09667bd07a1007366d9fa2a6d`.
+The original API also lacks build/partition reporting: app1 is the expected
+OTA destination from r9/app0, not an independently reported active slot.

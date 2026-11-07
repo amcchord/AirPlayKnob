@@ -158,10 +158,10 @@ knob and portal now show accepted/queued originals and local rejects. Driver
 success is queue acceptance, not RF/receiver delivery. See the
 [network audit](../NETWORK_AUDIT_2026-11.md) for tested values and limits.
 
-## Current r9 PCM configuration and sustained checks
+## r9 PCM configuration and sustained checks
 
 `pcm512-20261107-r9`, source `7e4158e`, was deployed through the validated OTA
-upload above and now runs in **app0**. The previous r8 image is retained at
+upload above and ran in **app0** before the original-main comparison below. The previous r8 image is retained at
 `artifacts/firmware/art-network-2026-11-07-r8/firmware.bin`. Restoring through
 OTA uses the same multipart procedure; verify the resulting build, partition
 and saved output. Do not use an old USB address without checking the slot.
@@ -187,3 +187,28 @@ The r9 five-minute HomePod run failed audibly and recorded repeated source
 underruns and local send rejections. Album art loaded and no reset was
 observed. Exact bounded results are in the network audit and current-state
 file; a successful build or connected session is not a sustained-audio pass.
+
+## Original-main comparison and restoration
+
+The user subsequently requested original GitHub main `416c2ad`. It was built
+unchanged in `worktrees/og-main` and uploaded using the same multipart OTA
+procedure. Accepted upload and transition from r9 to the expected legacy API
+were observed, with the HomePod/preset/volume preserved. app1 is the expected
+target after r9/app0, but original API lacks build, uptime and active-slot
+fields. Inspect OTA metadata before a direct USB flash; do not infer the slot
+from these historical commands.
+
+The original version is currently installed. Its five-minute HomePod test
+also failed audibly, with empty buffers and reconnect behavior. Original
+packet counters do not measure accepted sends, and counter decreases prevent
+simple endpoint subtraction for underruns. Sum observed positive increments
+and report counter resets/missing samples explicitly. Original has no BSSID
+reporting; AP identity and hardware-reset absence were not established.
+
+To restore the current source's 512 KiB configuration and fixes, upload the
+retained `artifacts/firmware/pcm512-2026-11-07-r9/firmware.bin` using the same
+OTA form. Check expected `pcm512-20261107-r9` build, fresh uptime,
+`running_partition`, PCM capacity, saved output/preset/volume and audible
+playback. Exact restoration SHA-256 and prior tests are in current state.
+This restoration was prepared but not performed; original firmware was left
+installed for the user.

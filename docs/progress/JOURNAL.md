@@ -347,3 +347,49 @@
   runbook updated; published results to PR #1 and kept issue #2 open.
 - Next diagnostic: hold AP/workload constant while separating source-input
   starvation, sender scheduling, internal/DMA allocation and TX queue drain.
+
+
+## 2026-11-07 — Original GitHub main HomePod comparison (in progress)
+
+- User requested flashing the original GitHub version and testing HomePod.
+  Selected pre-troubleshooting main `416c2ad` in contained linked worktree
+  `worktrees/og-main`, branch `codex/test-og-homepod`; integration checkout
+  remains `codex/workshop-audio`. GitHub commit confirmed.
+- Original source and platform configuration are unchanged, with no copied
+  credentials. Firmware build passed using installed platform 55.03.38,
+  Arduino 3.3.8 / IDF 5.5.4 and LVGL 8.4.0, matching current dependencies.
+  Rebuilt image SHA-256:
+  `c9fb563e92e8c5a43f4ec37420f821a7e84988a09667bd07a1007366d9fa2a6d`.
+- Preserved current r9 rollback image and preflight HomePod/preset 19/volume
+  24. Exact original image/ELF/source manifest and private snapshots are in
+  ignored `artifacts/firmware/og-main-2026-11-07/`. OTA upload is in progress;
+  expected legacy API lacks build, uptime, active-slot, BSSID and local-send
+  acceptance telemetry. Test buffers/connections and actual audible playback
+  without interpreting historical packet-attempt counters as delivery.
+
+
+## 2026-11-07 — Original main flashed; HomePod also struggles
+
+- OTA accepted unmodified `416c2ad` image, SHA-256
+  `c9fb563e92e8c5a43f4ec37420f821a7e84988a09667bd07a1007366d9fa2a6d`.
+  Observed legacy API and connected Workshop HomePod, preset 19 / volume 24,
+  local DAC and WhiteCap off. No source/config/credential changes. r9 app0
+  preceded OTA, so app1 is expected; original API cannot confirm slot/build.
+- Real monitor ran 307.24 seconds; 70 successful snapshots span 297.462 seconds
+  with 27 failed status requests. Both buffers reached zero; PCM range
+  0–10,115 ms and MP3 0–630 bytes. User confirmed choppy/intermittent sound.
+  At least 11 underrun increments were observed; one counter decrease makes
+  the endpoint delta of 6 an undercount. Packet-counter reset/disconnect at
+  52 seconds, reconnected at 71. Hardware reset cannot be established without
+  uptime/reset telemetry. HomePod selection stayed unchanged.
+- The original main source also fails under current conditions. Signal was
+  -88 to -71 dBm versus r9's -69 to -61. Original lacks BSSID reporting, so
+  this is not a controlled AP A/B and cannot isolate a particular code change.
+  Historical attempt/repair counts cannot establish delivery. Rebuilt source
+  is not proof of the exact binary used during earlier Tree House listening.
+- Original firmware left installed as requested; r9 rollback image verified
+  and retained. Exact original image/ELF/source/dependency manifest, build log,
+  baseline and private JSON/CSV/assessment retained in ignored original-test
+  artifact directory. Current state, network audit and legacy-OTA runbook
+  updated; published this comparison in PR #1 / issue #2. No firmware fixes or
+  main merge in this comparison. Next experiment should hold AP/workload fixed.
