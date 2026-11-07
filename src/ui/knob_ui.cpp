@@ -2443,7 +2443,7 @@ void knob_ui_init(void) {
     lv_obj_align(s_lbl_stream_state, LV_ALIGN_TOP_MID, 0, 5);
 
     s_lbl_stream_pkts = lv_label_create(str_card);
-    lv_label_set_text(s_lbl_stream_pkts, "Pkts: 0  •  NTP: 0  •  Retx: 0  •  Underrun: 0");
+    lv_label_set_text(s_lbl_stream_pkts, "Queued: 0  •  Reject: 0  •  Repair: 0");
     lv_obj_set_style_text_font(s_lbl_stream_pkts, &ui_font_sm, 0);
     lv_obj_set_style_text_color(s_lbl_stream_pkts, hex_to_lv(0x64748B), 0);
     lv_label_set_long_mode(s_lbl_stream_pkts, LV_LABEL_LONG_DOT);
@@ -2887,6 +2887,7 @@ void knob_ui_tick(void) {
     bool sonos_native = false;
     bool local_monitor = false;
     uint32_t raop_pkts = 0;
+    uint32_t raop_rejects = 0;
     uint32_t raop_ntp = 0;
     uint32_t raop_retx = 0;
     bool pin_prompt = false;
@@ -2930,7 +2931,8 @@ void knob_ui_tick(void) {
         raop_ap2 = g_app.raop_is_ap2;
         sonos_native = g_app.sonos_native;
         local_monitor = g_app.also_local_dac || g_app.whitecap_active;
-        raop_pkts = g_app.raop_pkts_sent;
+        raop_pkts = g_app.raop_tx_accepted;
+        raop_rejects = g_app.raop_tx_rejected;
         raop_ntp = g_app.raop_ntp_replies;
         raop_retx = g_app.raop_retransmits;
         pin_prompt = g_app.pin_prompt_active;
@@ -3154,11 +3156,10 @@ void knob_ui_tick(void) {
         }
 
         if (sonos_native) lv_label_set_text(s_lbl_stream_pkts, "Playing directly on speaker");
-        else lv_label_set_text_fmt(s_lbl_stream_pkts, "Pkts %lu • NTP %lu • Retx %lu • Drop %lu",
+        else lv_label_set_text_fmt(s_lbl_stream_pkts, "Queued %lu • Reject %lu • Repair %lu",
                               (unsigned long)raop_pkts,
-                              (unsigned long)raop_ntp,
-                              (unsigned long)raop_retx,
-                              (unsigned long)underruns);
+                              (unsigned long)raop_rejects,
+                              (unsigned long)raop_retx);
     }
 
     // Update QR modal if open and IP changed
