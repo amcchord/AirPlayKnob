@@ -46,5 +46,13 @@ Exact image/ELF/source hashes and live results are retained in ignored
 flash backup, deployed r2 source archive and private diagnostics remain in
 ignored `scratch/workshop-fix/`. See [the runbook](../operations/RUNBOOK.md).
 
+Wall-power follow-up: the user placed the knob several feet from the Mac and
+USB hub. It stayed reachable on the same AP without another reset. A limited
+AirPlay attempt still produced 1,525 retransmissions for 1,628 attempted
+packets; stable connected status was not observed before the transition
+window expired. This move did not resolve the transport problem, but does not
+isolate its cause. Native radio was restored and receiver playback remained
+PLAYING through a further observation of at least 20 seconds.
+
 Next safe action: controlled AirPlay comparisons and receiver qualification
 from issue #2, preserving native playback as the working Workshop setting.

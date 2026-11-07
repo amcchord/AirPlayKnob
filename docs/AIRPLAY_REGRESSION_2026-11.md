@@ -99,6 +99,13 @@ AirPlay 2 completed setup and timing, but 20 status samples recorded nine new
 buffer underruns with sustained UDP send failures and retransmissions. The
 remaining generic transport work is tracked in
 [issue #2](https://github.com/amcchord/AirPlayKnob/issues/2).
+A later wall-charger test placed the knob several feet from the Mac and USB
+hub, on the same AP. AirPlay still accumulated heavy retransmissions (1,525
+with 1,628 attempted packets). The harness timed out awaiting stable connected
+status, so this was a limited comparison, not a sustained playback test. Native
+radio was restored. Physical separation did not resolve this observation;
+interference, RF conditions, driver behavior, and scheduling remain unisolated.
+
 
 The platform had been specified only as `espressif32`, which did not capture
 the installed pioarduino fork. It is now pinned to the actual 55.03.38-1

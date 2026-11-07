@@ -170,3 +170,25 @@
 - Final device state: Workshop, Groove Salad, volume 16, native radio on,
   local monitoring off. PR #1 contains the published fix/audit; main has not
   been merged. Generic AirPlay restoration remains explicitly open in issue #2.
+
+
+## 2026-11-07 — Wall-power and physical separation comparison
+
+- User confirmed wall USB power and placement several feet from the Mac and
+  any USB hub. The knob remained reachable on Wi-Fi with the same r5 firmware,
+  saved Workshop/Groove Salad/volume-16 settings, and previously tested AP.
+  The initial reset reason was power-on (1); uptime advanced through the test.
+- Briefly selected standard AirPlay, then restored native radio. The harness
+  did not observe a stable connected status within its 50-second transition
+  window, so a sustained AirPlay qualification was not completed. Counters
+  advanced from 0 to 1,628 attempted packets, 7 timing replies and 1,525
+  retransmissions. This supports continuing transport trouble after the move;
+  it does not isolate the underlying RF/driver/scheduling cause or establish a
+  retransmission percentage. No serial send-error diagnostics were available
+  while on wall power, and buffer depletion was not newly established by this
+  limited observation.
+- Native mode was restored and verified PLAYING, with ten subsequent receiver
+  and device observations over at least 20 seconds and no new underruns.
+  Final state: native radio, Groove Salad, volume 16, local monitoring off.
+  No firmware change, flash, or additional restart. Private evidence retained
+  in ignored `scratch/workshop-fix/wall-power-comparison.json`.
