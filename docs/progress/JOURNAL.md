@@ -439,3 +439,12 @@
 - Updated current state/runbook and published device-state follow-up to
   existing PR #1 / issue #2. Native Sonos remains the working route; broad
   AirPlay/HomePod remains unresolved. Next action: keep smart Sonos selected.
+
+
+## 2026-11-07 — Smart Sonos audible restoration confirmed
+
+- User confirmed Workshop is playing steadily after restoring r9 and native
+  Sonos mode. This completes acoustic confirmation of the restoration, in
+  addition to the receiver/URI/volume/artwork checks already recorded.
+- No further device, firmware or playback changes. Keep Workshop on smart
+  Sonos; generic AirPlay/HomePod and discovery work remain open in issue #2.

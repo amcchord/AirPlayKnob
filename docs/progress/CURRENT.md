@@ -24,8 +24,8 @@ selection path. This assistance is not a general discovery reliability fix.
 After the receiver finished TRANSITIONING, observed 12 native/receiver checks
 over **68.68 seconds**: every receiver sample PLAYING, exact Fluid stream URI,
 volume 24 / unmuted, zero new source underruns, no observed reset, album art
-kind 2 present. This is a short restoration health check; acoustic feedback
-was requested separately. Generic AirPlay/HomePod failures remain unresolved.
+kind 2 present. User then confirmed Workshop is playing steadily in smart
+Sonos mode. Generic AirPlay/HomePod failures remain unresolved.
 
 Firmware SHA-256:
 `215b77a783a4d05b01dbaf7deba78f65cb7f998930a6667e09ff7af06177d7b1`.
