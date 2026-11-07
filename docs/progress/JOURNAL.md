@@ -243,3 +243,35 @@
   connecting AirPlay override stale native flags. Added regression cases for
   both contradictory-state transitions. Clean build and host policy/repair
   checks pass; repeating the live isolation test next.
+
+
+### 2026-11-07 — Local rejection proven with scans deferred; artwork deployed
+
+- Published transition correction `3b6244b`. Its 34-second live AirPlay audit
+  passed scan isolation: scan count remained 1, scan-active flags stayed false,
+  and UDP-5353 driver submissions remained 7 despite a queued explicit scan.
+  The queue completed once native playback resumed.
+- Last raw sample: 4,123 original attempts, 3,816 accepted, 307 rejected after
+  bounded retries, 1,320 extra original retries, 393 accepted repairs and 7
+  rejected repair attempts. Driver totals since boot were 6,920 submissions,
+  5,204 accepted and 1,716 rejected (including all traffic and retries), with
+  ESP_ERR_NO_MEM 257; socket errno was ENOMEM 12. These are local-layer counts,
+  not an RF loss percentage. Active discovery is not the sole rejection cause.
+- From the 8.5-second sample onward PCM stayed 11.860–11.882 seconds and the
+  compressed-input cushion remained substantial; no source underruns occurred.
+  This is a short buffering improvement, not acoustic/general AirPlay release
+  qualification. Native mode was restored and observed for a further 24 seconds.
+- Published `c1fb82c` to correct physical Queued/Reject/Repair labels and record
+  the audit. r8 preserves the exact validated r7 artwork/network source hashes.
+  Deployed via accepted web OTA, observed expected boot/build in app1. Image
+  SHA-256 `10beac7ec2db1b580b4ee44b70fb5d382e6f893e6c9c7a9f96bec0c8b3e1716d`. Source/image manifest, boot/preflight,
+  final JPEG and checks retained in ignored r8 firmware artifacts.
+- User confirmed the artwork on the physical screen. Final r8 downloaded and
+  published an album cover (decoder OK), used external TLS allocations and had
+  no driver rejections since boot. Final 30-second native Sonos receiver/device
+  observation passed with zero new underruns or reset. Preserved selected
+  Groove Salad, Workshop, volume 20, local monitoring off.
+- GitHub Linux host regressions and credential-free firmware build passed for
+  deployed source. No AP selection, PHY or antenna changes. Broader AirPlay
+  remains open/deferred in issue #2; local driver queue/allocation and blocking
+  control writes are the next software diagnostics. No universal/RF conclusion.

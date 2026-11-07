@@ -151,3 +151,14 @@ output, and recovery after network interruption. A connection flag, packet
 attempt counter, or native Sonos success cannot establish universal AirPlay
 compatibility. IPv6-only, password/authentication variants, grouping, and
 receivers outside the tested transport/codec modes remain separate work.
+
+
+## Follow-up: local-stack evidence and artwork
+
+The later [network audit](NETWORK_AUDIT_2026-11.md) supersedes any implication
+that the older attempted-send or repair counts measure RF loss. The controlled
+r7 test observed local socket and driver rejections while discovery was
+explicitly deferred. Pacing repairs kept source buffers full during the short
+observation, but driver pressure and broader AirPlay reliability remain open.
+Album artwork was restored and confirmed visible by the user. The current
+working output remains native Sonos radio.

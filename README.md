@@ -79,6 +79,9 @@ No phone, companion app, or external server is required: the knob connects direc
   - **AirPlay 2 (`HomePod` / `HomePod mini` / `Apple TV` on OS 17–27+)**: Full HomeKit Transient Pair-Setup (`POST /pair-setup` TLV8 `M1..M4`, 3072-bit SRP-6a with SHA-512, HKDF-SHA-512 session keys), framed `ChaCha20-Poly1305` encrypted RTSP control & event channels, two-phase binary plist (`bplist00`) `SETUP`, and `ChaCha20-Poly1305` encrypted RTP audio frames.
   - **AirPlay 1 / RAOP (`Sonos`, `AirPort Express`, `ShairPort`, legacy receivers)**: Supports both `/auth-setup` Curve25519 ECDH (required by Sonos) and RSA-OAEP `AES-128-CBC` SDP `ANNOUNCE`.
   - **Buffering & Async Control**: **2.0 MB PSRAM PCM ringbuffer** (~11.9 seconds of 44.1 kHz 16-bit stereo audio), **256 KB MP3 buffer**, 512-packet UDP retransmission backlog, dedicated Core 0 NTP timing responder task, and asynchronous RTSP control with sequence-matched synchronous responses.
+- **Artwork and Network Diagnostics**:
+  - Live album covers and station fallbacks work during native Sonos playback, with bounded background requests and large artwork HTTPS buffers in PSRAM.
+  - Local socket/driver rejections are counted separately from attempts. Repairs are paced, and scan requests wait during AirPlay playback. See the [local network audit](docs/NETWORK_AUDIT_2026-11.md) for evidence and remaining limits.
 - **Sonos Native Radio Playback**:
   - Sonos speakers normally fetch the selected station directly. The knob controls the station, volume, and play/pause, and reads track information from the speaker without relaying uncompressed audio over Wi-Fi.
   - For Sonos-only listening, disable the local 3.5mm output in the Web Portal. The buffer panel then shows **Audio buffered by Sonos**. Opening the visualizer or enabling the local jack starts an optional local audio monitor; the Sonos stream remains independent.

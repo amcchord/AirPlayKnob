@@ -8,30 +8,35 @@ This document explains how CPU cores, memory hierarchies, DMA buses, and FreeRTO
 
 ## 1. Dual-Core FreeRTOS Task Partitioning
 
-```
-+-----------------------------------------------------------------------------------+
-|                               ESP32-S3 (240 MHz)                                  |
-+-----------------------------------------+-----------------------------------------+
-|            CORE 0 (Network/IO)          |         CORE 1 (Audio DSP & UI)         |
-+-----------------------------------------+-----------------------------------------+
-| - Wi-Fi MAC / lwIP TCP/IP Stack         | - radio_decode_task (Priority 5)        |
-| - raop_time (Priority 19, NTP UDP Sync) |   HTTP ICY read -> minimp3 -> PCM ring  |
-| - radio_out_task (Priority 6)           |   -> stereo VU & waveform extraction    |
-|   RTP ALAC framing, ChaCha20/AES enc,   |                                         |
-|   UDP send + Local I2S DAC write        | - lvgl_port_task (Priority 4)           |
-| - raop_vol_task (Priority 3)            |   60 FPS UI & WhiteCap 3D wireframe     |
-|   Async RTSP SET_PARAMETER volume       |   DMA strip rendering                   |
-| - net_mgr (Priority 3)                  |                                         |
-|   Wi-Fi STA, mDNS (_raop._tcp), OTA     | - Arduino loop() (Priority 1)           |
-| - artwork_task (Priority 1)             |   Rotary encoder delta, touch swipes,   |
-|   iTunes Search + SomaFM JPEG decode    |   Web Portal HTTP polling, Serial CLI   |
-+-----------------------------------------+-----------------------------------------+
-```
+The current source creates these tasks (higher numbers have higher priority):
 
-### Why This Partitioning Matters
-1. **Zero RTSP Blocking in the Audio Path**: Turning the physical rotary knob fires dozens of volume updates per second. Instead of sending synchronous RTSP `SET_PARAMETER` TCP packets from the audio output task, `radio_out_task` notifies a dedicated low-priority worker (`raop_vol_task`) that coalesces and transmits encrypted RTSP volume commands asynchronously.
-2. **Microsecond-Accurate NTP Timing (`raop_time`)**: Apple HomePods (especially on HomePod OS 17–27+) send UDP NTP timing requests (`PT=0x52`) every ~3 seconds and tear down the stream if replies are delayed while TCP/HTTP is busy. A dedicated priority-19 task (`raop_time`) services the timing UDP socket with sub-millisecond turnaround.
-3. **Decoupled MP3 Ingest (`radio_decode_task`) vs RTP Pacing (`radio_out_task`)**: Network jitter on the incoming SomaFM HTTP stream is absorbed by a **2 MB PSRAM PCM ringbuffer** (~11.6 seconds of 44.1 kHz 16-bit stereo audio) plus a **64 KB TCP socket receive buffer**, while `radio_out_task` clocks out exact 352-sample RTP frames locked to the `esp_timer_get_time()` microsecond clock.
+| Task | Core | Priority | Work |
+| --- | ---: | ---: | --- |
+| `radio_http` | 0 | 4 | HTTP/ICY ingest, MP3 decoding, PCM buffering |
+| `raop_ntp` | 0 | 5 | Dedicated timing requests/replies |
+| `net_mgr` | 0 | 3 | Connection management, discovery and ArduinoOTA |
+| `art_fetch` | 0 | 1 | Bounded artwork lookup/download and JPEG decoding |
+| `raop_tx` | 1 | 6 | RTP framing/pacing, repair queue, receiver control, local DAC |
+| `LVGL` | 1 | 5 | UI rendering |
+| Arduino `loop()` | 1 | Framework default | Input, web portal and preferences |
+
+The framework also runs its own Wi-Fi/lwIP tasks. MP3 input uses a **256 KB
+PSRAM compressed buffer** plus a **2 MB PCM ring** (~11.89 seconds). Incoming
+HTTP and outgoing audio therefore have separate tasks and bounded storage.
+
+Timing uses its own socket/task so it can respond while the sender handles
+control traffic. However, there is **no separate volume worker** in the
+current implementation: RTSP writes, metadata and artwork forwarding run on
+`raop_tx`. Commands can be asynchronous with respect to replies while their
+TCP writes still block. The earlier architecture description overstated this
+separation. Remaining scheduling/queue diagnostics and the measured local
+rejections are documented in the [network audit](NETWORK_AUDIT_2026-11.md).
+
+Speaker and off-channel Wi-Fi scans are deferred during controller audio
+playback, including transitions from native Sonos radio. Native-only Sonos
+playback owns its stream on the receiver, so its zero local PCM buffer does
+not gate artwork and queued scans. Artwork bulk TLS allocations use PSRAM only
+for `art_fetch`; other tasks retain the SDK allocator.
 
 ---
 

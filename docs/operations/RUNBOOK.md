@@ -9,6 +9,7 @@ Validated on 2026-11-06 with the attached ESP32-S3 knob. Read
 /Users/austinmcchord/.platformio/penv/bin/pio run
 /Users/austinmcchord/.platformio/penv/bin/python tests/test_alac_packets.py
 /Users/austinmcchord/.platformio/penv/bin/python tests/test_rtsp_responses.py
+/Users/austinmcchord/.platformio/penv/bin/python tests/test_network_policy.py
 git diff --check
 ```
 
@@ -118,3 +119,40 @@ and flush the host writer, then verify the response. Never count an issued
 command as a completed restart: check the acknowledged reboot, uptime decrease
 and reset reason. The final r5 software reboot reported reset reason 3 while
 Sonos stayed PLAYING across all 40 receiver-state observations.
+
+
+## Artwork and local-stack diagnostics (r8)
+
+Read `docs/progress/CURRENT.md` for the latest image/hash. The r8 update was
+installed using the existing `/api/ota` multipart endpoint and runs in app1.
+**The earlier app0 USB address is no longer the active-slot assumption.**
+Check `running_partition` in `/api/status` and inspect OTA metadata before
+any future direct flash. The updater chooses the inactive OTA partition;
+NVS and the previous slot are retained. Kept images can be restored through
+the same OTA upload procedure or through USB after verifying the active slot.
+
+The validated web upload is `POST /api/ota`, multipart form field `firmware`,
+filename `firmware.bin`, content type `application/octet-stream`. Confirm HTTP
+200 / `OK`, then wait for the expected build, a fresh uptime, running partition,
+saved preferences and actual receiver playback. Exact uploaded image hashes,
+preflight/boot snapshots and final checks are retained in ignored artifacts.
+An accepted upload is not a substitute for post-boot checks.
+
+`/api/artwork.jpg` returns the current decoded/published cover JPEG. It returns
+404 while no downloaded cover is available. `artwork_kind` is 0 for generated
+fallback, 1 for station art and 2 for album art. Check JPEG/pixel sequences,
+HTTP status, decoder error (0 means OK), attempts/failures and task-specific
+external TLS allocation count. Optional jobs can abort and retry during busy
+network work; a failed/cancelled job is not itself an audio underrun.
+
+During controller AirPlay, speaker/Wi-Fi scan requests are queued. Read
+`speaker_scan_deferred`, `wifi_scan_deferred`, scan count and active flags.
+Pause playback to run queued scans; native Sonos-only mode can also process
+them safely. Initial/missing-IP discovery remains available.
+
+Use `raop_tx_accepted`, `raop_tx_rejected`, `raop_tx_retries`,
+`raop_repair_rejected` and pending repairs alongside `driver_tx_*` and scan
+telemetry. `raop_pkts_sent` remains a legacy original-attempt counter. The
+knob and portal now show accepted/queued originals and local rejects. Driver
+success is queue acceptance, not RF/receiver delivery. See the
+[network audit](../NETWORK_AUDIT_2026-11.md) for tested values and limits.

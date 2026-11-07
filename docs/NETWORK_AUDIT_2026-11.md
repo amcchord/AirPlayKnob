@@ -33,8 +33,8 @@ rejections occur without active discovery, so scans are not their sole cause.
 Driver-buffer limits, allocation constraints and radio queue drain remain
 unisolated; AP/RF faults have not been established.
 
-The source PCM buffer stayed at about 11.86–11.89 seconds after the initial
-sample, with roughly 100 KB of compressed input retained and no underruns.
+From the 8.5-second sample onward, the source PCM buffer stayed at
+11.860–11.882 seconds, with roughly 100 KB of compressed input retained and no underruns.
 This is an improvement over the earlier rapid depletion after repair bursts
 were bounded. It is a short software-path result, not general AirPlay or
 acoustic qualification. Native Sonos playback was restored afterward.
