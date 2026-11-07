@@ -8,7 +8,7 @@
 #define MAX_PRESETS        48
 #define MAX_SPEAKERS       48
 #define MAX_WIFI_SCAN      20
-#define AIRPLAYKNOB_BUILD_ID "airplay-compat-20261107-r4"
+#define AIRPLAYKNOB_BUILD_ID "airplay-compat-20261107-r5"
 
 #if __has_include("secrets.h")
 #include "secrets.h"

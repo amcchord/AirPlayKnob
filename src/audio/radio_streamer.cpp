@@ -426,7 +426,8 @@ static void http_decoder_task(void *arg) {
                 bool keep_going = true;
                 if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
                     if (!g_app.playing || !g_app.wifi_connected || g_app.stream_reconfig_needed || g_app.ota_in_progress ||
-                        (g_app.sonos_native && !g_app.also_local_dac && !g_app.whitecap_active)) {
+                        ((g_app.sonos_native || g_app.sonos_radio_selected) &&
+                         !g_app.also_local_dac && !g_app.whitecap_active)) {
                         keep_going = false;
                     }
                     g_app.mp3_buf_bytes = (uint32_t)(mp3_fill - mp3_off);
