@@ -136,6 +136,7 @@ private:
     uint32_t m_latency_frames;
     uint64_t m_last_sync_us;
     uint64_t m_last_keepalive_us;
+    uint64_t m_last_pkt_us;
     uint32_t m_pkts_sent;
     uint32_t m_ntp_replies;
     uint32_t m_retransmits;
@@ -146,6 +147,7 @@ private:
     struct BacklogSlot {
         uint16_t seq;
         uint16_t len;
+        uint64_t last_sent_us;
         uint8_t data[1480];
     };
     BacklogSlot *m_backlog; // allocated in PSRAM

@@ -1689,6 +1689,11 @@ static void wifi_ssid_click_cb(lv_event_t *e) {
             strncpy(prefill_pass, FALLBACK_WIFI_PASS, sizeof(prefill_pass) - 1);
         }
 #endif
+#ifdef FALLBACK2_WIFI_SSID
+        else if (strcasecmp(s_pending_ssid, FALLBACK2_WIFI_SSID) == 0) {
+            strncpy(prefill_pass, FALLBACK2_WIFI_PASS, sizeof(prefill_pass) - 1);
+        }
+#endif
     }
 
     if (!s_wifi_modal) return;
@@ -2172,7 +2177,7 @@ void knob_ui_init(void) {
 
     // 3. Station • AirPlay Speaker status line (y = 295..315, Space Grotesk Bold 13px)
     s_lbl_sub_meta = lv_label_create(p0);
-    lv_label_set_text(s_lbl_sub_meta, "Groove Salad  •  Tree House");
+    lv_label_set_text(s_lbl_sub_meta, "Choose a station and speaker");
     lv_obj_set_style_text_font(s_lbl_sub_meta, &ui_font_sm, 0);
     lv_obj_set_style_text_color(s_lbl_sub_meta, hex_to_lv(0x10B981), 0);
     lv_label_set_long_mode(s_lbl_sub_meta, LV_LABEL_LONG_DOT);
@@ -2332,7 +2337,7 @@ void knob_ui_init(void) {
     lv_obj_add_event_cb(p3, open_qr_modal, LV_EVENT_CLICKED, NULL);
 
     s_lbl_wifi_ssid = lv_label_create(p3);
-    lv_label_set_text_fmt(s_lbl_wifi_ssid, LV_SYMBOL_WIFI " %s", g_app.wifi_ssid[0] ? g_app.wifi_ssid : "McLab");
+    lv_label_set_text_fmt(s_lbl_wifi_ssid, LV_SYMBOL_WIFI " %s", g_app.wifi_ssid[0] ? g_app.wifi_ssid : "Select network");
     lv_obj_set_style_text_font(s_lbl_wifi_ssid, &ui_font_md, 0);
     lv_obj_set_style_text_color(s_lbl_wifi_ssid, hex_to_lv(0xF8FAFC), 0);
     lv_obj_align(s_lbl_wifi_ssid, LV_ALIGN_TOP_MID, 0, 20);
@@ -2642,7 +2647,7 @@ void knob_ui_init(void) {
     lv_obj_set_style_arc_color(s_conn_spinner_arc, hex_to_lv(0x38BDF8), LV_PART_INDICATOR);
 
     s_conn_lbl_ssid = lv_label_create(s_conn_layer);
-    lv_label_set_text(s_conn_lbl_ssid, g_app.wifi_ssid[0] ? g_app.wifi_ssid : "McLab");
+    lv_label_set_text(s_conn_lbl_ssid, g_app.wifi_ssid[0] ? g_app.wifi_ssid : "Select network");
     lv_obj_set_style_text_font(s_conn_lbl_ssid, &ui_font_xl, 0);
     lv_obj_set_style_text_color(s_conn_lbl_ssid, hex_to_lv(0xFFFFFF), 0);
     lv_label_set_long_mode(s_conn_lbl_ssid, LV_LABEL_LONG_DOT);
@@ -2879,6 +2884,8 @@ void knob_ui_tick(void) {
     uint32_t underruns = 0;
     bool raop_conn = false;
     bool raop_ap2 = true;
+    bool sonos_native = false;
+    bool local_monitor = false;
     uint32_t raop_pkts = 0;
     uint32_t raop_ntp = 0;
     uint32_t raop_retx = 0;
@@ -2921,6 +2928,8 @@ void knob_ui_tick(void) {
         underruns = g_app.stream_underruns;
         raop_conn = g_app.raop_connected;
         raop_ap2 = g_app.raop_is_ap2;
+        sonos_native = g_app.sonos_native;
+        local_monitor = g_app.also_local_dac || g_app.whitecap_active;
         raop_pkts = g_app.raop_pkts_sent;
         raop_ntp = g_app.raop_ntp_replies;
         raop_retx = g_app.raop_retransmits;
@@ -2942,6 +2951,9 @@ void knob_ui_tick(void) {
         spk_count = g_app.speaker_count;
         spk_scanning = g_app.speaker_scanning;
         xSemaphoreGive(g_app.mutex);
+    } else {
+        bsp_lvgl_unlock();
+        return;
     }
 
     // Automatically pop up or close 4-Digit AirPlay PIN Modal when requested by RAOP client
@@ -3109,17 +3121,24 @@ void knob_ui_tick(void) {
                               (unsigned)pcm_kb, (unsigned)(pcm_ms / 1000), (unsigned)((pcm_ms % 1000) / 100));
 
         int mp3_kb_x10 = (int)((mp3_bytes * 10) / 1024);
-        int mp3_pct = (int)((mp3_bytes * 100) / 65536);
+        int mp3_pct = (int)((mp3_bytes * 100) / 262144);
         if (mp3_pct > 100) mp3_pct = 100;
         lv_bar_set_value(s_bar_buf_mp3, mp3_pct, LV_ANIM_OFF);
-        lv_label_set_text_fmt(s_lbl_buf_mp3, "%d.%d / 64 KB  •  %u kbps",
+        lv_label_set_text_fmt(s_lbl_buf_mp3, "%d.%d / 256 KB  •  %u kbps",
                               mp3_kb_x10 / 10, mp3_kb_x10 % 10, (unsigned)(bitrate ? bitrate : 128));
+        if (sonos_native && !local_monitor) {
+            lv_label_set_text(s_lbl_buf_pcm, "Audio buffered by Sonos");
+            lv_label_set_text(s_lbl_buf_mp3, "Local monitoring off");
+        }
 
         if (!playing) {
             lv_label_set_text_fmt(s_lbl_stream_state, "PAUSED  •  %s", cur_sp.name[0] ? cur_sp.name : "Speaker");
             lv_obj_set_style_text_color(s_lbl_stream_state, hex_to_lv(0x94A3B8), 0);
         } else if (cur_sp.is_local_dac) {
             lv_label_set_text(s_lbl_stream_state, "LOCAL 3.5MM DAC  •  I2S STREAMING");
+            lv_obj_set_style_text_color(s_lbl_stream_state, hex_to_lv(0x10B981), 0);
+        } else if (sonos_native) {
+            lv_label_set_text_fmt(s_lbl_stream_state, "SONOS RADIO  •  %s", cur_sp.name);
             lv_obj_set_style_text_color(s_lbl_stream_state, hex_to_lv(0x10B981), 0);
         } else if (raop_conn) {
             lv_label_set_text_fmt(s_lbl_stream_state, "%s  •  %s",
@@ -3134,7 +3153,8 @@ void knob_ui_tick(void) {
             lv_obj_set_style_text_color(s_lbl_stream_state, hex_to_lv(0xF59E0B), 0);
         }
 
-        lv_label_set_text_fmt(s_lbl_stream_pkts, "Pkts %lu • NTP %lu • Retx %lu • Drop %lu",
+        if (sonos_native) lv_label_set_text(s_lbl_stream_pkts, "Playing directly on speaker");
+        else lv_label_set_text_fmt(s_lbl_stream_pkts, "Pkts %lu • NTP %lu • Retx %lu • Drop %lu",
                               (unsigned long)raop_pkts,
                               (unsigned long)raop_ntp,
                               (unsigned long)raop_retx,

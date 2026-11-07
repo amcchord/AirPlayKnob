@@ -1,0 +1,35 @@
+name: Firmware and protocol regressions
+
+on:
+  pull_request:
+  push:
+    branches: [main, 'codex/**']
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: platformio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+      - name: Install validation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install platformio==6.1.19
+      - name: Check protocol regressions
+        run: |
+          python tests/test_alac_packets.py
+          python tests/test_rtsp_responses.py
+      - name: Build firmware without private credentials
+        run: pio run
+      - name: Check whitespace
+        run: git diff --check

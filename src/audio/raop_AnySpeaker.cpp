@@ -79,28 +79,35 @@ static inline uint64_t ts_to_ntp(uint64_t ts, uint32_t rate) {
     return (((ts << 16) / rate) << 16);
 }
 
-// Encodes 352 stereo 16-bit little-endian frames into 1412-byte raw uncompressed ALAC packet (hassize=0)
+// A raw ALAC stereo frame with an explicit sample count. AirPlay 2 receivers
+// may retain the codec's 4096-frame default even when SETUP advertises spf=352.
+// Carrying the count in every frame also works with legacy RAOP decoders.
 static int encode_pcm_to_alac_raw(const int16_t *stereo_pcm, int frames, uint8_t *out) {
     if (frames > RAOP_CHUNK_FRAMES) frames = RAOP_CHUNK_FRAMES;
     const uint8_t *src = (const uint8_t *)stereo_pcm;
-    const int samples_size = frames * 4; // 352 * 4 = 1408 bytes
+    const int samples_size = frames * 4;
 
-    // 20-bit ALAC uncompressed frame header (tag=1 [CPE], reserved=0, hassize=0, uncompressed=1)
-    out[0] = (1 << 5); // 0x20: 3-bit CPE tag = 1
-    out[1] = 0;        // 0x00: 4-bit tag + 12-bit reserved = 0
-    out[2] = (1 << 1); // 0x02: hassize(1b)=0, bytes_not_used(2b)=0, is_uncompressed(1b)=1
+    // 23-bit header: CPE=1, instance=0, reserved=0, has_size=1,
+    // bytes_not_used=0, uncompressed=1; then the 32-bit frame count.
+    out[0] = 0x20;
+    out[1] = 0;
+    out[2] = 0x12 | ((uint32_t)frames >> 31);
+    out[3] = (uint32_t)frames >> 23;
+    out[4] = (uint32_t)frames >> 15;
+    out[5] = (uint32_t)frames >> 7;
+    out[6] = (uint32_t)frames << 1;
 
-    // 16-bit stereo samples in big-endian byte order, shifted by 1 bit into bit position 20
+    // Samples start at bit 55, in big-endian order.
     for (int i = 0; i < samples_size; i += 2) {
-        out[i + 2] |= (src[i + 1] >> 7);
-        out[i + 3]  = (src[i + 1] << 1) | (src[i] >> 7);
-        out[i + 4]  = (src[i] << 1);
+        out[i + 6] |= (src[i + 1] >> 7);
+        out[i + 7]  = (src[i + 1] << 1) | (src[i] >> 7);
+        out[i + 8]  = (src[i] << 1);
     }
 
-    // 3-bit ID_END (7 = 0b111) trailer -> total 1412 bytes for 352 frames
-    out[samples_size + 2] |= 1;
-    out[samples_size + 3]  = (7 >> 1) << 6;
-    return samples_size + 4;
+    // Three-bit ID_END followed by zero padding: 1416 bytes for 352 frames.
+    out[samples_size + 6] |= 1;
+    out[samples_size + 7] = 0xC0;
+    return samples_size + 8;
 }
 
 // --- SRP-6a + HKDF + ChaCha20-Poly1305 Helpers for AirPlay 2 ---
@@ -337,6 +344,7 @@ RaopClient::RaopClient()
       m_latency_frames(44100),
       m_last_sync_us(0),
       m_last_keepalive_us(0),
+      m_last_pkt_us(0),
       m_pkts_sent(0),
       m_ntp_replies(0),
       m_retransmits(0),
@@ -445,6 +453,11 @@ bool RaopClient::connect(const AirPlaySpeaker &spk, int initial_volume_pct) {
          strcasestr(spk.am, "AppleTV") != NULL ||
          strcasestr(spk.am, "HomePod") != NULL ||
          strcasestr(spk.am, "Mac") != NULL ||
+         strcasestr(spk.am, "UPL") != NULL ||
+         strcasestr(spk.am, "WiiM") != NULL ||
+         strcasestr(spk.am, "Amp") != NULL ||
+         strcasestr(spk.am, "Port") != NULL ||
+         strcasestr(spk.am, "Sub") != NULL ||
          strcasestr(spk.am, "Five") != NULL ||
          strcasestr(spk.am, "One") != NULL ||
          strcasestr(spk.am, "Era") != NULL ||
@@ -459,16 +472,9 @@ bool RaopClient::connect(const AirPlaySpeaker &spk, int initial_volume_pct) {
          strchr(spk.et, '5') != NULL ||
          spk.is_ap2);
 
-    bool is_ap2_candidate =
-        (is_hard_ap2 ||
-         strchr(spk.et, '4') != NULL ||
-         spk.requires_pin);
-
-    if (is_ap2_candidate) {
-        strncpy(m_user_agent, "AirPlay/366.0", sizeof(m_user_agent));
-    } else {
-        strncpy(m_user_agent, "iTunes/7.6.2 (Windows; N;)", sizeof(m_user_agent));
-    }
+    // Always probe /info first with AirPlay/366.0 so speakers that advertise et=0 or missed mDNS TXT
+    // (e.g. Ubiquiti UPL-AMP, WiiM, Sonos on busy networks) still negotiate AirPlay 2 properly.
+    strncpy(m_user_agent, "AirPlay/366.0", sizeof(m_user_agent));
 
     // Open UDP sockets for timing, control, and audio BEFORE SETUP (required by HomePod/AppleTV/Sonos)
     m_time_sock = bind_udp_ephemeral(&m_local_time_port);
@@ -480,8 +486,13 @@ bool RaopClient::connect(const AirPlaySpeaker &spk, int initial_volume_pct) {
         return false;
     }
 
-    int sndbuf = 131072;
-    setsockopt(m_audio_sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    // Map real-time audio and its timing/control packets to Wi-Fi's video
+    // access category (IP precedence 5), rather than the best-effort queue.
+    // This category retains aggregation without using the management/voice queue.
+    const int audio_tos = 0xB8;
+    setsockopt(m_audio_sock, IPPROTO_IP, IP_TOS, &audio_tos, sizeof(audio_tos));
+    setsockopt(m_ctrl_sock, IPPROTO_IP, IP_TOS, &audio_tos, sizeof(audio_tos));
+    setsockopt(m_time_sock, IPPROTO_IP, IP_TOS, &audio_tos, sizeof(audio_tos));
 
     m_remote_time_port = 0;
     m_timing_running = true;
@@ -489,17 +500,15 @@ bool RaopClient::connect(const AirPlaySpeaker &spk, int initial_volume_pct) {
 
     bool supports_transient = false;
     bool pin_required = spk.requires_pin;
-    if (is_ap2_candidate) {
-        bool info_ok = doGetInfo(&supports_transient, &pin_required);
-        if (info_ok && (supports_transient || pin_required)) {
-            m_ap2 = true;
-        } else if (is_hard_ap2) {
-            m_ap2 = true;
-        } else {
-            // Non-AP2 speaker rejected /info; reconnect clean RTSP socket for RAOP AirPlay 1
-            strncpy(m_user_agent, "iTunes/7.6.2 (Windows; N;)", sizeof(m_user_agent));
-            reconnectRtspSocket();
-        }
+    bool info_ok = doGetInfo(&supports_transient, &pin_required);
+    if (info_ok && (supports_transient || pin_required)) {
+        m_ap2 = true;
+    } else if (is_hard_ap2) {
+        m_ap2 = true;
+    } else {
+        // Non-AP2 speaker rejected /info; reconnect clean RTSP socket for RAOP AirPlay 1
+        strncpy(m_user_agent, "iTunes/7.6.2 (Windows; N;)", sizeof(m_user_agent));
+        reconnectRtspSocket();
     }
 
     bool manual_pin_req = false;
@@ -570,19 +579,28 @@ bool RaopClient::connect(const AirPlaySpeaker &spk, int initial_volume_pct) {
             vTaskDelay(pdMS_TO_TICKS(25));
         }
 
-        // Follow owntone's Sonos-verified AirPlay 2 startup sequence:
-        // SETUP (session) -> RECORD -> SETUP (stream) -> SET_PARAMETER (volume)
+        // AirPlay 2 startup sequence:
+        // UPL-AMP receivers tested earlier expect RECORD before SETUP (stream),
+        // whereas some receivers accept either order. Try RECORD -> SETUP (stream) -> fallback RECORD.
         m_head_ts = ntp_to_ts(get_ntp_now(NULL, NULL), RAOP_SAMPLE_RATE);
-        if (!doRecord()) {
-            Serial.println("[RAOP] AirPlay 2 RECORD failed");
-            disconnect();
-            return false;
+        bool record_ok = doRecord();
+        bool stream_ok = doAp2SetupStream();
+        if (!stream_ok) {
+            Serial.println("[RAOP] Retrying AirPlay 2 stream SETUP...");
+            stream_ok = doAp2SetupStream();
         }
-
-        if (!doAp2SetupStream()) {
+        if (!stream_ok) {
             Serial.println("[RAOP] AirPlay 2 stream SETUP failed");
             disconnect();
             return false;
+        }
+        if (!record_ok) {
+            Serial.println("[RAOP] Retrying AirPlay 2 RECORD after stream SETUP...");
+            if (!doRecord()) {
+                Serial.println("[RAOP] AirPlay 2 RECORD failed");
+                disconnect();
+                return false;
+            }
         }
     } else {
         Serial.println("[RAOP] Using AirPlay 1 (RAOP)");
@@ -627,6 +645,7 @@ bool RaopClient::connect(const AirPlaySpeaker &spk, int initial_volume_pct) {
     m_connected = true;
     m_last_sync_us = esp_timer_get_time();
     m_last_keepalive_us = esp_timer_get_time();
+    m_last_pkt_us = 0;
 
     // Send initial volume synchronously as the final step of startup (required by Sonos)
     setVolume(initial_volume_pct, true);
@@ -638,6 +657,7 @@ bool RaopClient::connect(const AirPlaySpeaker &spk, int initial_volume_pct) {
 }
 
 void RaopClient::disconnect() {
+    bool was_connected = m_connected;
     m_connected = false;
     if (m_timing_running) {
         m_timing_running = false;
@@ -651,26 +671,33 @@ void RaopClient::disconnect() {
         m_event_sock = -1;
     }
     if (m_rtsp_sock >= 0) {
-        if (m_ap2 && m_rtsp_encrypted) {
-            char hdr[64];
-            snprintf(hdr, sizeof(hdr), "RTP-Info: seq=%u;rtptime=%u\r\n",
-                     (unsigned)(m_seq_num + 1), (unsigned)(m_head_ts + 1));
-            execRtsp("FLUSH", NULL, NULL, NULL, 0, hdr, NULL, 0, NULL, NULL);
+        if (was_connected || m_rtsp_encrypted || m_session[0] != '\0') {
+            if (m_ap2 && m_rtsp_encrypted) {
+                if (was_connected) {
+                    char hdr[64];
+                    snprintf(hdr, sizeof(hdr), "RTP-Info: seq=%u;rtptime=%u\r\n",
+                             (unsigned)(m_seq_num + 1), (unsigned)(m_head_ts + 1));
+                    sendRtspAsync("FLUSH", NULL, NULL, NULL, 0, hdr);
+                }
 
-            plb_t *root = plb_dict();
-            size_t bplen = 0;
-            uint8_t *bp = plb_encode(root, &bplen);
-            plb_free(root);
-            if (bp) {
-                execRtsp("TEARDOWN", NULL, BPLIST_CONTENT_TYPE, bp, (int)bplen, NULL, NULL, 0, NULL, NULL);
-                free(bp);
+                plb_t *root = plb_dict();
+                size_t bplen = 0;
+                uint8_t *bp = plb_encode(root, &bplen);
+                plb_free(root);
+                if (bp) {
+                    sendRtspAsync("TEARDOWN", NULL, BPLIST_CONTENT_TYPE, bp, (int)bplen, NULL);
+                    free(bp);
+                }
+            } else if (m_session[0]) {
+                if (was_connected) {
+                    char hdr[64];
+                    snprintf(hdr, sizeof(hdr), "RTP-Info: seq=%u;rtptime=%u\r\n",
+                             (unsigned)(m_seq_num + 1), (unsigned)(m_head_ts + 1));
+                    sendRtspAsync("FLUSH", NULL, NULL, NULL, 0, hdr);
+                }
+                sendRtspAsync("TEARDOWN", NULL, NULL, NULL, 0, NULL);
             }
-        } else if (m_session[0]) {
-            char hdr[64];
-            snprintf(hdr, sizeof(hdr), "RTP-Info: seq=%u;rtptime=%u\r\n",
-                     (unsigned)(m_seq_num + 1), (unsigned)(m_head_ts + 1));
-            execRtsp("FLUSH", NULL, NULL, NULL, 0, hdr, NULL, 0, NULL, NULL);
-            execRtsp("TEARDOWN", NULL, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL);
+            vTaskDelay(pdMS_TO_TICKS(30));
         }
         close(m_rtsp_sock);
         m_rtsp_sock = -1;
@@ -723,11 +750,33 @@ int RaopClient::rtspSend(const uint8_t *data, int len) {
 
 bool RaopClient::rtspFillPlain(int timeout_ms) {
     if (m_rtsp_sock < 0) return false;
-    struct timeval tv = {.tv_sec = timeout_ms / 1000, .tv_usec = (timeout_ms % 1000) * 1000};
-    fd_set rfds;
-    FD_ZERO(&rfds);
-    FD_SET(m_rtsp_sock, &rfds);
-    if (select(m_rtsp_sock + 1, &rfds, NULL, NULL, &tv) <= 0) return false;
+    uint32_t t0 = millis();
+    while (true) {
+        if (m_event_sock >= 0) {
+            pollEventChannel();
+        }
+        int rem_ms = timeout_ms - (int)(millis() - t0);
+        if (timeout_ms > 0 && rem_ms <= 0) return false;
+        int wait_ms = (timeout_ms == 0) ? 0 : rem_ms;
+        struct timeval tv = {.tv_sec = wait_ms / 1000, .tv_usec = (wait_ms % 1000) * 1000};
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(m_rtsp_sock, &rfds);
+        int max_fd = m_rtsp_sock;
+        if (m_event_sock >= 0 && timeout_ms > 0) {
+            FD_SET(m_event_sock, &rfds);
+            if (m_event_sock > max_fd) max_fd = m_event_sock;
+        }
+        int sel = select(max_fd + 1, &rfds, NULL, NULL, &tv);
+        if (sel <= 0) return false;
+        if (m_event_sock >= 0 && FD_ISSET(m_event_sock, &rfds)) {
+            pollEventChannel();
+        }
+        if (FD_ISSET(m_rtsp_sock, &rfds)) {
+            break;
+        }
+        if (timeout_ms == 0) return false;
+    }
 
     uint8_t raw[1536];
     int n = recv(m_rtsp_sock, raw, sizeof(raw), 0);
@@ -851,6 +900,7 @@ bool RaopClient::execRtsp(const char *cmd, const char *uri_override,
     uint8_t *req = (uint8_t *)raop_alloc(req_cap);
     if (!req) return false;
 
+    const int request_cseq = ++m_cseq;
     int hdr_len = snprintf((char *)req, 1024,
         "%s %s RTSP/1.0\r\n"
         "CSeq: %d\r\n"
@@ -859,7 +909,7 @@ bool RaopClient::execRtsp(const char *cmd, const char *uri_override,
         "DACP-ID: %s\r\n"
         "Active-Remote: %s\r\n",
         cmd, uri_override ? uri_override : m_rtsp_url,
-        ++m_cseq, m_user_agent, m_sci, m_dacp_id, m_active_remote);
+        request_cseq, m_user_agent, m_sci, m_dacp_id, m_active_remote);
 
     if (m_ap2) {
         hdr_len += snprintf((char *)req + hdr_len, 1024 - hdr_len,
@@ -901,12 +951,29 @@ bool RaopClient::execRtsp(const char *cmd, const char *uri_override,
 
     while (true) {
         if (m_rx_plain_buf && (hdr_end_ptr = strstr((char *)m_rx_plain_buf, "\r\n\r\n")) != NULL) {
+            clen = 0;
             char *cl_ptr = strcasestr((char *)m_rx_plain_buf, "\r\nContent-Length:");
             if (cl_ptr && cl_ptr < hdr_end_ptr) {
                 clen = atoi(cl_ptr + 17);
             }
+            if (clen < 0 || clen > 128 * 1024) {
+                Serial.println("[RAOP] Invalid RTSP response length");
+                return false;
+            }
             size_t needed = (size_t)(hdr_end_ptr + 4 - (char *)m_rx_plain_buf) + (size_t)clen;
-            if (m_rx_plain_len >= needed) break;
+            if (m_rx_plain_len >= needed) {
+                char *seq_ptr = strcasestr((char *)m_rx_plain_buf, "\r\nCSeq:");
+                int response_cseq = seq_ptr && seq_ptr < hdr_end_ptr ? atoi(seq_ptr + 7) : -1;
+                if (response_cseq == request_cseq) break;
+                // Async commands and a timed-out RECORD may reply after the
+                // next request is sent. Consume that whole message, including
+                // its body, without treating it as this command's response.
+                Serial.printf("[RAOP] Ignoring RTSP reply CSeq=%d; waiting for %s CSeq=%d\n",
+                              response_cseq, cmd, request_cseq);
+                memmove(m_rx_plain_buf, m_rx_plain_buf + needed, m_rx_plain_len - needed + 1);
+                m_rx_plain_len -= needed;
+                continue;
+            }
         }
         uint32_t elapsed = millis() - start_ms;
         if (elapsed >= 6000 || !rtspFillPlain(6000 - (int)elapsed)) {
@@ -1821,21 +1888,42 @@ void RaopClient::connectEventChannel(uint16_t event_port) {
     m_event_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (m_event_sock < 0) return;
 
-    struct timeval tv = {.tv_sec = 2, .tv_usec = 0};
-    setsockopt(m_event_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(m_event_sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    int flags = fcntl(m_event_sock, F_GETFL, 0);
+    fcntl(m_event_sock, F_SETFL, flags | O_NONBLOCK);
 
     struct sockaddr_in peer_in = {};
     peer_in.sin_family = AF_INET;
     peer_in.sin_addr.s_addr = m_peer_ip_addr;
     peer_in.sin_port = htons(event_port);
 
-    if (::connect(m_event_sock, (struct sockaddr *)&peer_in, sizeof(peer_in)) < 0) {
-        Serial.printf("[RAOP] Event channel connect to port %u failed (non-fatal)\n", event_port);
+    int res = ::connect(m_event_sock, (struct sockaddr *)&peer_in, sizeof(peer_in));
+    if (res < 0 && errno != EINPROGRESS) {
+        Serial.printf("[RAOP] Event channel connect to port %u failed immediately (non-fatal)\n", event_port);
         close(m_event_sock);
         m_event_sock = -1;
         return;
     }
+
+    if (res != 0) {
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(m_event_sock, &wfds);
+        struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
+        int sel = select(m_event_sock + 1, NULL, &wfds, NULL, &tv);
+        int sockerr = -1;
+        socklen_t slen = sizeof(sockerr);
+        if (sel <= 0 || getsockopt(m_event_sock, SOL_SOCKET, SO_ERROR, &sockerr, &slen) < 0 || sockerr != 0) {
+            Serial.printf("[RAOP] Event channel connect to port %u timed out / refused (non-fatal)\n", event_port);
+            close(m_event_sock);
+            m_event_sock = -1;
+            return;
+        }
+    }
+
+    fcntl(m_event_sock, F_SETFL, flags & (~O_NONBLOCK));
+    struct timeval tv = {.tv_sec = 2, .tv_usec = 0};
+    setsockopt(m_event_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(m_event_sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     Serial.printf("[RAOP] Connected to AirPlay 2 reverse event channel port %u\n", event_port);
 }
 
@@ -2116,7 +2204,7 @@ static int write_dmap_str(uint8_t *dst, const char *tag, const char *str) {
 }
 
 bool RaopClient::setMetadata(const char *title, const char *artist, const char *album) {
-    if (!m_connected || m_rtsp_sock < 0) return false;
+    if (!m_connected || m_rtsp_sock < 0 || m_ap2) return false;
     if (m_speaker.md[0] != '\0' && !strchr(m_speaker.md, '0')) return false;
 
     uint8_t dmap[512];
@@ -2150,7 +2238,8 @@ bool RaopClient::setMetadata(const char *title, const char *artist, const char *
 }
 
 bool RaopClient::setArtwork(const uint8_t *jpeg_data, size_t jpeg_len) {
-    if (!m_connected || m_rtsp_sock < 0 || !jpeg_data || jpeg_len == 0) return false;
+    if (!m_connected || m_rtsp_sock < 0 || m_ap2 || !jpeg_data || jpeg_len == 0) return false;
+    if (jpeg_len > 12288 || ESP.getFreeHeap() < 52000) return false;
     if (m_speaker.md[0] != '\0' && !strchr(m_speaker.md, '1')) return false;
 
     char hdr[64];
@@ -2201,6 +2290,10 @@ void RaopClient::sendSyncPacket(bool first) {
 bool RaopClient::acceptFrames() const {
     if (!m_connected) return false;
     if (m_first_pkt) return true;
+    uint64_t now_us = esp_timer_get_time();
+    if (m_last_pkt_us > 0 && (now_us - m_last_pkt_us) < 2500ULL) {
+        return false; // Pace catch-up bursts to >= 2.5ms between packet starts (nominal is 7.98ms)
+    }
     uint64_t now_ts = ntp_to_ts(get_ntp_now(NULL, NULL), RAOP_SAMPLE_RATE);
     return (now_ts >= m_head_ts + RAOP_CHUNK_FRAMES);
 }
@@ -2208,13 +2301,15 @@ bool RaopClient::acceptFrames() const {
 bool RaopClient::sendChunk(const int16_t *stereo_pcm_352) {
     if (!m_connected || m_audio_sock < 0 || !m_alac_buf || !m_rtp_pkt) return false;
 
+    m_last_pkt_us = esp_timer_get_time();
     uint64_t now_ts = ntp_to_ts(get_ntp_now(NULL, NULL), RAOP_SAMPLE_RATE);
-    // Resync if first packet after connect/rebuffer or if clock drifted by >100ms (4410 frames)
-    bool resync = m_first_pkt || (now_ts > m_head_ts + 4410ULL) || (m_head_ts > now_ts + 4410ULL);
+    // Only force a hard RTP timestamp resync on the first packet or if clock drifted by >1000ms (44100 frames);
+    // smaller scheduling jitter is absorbed seamlessly by the speaker's 2000ms buffer via continuous m_head_ts!
+    bool resync = m_first_pkt || (now_ts > m_head_ts + 44100ULL) || (m_head_ts > now_ts + 22050ULL);
     if (resync) {
         m_head_ts = now_ts;
         sendSyncPacket(true);
-        m_last_sync_us = esp_timer_get_time();
+        m_last_sync_us = m_last_pkt_us;
     }
 
     uint8_t *alac_buf = m_alac_buf;
@@ -2274,14 +2369,38 @@ bool RaopClient::sendChunk(const int16_t *stereo_pcm_352) {
         BacklogSlot &slot = m_backlog[m_seq_num % BACKLOG_SIZE];
         slot.seq = m_seq_num;
         slot.len = (uint16_t)total_len;
+        slot.last_sent_us = 0;
         memcpy(slot.data, rtp_pkt, total_len);
+    }
+
+    static uint32_t s_tx_ok_1s = 0;
+    static uint32_t s_tx_retry_1s = 0;
+    static uint32_t s_tx_drop_1s = 0;
+    static int s_last_errno = 0;
+    if (m_pkts_sent == 0) {
+        s_tx_ok_1s = 0;
+        s_tx_retry_1s = 0;
+        s_tx_drop_1s = 0;
+        s_last_errno = 0;
     }
 
     struct sockaddr_in dst = {};
     dst.sin_family = AF_INET;
     dst.sin_addr.s_addr = m_peer_ip_addr;
     dst.sin_port = htons(m_remote_audio_port);
-    sendto(m_audio_sock, rtp_pkt, total_len, 0, (struct sockaddr *)&dst, sizeof(dst));
+    int sent = sendto(m_audio_sock, rtp_pkt, total_len, 0, (struct sockaddr *)&dst, sizeof(dst));
+    for (int retry = 0; sent < 0 && (errno == ENOMEM || errno == EAGAIN) && retry < 4; retry++) {
+        s_tx_retry_1s++;
+        s_last_errno = errno;
+        vTaskDelay(pdMS_TO_TICKS(1));
+        sent = sendto(m_audio_sock, rtp_pkt, total_len, 0, (struct sockaddr *)&dst, sizeof(dst));
+    }
+    if (sent > 0) {
+        s_tx_ok_1s++;
+    } else {
+        s_tx_drop_1s++;
+        s_last_errno = errno;
+    }
 
     m_head_ts += RAOP_CHUNK_FRAMES;
     m_pkts_sent++;
@@ -2290,14 +2409,19 @@ bool RaopClient::sendChunk(const int16_t *stereo_pcm_352) {
     if (now_us - m_last_sync_us >= 1000000ULL) {
         sendSyncPacket(false);
         m_last_sync_us = now_us;
-        if ((m_pkts_sent % 500) < 5) {
-            Serial.printf("[RAOP] Stream stats: mode=%s pkts=%lu ntp=%lu retr=%lu seq=%u\n",
-                          m_ap2 ? "AP2" : "AP1",
-                          (unsigned long)m_pkts_sent,
-                          (unsigned long)m_ntp_replies,
-                          (unsigned long)m_retransmits,
-                          (unsigned)m_seq_num);
-        }
+        Serial.printf("[RAOP-1S] seq=%u txOk=%lu retry=%lu drop=%lu errno=%d retr=%lu ntp=%lu heap=%u largest=%u\n",
+                      (unsigned)m_seq_num,
+                      (unsigned long)s_tx_ok_1s,
+                      (unsigned long)s_tx_retry_1s,
+                      (unsigned long)s_tx_drop_1s,
+                      s_last_errno,
+                      (unsigned long)m_retransmits,
+                      (unsigned long)m_ntp_replies,
+                      (unsigned)ESP.getFreeHeap(),
+                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        s_tx_ok_1s = 0;
+        s_tx_retry_1s = 0;
+        s_tx_drop_1s = 0;
     }
     return true;
 }
@@ -2305,30 +2429,32 @@ bool RaopClient::sendChunk(const int16_t *stereo_pcm_352) {
 void RaopClient::handleControlSocket() {
     if (!m_connected || m_ctrl_sock < 0) return;
 
-    struct __attribute__((packed)) {
-        uint8_t proto;
-        uint8_t type;
-        uint16_t seq;
-        uint16_t first_seq;
-        uint16_t count;
-    } req;
-
+    uint8_t buf[64];
+    int pkts_resent = 0;
+    uint64_t now_us = esp_timer_get_time();
+    // Always drain ALL pending UDP datagrams from m_ctrl_sock so unread pbufs never accumulate in Internal SRAM
     while (true) {
-        int n = recv(m_ctrl_sock, &req, sizeof(req), MSG_DONTWAIT);
-        if (n < (int)sizeof(req)) break;
-        if ((req.type & 0x7F) == 0x55 && m_backlog) {
-            uint16_t first = ntohs(req.first_seq);
-            uint16_t cnt = ntohs(req.count);
+        int n = recv(m_ctrl_sock, buf, sizeof(buf), MSG_DONTWAIT);
+        if (n <= 0) break;
+        if (n < 8) continue;
+        if ((buf[1] & 0x7F) == 0x55 && m_backlog) {
+            uint16_t first = ((uint16_t)buf[4] << 8) | buf[5];
+            uint16_t cnt   = ((uint16_t)buf[6] << 8) | buf[7];
             if (cnt > 32) cnt = 32;
             struct sockaddr_in dst = {};
             dst.sin_family = AF_INET;
             dst.sin_addr.s_addr = m_peer_ip_addr;
             dst.sin_port = htons(m_ap2 ? m_remote_audio_port : m_remote_ctrl_port);
 
-            for (uint16_t i = 0; i < cnt; i++) {
+            for (uint16_t i = 0; i < cnt && pkts_resent < 8; i++) {
                 uint16_t target = first + i;
                 BacklogSlot &slot = m_backlog[target % BACKLOG_SIZE];
                 if (slot.seq == target && slot.len > 0 && m_rtp_pkt) {
+                    // Deduplicate redundant 0x55 requests for the same sequence number within 15ms of a retransmit
+                    if (slot.last_sent_us > 0 && (now_us - slot.last_sent_us) < 15000ULL) {
+                        continue;
+                    }
+                    slot.last_sent_us = now_us;
                     if (m_ap2) {
                         // AirPlay 2 resends the encrypted RTP packet directly to dataPort
                         sendto(m_audio_sock, slot.data, slot.len, 0, (struct sockaddr *)&dst, sizeof(dst));
@@ -2342,6 +2468,7 @@ void RaopClient::handleControlSocket() {
                         sendto(m_ctrl_sock, retr, 4 + slot.len, 0, (struct sockaddr *)&dst, sizeof(dst));
                     }
                     m_retransmits++;
+                    pkts_resent++;
                 }
             }
         }
@@ -2351,11 +2478,16 @@ void RaopClient::handleControlSocket() {
 void RaopClient::pollControlAndKeepalive() {
     if (!m_connected) return;
     handleControlSocket();
-    drainRtspResponses();
-    if (m_ap2) {
-        pollEventChannel();
-    }
+
     uint64_t now_us = esp_timer_get_time();
+    static uint64_t s_last_rtsp_poll_us = 0;
+    if (now_us - s_last_rtsp_poll_us >= 15000ULL) {
+        s_last_rtsp_poll_us = now_us;
+        drainRtspResponses();
+        if (m_ap2) {
+            pollEventChannel();
+        }
+    }
     uint64_t keepalive_us = m_ap2 ? 5000000ULL : 15000000ULL;
     if (now_us - m_last_keepalive_us >= keepalive_us) {
         m_last_keepalive_us = now_us;

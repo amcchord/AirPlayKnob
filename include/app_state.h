@@ -8,6 +8,7 @@
 #define MAX_PRESETS        48
 #define MAX_SPEAKERS       48
 #define MAX_WIFI_SCAN      20
+#define AIRPLAYKNOB_BUILD_ID "airplay-compat-20261107-r3"
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -71,6 +72,7 @@ struct AppState {
     int current_speaker;
     int preview_speaker;
     bool also_local_dac;
+    bool prefer_sonos_native; // Optional radio optimization; false always uses AirPlay.
     bool speaker_scan_requested;
     bool speaker_scanning;
 
@@ -97,6 +99,7 @@ struct AppState {
     uint32_t stream_underruns;
     bool raop_connected;
     bool raop_is_ap2;
+    bool sonos_native;
     uint32_t raop_pkts_sent;
     uint32_t raop_ntp_replies;
     uint32_t raop_retransmits;

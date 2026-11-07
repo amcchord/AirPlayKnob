@@ -252,35 +252,55 @@ static bool decode_jpeg_to_artwork(const uint8_t *jpg_data, size_t jpg_len, lv_c
 
 static bool download_url_to_buf(const char *url, uint8_t *buf, size_t max_len, size_t *out_len) {
     *out_len = 0;
-    if (g_app.stream_reconfig_needed || (g_app.playing && radio_get_buffered_ms() < 2000)) {
+    if (g_app.stream_reconfig_needed || (g_app.playing && radio_get_buffered_ms() < 2200)) {
         return false;
     }
-    WiFiClientSecure sc;
-    sc.setInsecure();
+    bool is_https = (strncmp(url, "https://", 8) == 0);
+    if (is_https) {
+        // Never run an mbedTLS handshake while audio streaming is active:
+        // WiFiClientSecure allocates ~45 KB of Internal SRAM, starving lwIP TCP RX pbufs.
+        if (g_app.playing) {
+            return false;
+        }
+        size_t free_int = ESP.getFreeHeap();
+        size_t largest_blk = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (free_int < 75000 || largest_blk < 48000) {
+            return false;
+        }
+    }
+
+    WiFiClientSecure *sc = NULL;
     WiFiClient pc;
     HTTPClient http;
     http.setUserAgent("Mozilla/5.0 (AirPlayKnob/1.0)");
     http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-    http.setConnectTimeout(3500);
-    http.setTimeout(3500);
+    http.setConnectTimeout(2500);
+    http.setTimeout(2500);
 
     bool ok = false;
-    if (strncmp(url, "https://", 8) == 0) {
-        ok = http.begin(sc, url);
+    if (is_https) {
+        sc = new WiFiClientSecure();
+        sc->setInsecure();
+        ok = http.begin(*sc, url);
     } else {
         ok = http.begin(pc, url);
     }
-    if (!ok) return false;
+    if (!ok) {
+        if (sc) delete sc;
+        return false;
+    }
 
     int code = http.GET();
     if (code != HTTP_CODE_OK) {
         http.end();
+        if (sc) delete sc;
         return false;
     }
 
     int total = http.getSize();
     if (total > (int)max_len) {
         http.end();
+        if (sc) delete sc;
         return false;
     }
 
@@ -290,6 +310,7 @@ static bool download_url_to_buf(const char *url, uint8_t *buf, size_t max_len, s
     while (http.connected() && (total < 0 || got < (size_t)total) && got < max_len) {
         if (g_app.stream_reconfig_needed || (g_app.playing && radio_get_buffered_ms() < 1600)) {
             http.end();
+            if (sc) delete sc;
             return false;
         }
         int avail = s->available();
@@ -299,11 +320,12 @@ static bool download_url_to_buf(const char *url, uint8_t *buf, size_t max_len, s
             if (n > 0) got += n;
             t0 = millis();
         } else {
-            if (millis() - t0 > 3500) break;
+            if (millis() - t0 > 2500) break;
             vTaskDelay(pdMS_TO_TICKS(5));
         }
     }
     http.end();
+    if (sc) delete sc;
     *out_len = got;
     return got > 120;
 }
@@ -364,8 +386,10 @@ static void artwork_worker_task(void *arg) {
         if (cur_preset != last_preset) {
             last_preset = cur_preset;
             last_track[0] = '\0';
-            station_jpg_loaded = false;
-            station_jpg_tries = 0;
+            // Keep procedural SomaFM station cover active so artwork_worker_task never contends
+            // for DNS/HTTP sockets or redirects (somafm.com -> https://) during audio streaming.
+            station_jpg_loaded = true;
+            station_jpg_tries = 3;
             if (s_jpg_mutex && xSemaphoreTake(s_jpg_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                 s_station_jpg_len = 0;
                 s_current_jpg_len = 0;
@@ -408,19 +432,23 @@ static void artwork_worker_task(void *arg) {
             }
         }
 
-        // 3. Did the live ICY track change? Query iTunes when buffer cushion >= 3.0s and FreeHeap >= 35KB
+        // 3. Did the live ICY track change? Query iTunes when buffer cushion >= 4.0s
         if (wifi_ok && !spk_scan && cur_track[0] != '\0' && strcmp(cur_track, last_track) != 0 &&
-            (!g_app.playing || (g_app.status == STREAM_PLAYING && radio_get_buffered_ms() >= 3000)) &&
-            ESP.getFreeHeap() >= 35000) {
+            (!g_app.playing || (g_app.status == STREAM_PLAYING && radio_get_buffered_ms() >= 4000))) {
 
             bool is_real_song = (strstr(cur_track, " - ") != NULL) &&
                                 (strstr(cur_track, "Live Stream") == NULL) &&
                                 (strstr(cur_track, "Connecting") == NULL) &&
                                 (strstr(cur_track, "SomaFM") == NULL);
 
-            bool search_completed = false;
+            // Always mark search_completed = true so a tight-heap or failed TLS lookup never retries in a 250ms loop!
+            // While streaming audio (g_app.playing), skip the HTTPS iTunes lookup so mbedTLS never steals
+            // ~45 KB of Internal SRAM from lwIP's TCP RX window; keep the plain-HTTP SomaFM station cover.
+            bool search_completed = true;
             bool got_track_art = false;
-            if (is_real_song) {
+            size_t free_int = ESP.getFreeHeap();
+            size_t largest_blk = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            if (!g_app.playing && is_real_song && free_int >= 75000 && largest_blk >= 48000) {
                 char encoded[256];
                 url_encode_query(cur_track, encoded, sizeof(encoded));
                 char search_url[360];
@@ -429,7 +457,6 @@ static void artwork_worker_task(void *arg) {
 
                 size_t json_len = 0;
                 if (download_url_to_buf(search_url, dl_buf, 16384, &json_len)) {
-                    search_completed = true;
                     dl_buf[json_len] = '\0';
                     char *art_key = strstr((char *)dl_buf, "\"artworkUrl100\":\"");
                     if (art_key) {
@@ -465,14 +492,10 @@ static void artwork_worker_task(void *arg) {
                                     }
                                     Serial.printf("[ART] Loaded live Album Art for '%s' (%u bytes)\n", cur_track, (unsigned)jpg_len);
                                 }
-                            } else {
-                                search_completed = false; // Retry JPEG download on next tick
                             }
                         }
                     }
                 }
-            } else {
-                search_completed = true;
             }
 
             if (search_completed) {

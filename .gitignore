@@ -7,3 +7,6 @@
 *.pyc
 __pycache__/
 include/secrets.h
+scratch/
+worktrees/
+artifacts/firmware/

@@ -22,7 +22,7 @@
 
 **AirPlayKnob** turns the **[Waveshare ESP32-S3-Knob-Touch-LCD-1.8](https://www.waveshare.com/wiki/ESP32-S3-Knob-Touch-LCD-1.8)** (dual-core 240 MHz ESP32-S3, 8 MB Octal PSRAM, 360×360 round QSPI display, capacitive touch, mechanical rotary encoder ring, DRV2605 haptic motor, and PCM5100A 3.5mm stereo DAC) into a standalone **SomaFM Internet Radio to AirPlay streamer**.
 
-No phone, companion app, or external server is required: the knob connects directly to SomaFM (or any custom MP3 radio stream), decodes stereo audio in real time on the ESP32-S3, fetches live album art, renders a **60 FPS** circular UI and 3D wireframe audio visualizer, and streams lossless RTP ALAC audio directly to **Apple HomePods (OS 17–27+)**, **Sonos**, **Apple TV**, **AirPort Express**, **ShairPort**, or the onboard **3.5mm stereo jack**.
+No phone, companion app, or external server is required: the knob connects directly to SomaFM (or a custom MP3 radio stream), decodes stereo audio on the ESP32-S3, fetches live album art, renders a **60 FPS** circular UI and 3D wireframe audio visualizer, and implements **AirPlay 1 / 2** output plus an onboard **3.5mm stereo jack**. HomePod and Sonos have played successfully in earlier testing; receiver support is not universally qualified. See the [regression audit and receiver test matrix](docs/AIRPLAY_REGRESSION_2026-11.md) for current evidence and remaining compatibility work.
 
 ---
 
@@ -75,10 +75,15 @@ No phone, companion app, or external server is required: the knob connects direc
   - Ships with 30 curated SomaFM stations (*Groove Salad*, *Groove Salad Classic*, *Drone Zone*, *DEF CON Radio*, *Secret Agent*, *Space Station Soma*, *Underground 80s*, *Lush*, *Vaporwaves*, *Indie Pop Rocks!*, *Beat Blender*, *Deep Space One*, *Synphaera*, and more).
   - Automatic stream server failover (`ice6.somafm.com` $\to$ `ice2` $\to$ `ice4`) and live ICY `StreamTitle` metadata extraction.
   - Add, edit, or reorder up to 48 custom MP3 radio streams via the embedded Web UI (persisted in ESP32 NVS flash).
-- **🔊 Universal AirPlay 1 (RAOP) & AirPlay 2 Streaming Engine**:
+- **🔊 AirPlay 1 (RAOP) & AirPlay 2 Streaming Engine**:
   - **AirPlay 2 (`HomePod` / `HomePod mini` / `Apple TV` on OS 17–27+)**: Full HomeKit Transient Pair-Setup (`POST /pair-setup` TLV8 `M1..M4`, 3072-bit SRP-6a with SHA-512, HKDF-SHA-512 session keys), framed `ChaCha20-Poly1305` encrypted RTSP control & event channels, two-phase binary plist (`bplist00`) `SETUP`, and `ChaCha20-Poly1305` encrypted RTP audio frames.
   - **AirPlay 1 / RAOP (`Sonos`, `AirPort Express`, `ShairPort`, legacy receivers)**: Supports both `/auth-setup` Curve25519 ECDH (required by Sonos) and RSA-OAEP `AES-128-CBC` SDP `ANNOUNCE`.
-  - **Glitch-Free Buffering & Async Control**: **2.0 MB PSRAM PCM ringbuffer** (~11.6 seconds of 44.1 kHz 16-bit stereo audio), **64 KB MP3 buffer**, 512-packet UDP retransmission backlog, dedicated Core 0 microsecond NTP timing responder task, and non-blocking async RTSP volume worker task.
+  - **Buffering & Async Control**: **2.0 MB PSRAM PCM ringbuffer** (~11.9 seconds of 44.1 kHz 16-bit stereo audio), **256 KB MP3 buffer**, 512-packet UDP retransmission backlog, dedicated Core 0 NTP timing responder task, and asynchronous RTSP control with sequence-matched synchronous responses.
+- **Sonos Native Radio Playback**:
+  - Sonos speakers normally fetch the selected station directly. The knob controls the station, volume, and play/pause, and reads track information from the speaker without relaying uncompressed audio over Wi-Fi.
+  - For Sonos-only listening, disable the local 3.5mm output in the Web Portal. The buffer panel then shows **Audio buffered by Sonos**. Opening the visualizer or enabling the local jack starts an optional local audio monitor; the Sonos stream remains independent.
+  - Other receivers continue using AirPlay. Sonos receivers that reject native control can fall back to the existing AirPlay path.
+  - Turn off **Use direct radio playback on Sonos** in the portal, or send `{ "prefer_sonos_native": false }` to `/api/control`, to select standard AirPlay on Sonos. This preference is saved across restarts. Native radio success is separate from AirPlay qualification.
 - **🎧 Simultaneous Onboard 3.5mm Stereo DAC Output**:
   - Drives the onboard **TI PCM5100A** I2S stereo DAC via the `CH445P` analog mux (`GPIO 0`) so you can plug headphones or powered speakers directly into the knob's 3.5mm jack alongside—or instead of—AirPlay streaming.
 - **🎨 60 FPS Circular Touchscreen UI & Old-School "WhiteCap" 3D Visualizer**:
@@ -126,7 +131,7 @@ Built for the **[Waveshare ESP32-S3-Knob-Touch-LCD-1.8](https://www.waveshare.co
 ## ⚡ Quick Start
 
 ### 1. Prerequisites
-Install **[PlatformIO](https://platformio.org/)** (VS Code extension or PlatformIO Core CLI). All library dependencies (`LVGL 8.3.11`) and ESP32-S3 partition tables (`partitions.csv`) are configured automatically by [`platformio.ini`](platformio.ini).
+Install **[PlatformIO](https://platformio.org/)** (Core 6.1.19 or later). The pioarduino platform is pinned to **55.03.38-1** (Arduino 3.3.8 / IDF 5.5.4), with **LVGL 8.4.0** and the ESP32-S3 partition table configured by [`platformio.ini`](platformio.ini). Wi-Fi credentials are optional and are never needed for a clean build.
 
 ### 2. Configure Wi-Fi (Optional Compile-Time or On-Screen)
 You can connect to Wi-Fi in either of two ways:
@@ -168,8 +173,9 @@ pio run -t upload --upload-port airplayknob.local
 - **`GET /api/status`** — Live JSON state (current station, ICY track title, album art URL, playback status, volume, Wi-Fi IP/SSID, presets array, and discovered AirPlay speakers).
 - **`POST /api/control`** — Control playback, routing, and UI:
   ```json
-  { "preset": 4, "play": true, "volume": 28, "speaker": 2, "toggle_whitecap": true }
+  { "preset": 4, "volume": 28, "speaker": 2, "toggle_whitecap": true }
   ```
+- Use `{ "toggle_play": true }` to toggle playback and `{ "also_local_dac": false }` for Sonos-only listening.
 - **`POST /api/presets`** — Add, update, delete, or reset station presets (`action`: `"add" | "update" | "delete" | "reset"`).
 - **`POST /api/wifi`** — Save and connect to a new Wi-Fi network (`{ "ssid": "...", "pass": "..." }`).
 - **`GET /api/screenshot.bmp`** — Streams a live `360×360` 24-bit BMP capture of the display framebuffer.

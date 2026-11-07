@@ -8,6 +8,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Update.h>
+#include <esp_system.h>
 
 static WebServer s_server(80);
 
@@ -199,6 +200,10 @@ static const char WEB_UI_HTML[] PROGMEM = R"rawliteral(
         </div>
         <div id="speakerList"></div>
         <label style="display:flex;align-items:center;gap:8px;margin-top:12px;font-size:13px;color:var(--muted);cursor:pointer;">
+          <input type="checkbox" id="sonosRadioChk" onchange="toggleSonosRadio(this.checked)">
+          Use direct radio playback on Sonos (turn off to use AirPlay)
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;margin-top:12px;font-size:13px;color:var(--muted);cursor:pointer;">
           <input type="checkbox" id="localDacChk" onchange="toggleLocalDac(this.checked)">
           Also output audio to onboard 3.5mm stereo jack
         </label>
@@ -212,7 +217,7 @@ static const char WEB_UI_HTML[] PROGMEM = R"rawliteral(
           <div style="display:flex;justify-content:space-between;"><span>Wi-Fi Negotiated Link:</span><strong id="telWifi" style="color:#10b981;">—</strong></div>
           <div style="display:flex;justify-content:space-between;"><span>PCM Ringbuffer (2 MB PSRAM):</span><strong id="telPcm" style="color:#f8fafc;">—</strong></div>
           <div style="display:flex;justify-content:space-between;"><span>MP3 Stream Buffer (64 KB):</span><strong id="telMp3" style="color:#38bdf8;">—</strong></div>
-          <div style="display:flex;justify-content:space-between;"><span>AirPlay RAOP Engine:</span><strong id="telRaop" style="color:#f8fafc;">—</strong></div>
+          <div style="display:flex;justify-content:space-between;"><span>Speaker output:</span><strong id="telRaop" style="color:#f8fafc;">—</strong></div>
         </div>
       </div>
 
@@ -283,6 +288,7 @@ async function refreshState() {
     document.getElementById('wcBtn').textContent = s.whitecap_active ? '✨ Exit WhiteCap' : '✨ WhiteCap Visualizer';
     document.getElementById('wifiBadge').textContent = `${s.wifi_ssid} • ${s.wifi_speed_mbps || 72} Mbps • ${s.wifi_ip}`;
     document.getElementById('localDacChk').checked = !!s.also_local_dac;
+    document.getElementById('sonosRadioChk').checked = !!s.prefer_sonos_native;
     if (s.artwork_url && document.getElementById('nowArt').src !== s.artwork_url) {
       document.getElementById('nowArt').src = s.artwork_url;
     }
@@ -290,9 +296,9 @@ async function refreshState() {
     document.getElementById('knobModeBtn').textContent = modes[s.knob_mode] || 'VOL';
 
     document.getElementById('telWifi').textContent = `${s.wifi_speed_mbps || 72} Mbps • ${s.wifi_phy_mode || '802.11n'} • Ch ${s.wifi_channel || 1} (${s.wifi_rssi || -55} dBm)`;
-    document.getElementById('telPcm').textContent = `${s.pcm_buf_kb || 0} / 2048 KB (${((s.pcm_buf_ms || 0)/1000).toFixed(1)}s)`;
-    document.getElementById('telMp3').textContent = `${((s.mp3_buf_bytes || 0)/1024).toFixed(1)} / 64 KB • ${s.bitrate_kbps || 128} kbps`;
-    document.getElementById('telRaop').textContent = `${s.raop_connected ? (s.raop_is_ap2 ? 'AP2 ChaCha20' : 'AP1 AES') : 'Idle'} • Pkts ${s.raop_pkts_sent || 0} • NTP ${s.raop_ntp_replies || 0} • Retx ${s.raop_retransmits || 0}`;
+    document.getElementById('telPcm').textContent = s.sonos_native && !s.local_monitor ? 'Audio buffered by Sonos' : `${s.pcm_buf_kb || 0} / 2048 KB (${((s.pcm_buf_ms || 0)/1000).toFixed(1)}s)`;
+    document.getElementById('telMp3').textContent = s.sonos_native && !s.local_monitor ? 'Local monitoring off' : `${((s.mp3_buf_bytes || 0)/1024).toFixed(1)} / 256 KB • ${s.bitrate_kbps || 128} kbps`;
+    document.getElementById('telRaop').textContent = s.sonos_native ? 'Sonos radio • playing directly on speaker' : `${s.raop_connected ? (s.raop_is_ap2 ? 'AP2 ChaCha20' : 'AP1 AES') : 'Idle'} • Pkts ${s.raop_pkts_sent || 0} • NTP ${s.raop_ntp_replies || 0} • Retx ${s.raop_retransmits || 0}`;
 
     if (s.pin_prompt_active) {
       document.getElementById('pinBox').style.display = 'block';
@@ -396,6 +402,11 @@ async function scanSpeakers() {
 
 async function toggleLocalDac(val) {
   await api('/api/control', 'POST', { also_local_dac: val });
+}
+
+async function toggleSonosRadio(val) {
+  await api('/api/control', 'POST', { prefer_sonos_native: val });
+  await refreshState();
 }
 
 async function requestPinPair() {
@@ -575,12 +586,26 @@ static void handle_root() {
 }
 
 static void handle_status() {
+    lv_mem_monitor_t ui_mem = {};
+    bool have_ui_mem = bsp_lvgl_lock(3);
+    if (have_ui_mem) {
+        lv_mem_monitor(&ui_mem);
+        bsp_lvgl_unlock();
+    }
     String json;
     json.reserve(6144);
 
     if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         char esc1[160], esc2[160], esc3[280];
         json += "{";
+        json += "\"build\":\"" AIRPLAYKNOB_BUILD_ID "\",";
+        json += "\"uptime_ms\":"; json += String(millis()); json += ",";
+        json += "\"reset_reason\":"; json += String((int)esp_reset_reason()); json += ",";
+        json += "\"free_heap\":"; json += String(ESP.getFreeHeap()); json += ",";
+        json += "\"min_free_heap\":"; json += String(ESP.getMinFreeHeap()); json += ",";
+        json += "\"ui_heap_free\":"; json += have_ui_mem ? String(ui_mem.free_size) : "null"; json += ",";
+        json += "\"ui_heap_max_used\":"; json += have_ui_mem ? String(ui_mem.max_used) : "null"; json += ",";
+        json += "\"tab\":"; json += String(knob_ui_get_tab()); json += ",";
         json += "\"playing\":"; json += (g_app.playing ? "true" : "false"); json += ",";
         json += "\"whitecap_active\":"; json += (g_app.whitecap_active ? "true" : "false"); json += ",";
         json += "\"volume\":"; json += String(g_app.volume); json += ",";
@@ -588,6 +613,7 @@ static void handle_status() {
         json += "\"current_speaker\":"; json += String(g_app.current_speaker); json += ",";
         json += "\"knob_mode\":"; json += String((int)g_app.knob_mode); json += ",";
         json += "\"also_local_dac\":"; json += (g_app.also_local_dac ? "true" : "false"); json += ",";
+        json += "\"prefer_sonos_native\":"; json += (g_app.prefer_sonos_native ? "true" : "false"); json += ",";
         json_escape(g_app.track_title, esc1, sizeof(esc1));
         json_escape(g_app.status_text, esc2, sizeof(esc2));
         json_escape(g_app.artwork_url, esc3, sizeof(esc3));
@@ -602,6 +628,7 @@ static void handle_status() {
         json_escape(g_app.wifi_phy_mode, esc1, sizeof(esc1));
         json += "\"wifi_phy_mode\":\""; json += esc1; json += "\",";
         json += "\"wifi_channel\":"; json += String(g_app.wifi_channel); json += ",";
+        json += "\"wifi_bssid\":\""; json += WiFi.BSSIDstr(); json += "\",";
         json += "\"pcm_buf_ms\":"; json += String(g_app.pcm_buf_ms); json += ",";
         json += "\"pcm_buf_kb\":"; json += String(g_app.pcm_buf_kb); json += ",";
         json += "\"mp3_buf_bytes\":"; json += String(g_app.mp3_buf_bytes); json += ",";
@@ -609,6 +636,8 @@ static void handle_status() {
         json += "\"stream_underruns\":"; json += String(g_app.stream_underruns); json += ",";
         json += "\"raop_connected\":"; json += (g_app.raop_connected ? "true" : "false"); json += ",";
         json += "\"raop_is_ap2\":"; json += (g_app.raop_is_ap2 ? "true" : "false"); json += ",";
+        json += "\"sonos_native\":"; json += (g_app.sonos_native ? "true" : "false"); json += ",";
+        json += "\"local_monitor\":"; json += (g_app.also_local_dac || g_app.whitecap_active) ? "true" : "false"; json += ",";
         json += "\"raop_pkts_sent\":"; json += String(g_app.raop_pkts_sent); json += ",";
         json += "\"raop_ntp_replies\":"; json += String(g_app.raop_ntp_replies); json += ",";
         json += "\"raop_retransmits\":"; json += String(g_app.raop_retransmits); json += ",";
@@ -703,6 +732,17 @@ static void handle_control() {
             g_app.also_local_dac = dac_val;
             xSemaphoreGive(g_app.mutex);
         }
+        app_state_save_playback();
+    }
+    bool has_sonos = false;
+    bool sonos_val = extract_json_bool(body, "prefer_sonos_native", &has_sonos);
+    if (has_sonos) {
+        if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+            s_server.send(503, "application/json", "{\"error\":\"Controller busy; retry\"}");
+            return;
+        }
+        g_app.prefer_sonos_native = sonos_val;
+        xSemaphoreGive(g_app.mutex);
         app_state_save_playback();
     }
     int tab = extract_json_int(body, "tab", -1);
