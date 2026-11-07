@@ -78,6 +78,8 @@ int main() {
     assert(!discovery_must_wait(true,false,true,false,false,false));
     assert(!discovery_must_wait(true,false,false,true,false,false));
     assert(!discovery_must_wait(true,true,false,false,false,false));
+    assert(discovery_must_wait(true,true,false,false,true,false));
+    assert(discovery_must_wait(true,true,false,false,false,true));
     assert(!discovery_must_wait(false,false,false,false,false,false));
     UdpTxStats tx;
     assert(!tx.record(-1,1452,ENOMEM)); assert(tx.accepted==0 && tx.rejected==1);

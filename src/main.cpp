@@ -1035,7 +1035,8 @@ static void network_manager_task(void *arg) {
             bool needs_ip = g_app.current_speaker >= 0 && g_app.current_speaker < g_app.speaker_count &&
                             !g_app.speakers[g_app.current_speaker].is_local_dac &&
                             !g_app.speakers[g_app.current_speaker].ip[0];
-            bool native_only = g_app.sonos_native && !g_app.also_local_dac && !g_app.whitecap_active;
+            bool native_only = g_app.prefer_sonos_native && g_app.sonos_native &&
+                               !g_app.also_local_dac && !g_app.whitecap_active;
             bool defer = connected && discovery_must_wait(g_app.playing, native_only, needs_ip,
                                              last_mdns_scan_ms == 0, g_app.raop_connected,
                                              g_app.status == STREAM_CONNECTING_AIRPLAY);

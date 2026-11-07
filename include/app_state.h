@@ -8,7 +8,7 @@
 #define MAX_PRESETS        48
 #define MAX_SPEAKERS       48
 #define MAX_WIFI_SCAN      20
-#define AIRPLAYKNOB_BUILD_ID "art-network-20261107-r6"
+#define AIRPLAYKNOB_BUILD_ID "art-network-20261107-r7"
 
 #if __has_include("secrets.h")
 #include "secrets.h"

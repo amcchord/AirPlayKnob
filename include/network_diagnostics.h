@@ -43,6 +43,6 @@ inline bool artwork_network_allowed(bool playing, bool native_only, bool busy,
 
 inline bool discovery_must_wait(bool playing, bool native_only, bool selected_needs_ip,
                                 bool initial_scan, bool raop_connected, bool connecting) {
-    return playing && !native_only && !selected_needs_ip &&
-           (!initial_scan || raop_connected || connecting);
+    return playing && !selected_needs_ip &&
+           (raop_connected || connecting || (!native_only && !initial_scan));
 }

@@ -283,7 +283,8 @@ static bool decode_jpeg_to_artwork(const uint8_t *jpg_data, size_t jpg_len, lv_c
 
 static bool artwork_network_ready(uint32_t cushion_ms) {
     if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(10)) != pdTRUE) return false;
-    bool native_only = g_app.sonos_native && !g_app.also_local_dac && !g_app.whitecap_active;
+    bool native_only = g_app.prefer_sonos_native && g_app.sonos_native &&
+                       !g_app.also_local_dac && !g_app.whitecap_active;
     bool busy = !g_app.wifi_connected || g_app.ota_in_progress || g_app.speaker_scanning ||
                 g_app.wifi_scanning || g_app.stream_reconfig_needed ||
                 g_app.status == STREAM_CONNECTING_AIRPLAY;

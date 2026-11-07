@@ -222,3 +222,24 @@
   private-configuration scan, and whitespace checks passed. r6 is ready for
   on-device artwork/driver-counter verification over OTA; r5 rollback images
   and private evidence remain retained locally.
+
+
+### 2026-11-07 — r6 artwork verified; transition scan guard corrected
+
+- Published `78c8528`; GitHub host checks and credential-free build passed.
+  Deployed r6 over the existing web OTA endpoint into app1; image accepted and
+  native playback restored. Firmware SHA-256
+  `b109373a4c2881c683c39fba76eb3fc6566119d2650293e661646ef49e2b0e02`.
+- Verified a live album JPEG downloaded from the knob, HTTP 200, decoder OK,
+  album kind 2, and four task-scoped external TLS allocations. Initial native
+  artwork work had zero driver rejections and internal-heap minimum 42,108
+  bytes. User confirmed the album cover is visible on the physical screen.
+- Live scan isolation caught a transition race: native-connected telemetry
+  could remain true after standard AirPlay was requested, allowing a manual
+  scan before the sender completed handoff. r6 scan-isolation check failed;
+  it was not counted as passed. Native mode was restored with no new native
+  underruns during the final observation.
+- r7 uses the requested transport as well as active state and makes active or
+  connecting AirPlay override stale native flags. Added regression cases for
+  both contradictory-state transitions. Clean build and host policy/repair
+  checks pass; repeating the live isolation test next.
