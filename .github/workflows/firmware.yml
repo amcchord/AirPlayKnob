@@ -29,6 +29,7 @@ jobs:
         run: |
           python tests/test_alac_packets.py
           python tests/test_rtsp_responses.py
+          python tests/test_network_policy.py
       - name: Build firmware without private credentials
         run: pio run
       - name: Check whitespace

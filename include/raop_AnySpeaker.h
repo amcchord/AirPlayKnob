@@ -1,4 +1,5 @@
 #pragma once
+#include "network_diagnostics.h"
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -19,6 +20,9 @@ public:
     uint32_t getPktsSent() const { return m_pkts_sent; }
     uint32_t getNtpReplies() const { return m_ntp_replies; }
     uint32_t getRetransmits() const { return m_retransmits; }
+    const UdpTxStats &txStats() const { return m_audio_tx; }
+    const UdpTxStats &repairStats() const { return m_repair_tx; }
+    uint32_t pendingRepairs() const { return m_pending_repairs; }
 
     // Returns true when the NTP-locked RTP clock is ready to accept the next 352-frame chunk
     bool acceptFrames() const;
@@ -30,7 +34,7 @@ public:
     bool setMetadata(const char *title, const char *artist, const char *album);
     bool setArtwork(const uint8_t *jpeg_data, size_t jpeg_len);
     void resyncTimestamp();
-    void pollControlAndKeepalive();
+    void pollControlAndKeepalive(bool allow_repair = true);
 
 private:
     bool reconnectRtspSocket();
@@ -140,6 +144,11 @@ private:
     uint32_t m_pkts_sent;
     uint32_t m_ntp_replies;
     uint32_t m_retransmits;
+    UdpTxStats m_audio_tx, m_repair_tx;
+    uint32_t m_pending_repairs = 0;
+    uint16_t m_repair_cursor = 0;
+    uint64_t m_last_repair_us = 0, m_last_reject_us = 0;
+    void sendPendingRepair();
 
     volatile bool m_timing_running;
     TaskHandle_t m_timing_task;
@@ -148,6 +157,7 @@ private:
         uint16_t seq;
         uint16_t len;
         uint64_t last_sent_us;
+        bool repair_pending;
         uint8_t data[1480];
     };
     BacklogSlot *m_backlog; // allocated in PSRAM

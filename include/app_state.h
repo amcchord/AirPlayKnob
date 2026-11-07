@@ -8,7 +8,7 @@
 #define MAX_PRESETS        48
 #define MAX_SPEAKERS       48
 #define MAX_WIFI_SCAN      20
-#define AIRPLAYKNOB_BUILD_ID "airplay-compat-20261107-r5"
+#define AIRPLAYKNOB_BUILD_ID "art-network-20261107-r6"
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -75,6 +75,10 @@ struct AppState {
     bool prefer_sonos_native; // Optional radio optimization; false always uses AirPlay.
     bool speaker_scan_requested;
     bool speaker_scanning;
+    bool speaker_scan_deferred;
+    bool wifi_scan_deferred;
+    uint32_t speaker_scan_count;
+    uint32_t speaker_scan_last_ms;
 
     // Playback & Volume
     bool playing;
@@ -104,6 +108,12 @@ struct AppState {
     uint32_t raop_pkts_sent;
     uint32_t raop_ntp_replies;
     uint32_t raop_retransmits;
+    uint32_t raop_tx_accepted;
+    uint32_t raop_tx_rejected;
+    uint32_t raop_tx_retries;
+    uint32_t raop_repair_rejected;
+    uint32_t raop_repair_pending;
+    int raop_tx_last_error;
 
     // AirPlay 4-Digit PIN Pairing State
     bool pin_prompt_active;

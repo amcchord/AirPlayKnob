@@ -192,3 +192,33 @@
   Final state: native radio, Groove Salad, volume 16, local monitoring off.
   No firmware change, flash, or additional restart. Private evidence retained
   in ignored `scratch/workshop-fix/wall-power-comparison.json`.
+
+
+## 2026-11-07 — Album art repair and local network-stack audit (in progress)
+
+- User requested fixing album art and checking local packet drops/discovery
+  before attributing the AirPlay failure to Wi-Fi/RF; broader receiver
+  compatibility remains deferred. Root branch remains `codex/workshop-audio`.
+- Found station JPEG downloads pre-marked complete, live album lookup disabled
+  while playing, and PCM-cushion guards preventing all native Sonos artwork.
+  Restored station/live lookup with native-aware gating, bounded retries,
+  stale-result rejection, baseline 160-pixel JPEGs, proper HTTP transfer
+  decoding, and safe fallback. Added a task-scoped TLS allocator: bulk artwork
+  TLS buffers use PSRAM without internal-RAM fallback; other TLS/pairing keeps
+  the pinned SDK's allocator. The SDK normally forces TLS into internal RAM.
+- The sender already logged local sendto ENOMEM failures, but incremented
+  “sent” and returned success even after rejection. Repair counters ignored
+  send results too. Added accepted/rejected/retry accounting, driver-boundary
+  submission counters, and discovery telemetry. These are queue-acceptance
+  observations, not over-the-air delivery or receiver acknowledgments.
+- Replaced eight-repair bursts with retained pending repairs, original-audio
+  priority, pacing and backoff after local rejection. Queued explicit/retry
+  speaker scans and off-channel Wi-Fi scans during controller audio playback;
+  preserved initial discovery, missing-IP discovery, paused scans and native
+  Sonos-only scans. No AP-selection or PHY changes.
+- Host checks passed: existing 12 ALAC and 16 RTSP cases, plus network policy,
+  frame classification, allocation overflow/OOM/context, and actual repair
+  queue/backpressure methods. Credential-free firmware build, portal syntax,
+  private-configuration scan, and whitespace checks passed. r6 is ready for
+  on-device artwork/driver-counter verification over OTA; r5 rollback images
+  and private evidence remain retained locally.

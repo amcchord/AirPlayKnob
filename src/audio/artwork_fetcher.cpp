@@ -8,9 +8,35 @@
 #include <esp_heap_caps.h>
 #include <extra/libs/sjpg/tjpgd.h>
 #include <math.h>
+#include <atomic>
+#include "network_diagnostics.h"
 
 #define MAX_JPG_DIM 300
 #define MAX_JPG_BYTES (64 * 1024)
+
+static std::atomic<TaskHandle_t> s_art_task{nullptr};
+static std::atomic<uint32_t> s_attempts{0}, s_failures{0}, s_tls_psram{0};
+static std::atomic<int> s_http_status{0}, s_decode_error{0};
+static std::atomic<uint8_t> s_art_kind{0};
+
+// IDF's pinned build allocates mbedTLS buffers only in internal RAM. Restrict
+// this override to the artwork task; other TLS/pairing allocations are unchanged.
+// Espressif's normal free hook is heap_caps_free, valid for either memory kind.
+extern "C" void *__real_esp_mbedtls_mem_calloc(size_t, size_t);
+extern "C" void *__wrap_esp_mbedtls_mem_calloc(size_t n, size_t size) {
+    if (n && size > SIZE_MAX / n) return nullptr;
+    if (xTaskGetCurrentTaskHandle() == s_art_task.load() && n * size >= 1024) {
+        void *p = heap_caps_calloc(n, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (p) s_tls_psram.fetch_add(1);
+        return p; // Optional artwork must not fall back into scarce driver RAM.
+    }
+    return __real_esp_mbedtls_mem_calloc(n, size);
+}
+
+ArtworkDiagnostics artwork_diagnostics() {
+    return {s_attempts.load(), s_failures.load(), s_tls_psram.load(),
+            s_http_status.load(), s_decode_error.load(), s_art_kind.load()};
+}
 
 static lv_color_t *s_art_pixels = NULL;
 static lv_color_t *s_station_cache_pixels = NULL;
@@ -24,14 +50,14 @@ static size_t s_current_jpg_len = 0;
 static volatile uint32_t s_current_jpg_seq = 0;
 static SemaphoreHandle_t s_jpg_mutex = NULL;
 
-static void store_current_jpeg(const uint8_t *data, size_t len, bool is_station_cover) {
+static void store_current_jpeg(const uint8_t *data, size_t len, bool is_station_cover, bool publish = true) {
     if (!data || len == 0 || len > MAX_JPG_BYTES || !s_jpg_mutex) return;
     if (xSemaphoreTake(s_jpg_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
         if (is_station_cover && s_station_jpg_buf) {
             memcpy(s_station_jpg_buf, data, len);
             s_station_jpg_len = len;
         }
-        if (s_current_jpg_buf) {
+        if (publish && s_current_jpg_buf) {
             memcpy(s_current_jpg_buf, data, len);
             s_current_jpg_len = len;
             s_current_jpg_seq = s_current_jpg_seq + 1;
@@ -47,6 +73,9 @@ static void restore_station_jpeg_as_current(void) {
             memcpy(s_current_jpg_buf, s_station_jpg_buf, s_station_jpg_len);
             s_current_jpg_len = s_station_jpg_len;
             s_current_jpg_seq = s_current_jpg_seq + 1;
+        } else {
+            s_current_jpg_len = 0;
+            ++s_current_jpg_seq;
         }
         xSemaphoreGive(s_jpg_mutex);
     }
@@ -176,6 +205,7 @@ static bool decode_jpeg_to_artwork(const uint8_t *jpg_data, size_t jpg_len, lv_c
     sess.pos = 0;
 
     JRESULT res = jd_prepare(&jdec, tjpg_input_cb, work, 3800, &sess);
+    s_decode_error.store((int)res);
     if (res != JDR_OK) {
         heap_caps_free(work);
         return false;
@@ -200,6 +230,7 @@ static bool decode_jpeg_to_artwork(const uint8_t *jpg_data, size_t jpg_len, lv_c
     res = jd_decomp(&jdec, tjpg_output_cb, scale);
     heap_caps_free(work);
 
+    s_decode_error.store((int)res);
     if (res != JDR_OK) {
         heap_caps_free(sess.rgb_raw);
         return false;
@@ -250,84 +281,63 @@ static bool decode_jpeg_to_artwork(const uint8_t *jpg_data, size_t jpg_len, lv_c
     return true;
 }
 
+static bool artwork_network_ready(uint32_t cushion_ms) {
+    if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(10)) != pdTRUE) return false;
+    bool native_only = g_app.sonos_native && !g_app.also_local_dac && !g_app.whitecap_active;
+    bool busy = !g_app.wifi_connected || g_app.ota_in_progress || g_app.speaker_scanning ||
+                g_app.wifi_scanning || g_app.stream_reconfig_needed ||
+                g_app.status == STREAM_CONNECTING_AIRPLAY;
+    bool ok = artwork_network_allowed(g_app.playing, native_only, busy,
+                                       radio_get_buffered_ms(), cushion_ms);
+    xSemaphoreGive(g_app.mutex);
+    return ok && ESP.getFreeHeap() >= 32000;
+}
+
+class ArtworkBufferStream : public Stream {
+public:
+    ArtworkBufferStream(uint8_t *data, size_t cap) : data(data), cap(cap) {}
+    size_t write(const uint8_t *p, size_t n) override {
+        if (n > cap - used || !artwork_network_ready(3000)) return 0;
+        memcpy(data + used, p, n); used += n; return n;
+    }
+    size_t write(uint8_t c) override { return write(&c, 1); }
+    int available() override { return 0; }
+    int read() override { return -1; }
+    int peek() override { return -1; }
+    void flush() override {}
+    uint8_t *data; size_t cap, used = 0;
+};
+
 static bool download_url_to_buf(const char *url, uint8_t *buf, size_t max_len, size_t *out_len) {
     *out_len = 0;
-    if (g_app.stream_reconfig_needed || (g_app.playing && radio_get_buffered_ms() < 2200)) {
-        return false;
-    }
-    bool is_https = (strncmp(url, "https://", 8) == 0);
-    if (is_https) {
-        // Never run an mbedTLS handshake while audio streaming is active:
-        // WiFiClientSecure allocates ~45 KB of Internal SRAM, starving lwIP TCP RX pbufs.
-        if (g_app.playing) {
-            return false;
-        }
-        size_t free_int = ESP.getFreeHeap();
-        size_t largest_blk = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        if (free_int < 75000 || largest_blk < 48000) {
-            return false;
-        }
-    }
-
-    WiFiClientSecure *sc = NULL;
+    if (!artwork_network_ready(6000)) return false;
+    ++s_attempts;
+    bool secure = strncmp(url, "https://", 8) == 0;
     WiFiClient pc;
+    WiFiClientSecure sc;
+    sc.setInsecure();
+    sc.setHandshakeTimeout(5);
     HTTPClient http;
-    http.setUserAgent("Mozilla/5.0 (AirPlayKnob/1.0)");
+    http.setUserAgent("AirPlayKnob/1.0");
     http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-    http.setConnectTimeout(2500);
-    http.setTimeout(2500);
-
+    http.setConnectTimeout(2500); http.setTimeout(2500);
+    bool begun = secure ? http.begin(sc, url) : http.begin(pc, url);
     bool ok = false;
-    if (is_https) {
-        sc = new WiFiClientSecure();
-        sc->setInsecure();
-        ok = http.begin(*sc, url);
-    } else {
-        ok = http.begin(pc, url);
-    }
-    if (!ok) {
-        if (sc) delete sc;
-        return false;
-    }
-
-    int code = http.GET();
-    if (code != HTTP_CODE_OK) {
-        http.end();
-        if (sc) delete sc;
-        return false;
-    }
-
-    int total = http.getSize();
-    if (total > (int)max_len) {
-        http.end();
-        if (sc) delete sc;
-        return false;
-    }
-
-    WiFiClient *s = http.getStreamPtr();
-    size_t got = 0;
-    uint32_t t0 = millis();
-    while (http.connected() && (total < 0 || got < (size_t)total) && got < max_len) {
-        if (g_app.stream_reconfig_needed || (g_app.playing && radio_get_buffered_ms() < 1600)) {
-            http.end();
-            if (sc) delete sc;
-            return false;
+    if (begun) {
+        int code = http.GET(); s_http_status.store(code);
+        if (code == HTTP_CODE_OK && http.getSize() <= (int)max_len) {
+            // HTTPClient removes transfer-encoding framing; the raw stream
+            // previously treated chunk headers as image/JSON bytes.
+            ArtworkBufferStream sink(buf, max_len);
+            int n = http.writeToStream(&sink);
+            ok = n > 120 && sink.used == (size_t)n &&
+                 (http.getSize() < 0 || sink.used == (size_t)http.getSize());
+            if (ok) *out_len = sink.used;
         }
-        int avail = s->available();
-        if (avail > 0) {
-            int to_read = (avail < (int)(max_len - got)) ? avail : (int)(max_len - got);
-            int n = s->read(buf + got, to_read);
-            if (n > 0) got += n;
-            t0 = millis();
-        } else {
-            if (millis() - t0 > 2500) break;
-            vTaskDelay(pdMS_TO_TICKS(5));
-        }
+        http.end();
     }
-    http.end();
-    if (sc) delete sc;
-    *out_len = got;
-    return got > 120;
+    if (!ok) ++s_failures;
+    return ok;
 }
 
 static void url_encode_query(const char *src, char *dst, size_t dst_max) {
@@ -348,172 +358,114 @@ static void url_encode_query(const char *src, char *dst, size_t dst_max) {
 
 static void artwork_worker_task(void *arg) {
     (void)arg;
-    const size_t MAX_DL = 64 * 1024;
-    uint8_t *dl_buf = (uint8_t *)heap_caps_malloc(MAX_DL, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_art_task.store(xTaskGetCurrentTaskHandle());
+    const size_t MAX_DL = MAX_JPG_BYTES;
+    uint8_t *dl_buf = (uint8_t *)heap_caps_malloc(MAX_DL + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     lv_color_t *work_pixels = (lv_color_t *)heap_caps_malloc(ARTWORK_SIZE * ARTWORK_SIZE * sizeof(lv_color_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-
-    int last_preset = -1;
+    if (!dl_buf || !work_pixels) { heap_caps_free(dl_buf); heap_caps_free(work_pixels); vTaskDelete(nullptr); return; }
+    int last_preset = -1, station_tries = 0, track_tries = 0;
     char last_track[128] = {0};
-    bool station_jpg_loaded = false;
-    int station_jpg_tries = 0;
-
+    bool station_loaded = false, track_done = false;
+    uint32_t next_station_ms = 0, next_track_ms = 0;
     for (;;) {
-        bool wifi_ok = false;
-        bool ota = false;
-        bool spk_scan = false;
-        int cur_preset = 0;
+        int preset = -1;
         StationPreset st = {};
-        char cur_track[128] = {0};
-
-        if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-            wifi_ok = g_app.wifi_connected;
-            ota = g_app.ota_in_progress;
-            spk_scan = g_app.speaker_scanning;
-            cur_preset = g_app.current_preset;
-            if (cur_preset >= 0 && cur_preset < g_app.preset_count) {
-                st = g_app.presets[cur_preset];
-            }
-            strncpy(cur_track, g_app.track_title, sizeof(cur_track) - 1);
-            xSemaphoreGive(g_app.mutex);
+        char track[128] = {0};
+        if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+            vTaskDelay(pdMS_TO_TICKS(250)); continue;
         }
-
-        if (ota) {
-            vTaskDelay(pdMS_TO_TICKS(400));
-            continue;
-        }
-
-        // 1. Did station preset change?
-        if (cur_preset != last_preset) {
-            last_preset = cur_preset;
-            last_track[0] = '\0';
-            // Keep procedural SomaFM station cover active so artwork_worker_task never contends
-            // for DNS/HTTP sockets or redirects (somafm.com -> https://) during audio streaming.
-            station_jpg_loaded = true;
-            station_jpg_tries = 3;
-            if (s_jpg_mutex && xSemaphoreTake(s_jpg_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-                s_station_jpg_len = 0;
-                s_current_jpg_len = 0;
-                xSemaphoreGive(s_jpg_mutex);
-            }
-
-            // Immediately display procedural SomaFM cover so UI responds in <5ms
+        preset = g_app.current_preset;
+        if (preset >= 0 && preset < g_app.preset_count) st = g_app.presets[preset];
+        strncpy(track, g_app.track_title, sizeof(track) - 1);
+        xSemaphoreGive(g_app.mutex);
+        if (preset != last_preset) {
+            last_preset = preset; last_track[0] = 0;
+            station_loaded = false; station_tries = 0; next_station_ms = 0;
+            s_art_kind.store(0);
             render_procedural_stream_art(s_station_cache_pixels, st);
             memcpy(s_art_pixels, s_station_cache_pixels, ARTWORK_SIZE * ARTWORK_SIZE * sizeof(lv_color_t));
-            s_art_seq = s_art_seq + 1;
-
-            char somafm_art_url[128];
-            snprintf(somafm_art_url, sizeof(somafm_art_url), "https://somafm.com/img/%s120.jpg", st.id);
+            ++s_art_seq;
+            if (xSemaphoreTake(s_jpg_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                s_station_jpg_len = 0; s_current_jpg_len = 0;
+                xSemaphoreGive(s_jpg_mutex);
+            }
+        }
+        if (strcmp(track, last_track) != 0) {
+            strncpy(last_track, track, sizeof(last_track) - 1);
+            track_tries = 0; track_done = false; next_track_ms = 0;
+            memcpy(s_art_pixels, s_station_cache_pixels, ARTWORK_SIZE * ARTWORK_SIZE * sizeof(lv_color_t));
+            ++s_art_seq; restore_station_jpeg_as_current();
+            s_art_kind.store(station_loaded ? 1 : 0);
             if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-                strncpy(g_app.artwork_url, somafm_art_url, sizeof(g_app.artwork_url) - 1);
+                snprintf(g_app.artwork_url, sizeof(g_app.artwork_url), "http://somafm.com/img/%s120.jpg", st.id);
                 xSemaphoreGive(g_app.mutex);
             }
         }
-
-        // 2. Download SomaFM station cover over plain HTTP (zero TLS internal SRAM overhead)
-        //    once stream buffer has >= 2.2s cushion
-        uint32_t buf_ms_now = radio_get_buffered_ms();
-        if (wifi_ok && !spk_scan && !station_jpg_loaded && st.id[0] != '\0' &&
-            (!g_app.playing || (g_app.status == STREAM_PLAYING && buf_ms_now >= 2200))) {
-            char somafm_art_url[128];
-            snprintf(somafm_art_url, sizeof(somafm_art_url), "http://somafm.com/img/%s120.jpg", st.id);
-            size_t jpg_len = 0;
-            station_jpg_tries++;
-            if (download_url_to_buf(somafm_art_url, dl_buf, MAX_DL, &jpg_len)) {
-                if (decode_jpeg_to_artwork(dl_buf, jpg_len, s_station_cache_pixels, st.color)) {
-                    memcpy(s_art_pixels, s_station_cache_pixels, ARTWORK_SIZE * ARTWORK_SIZE * sizeof(lv_color_t));
-                    s_art_seq = s_art_seq + 1;
-                    store_current_jpeg(dl_buf, jpg_len, true);
-                    station_jpg_loaded = true;
-                    Serial.printf("[ART] Loaded SomaFM stream art for '%s' (%u bytes)\n", st.name, (unsigned)jpg_len);
+        auto still_current = [&]() {
+            if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(20)) != pdTRUE) return false;
+            bool same = g_app.current_preset == preset && strcmp(g_app.track_title, track) == 0;
+            xSemaphoreGive(g_app.mutex); return same;
+        };
+        char station_url[128];
+        snprintf(station_url, sizeof(station_url), "http://somafm.com/img/%s120.jpg", st.id);
+        if (!station_loaded && station_tries < 3 && st.id[0] &&
+            (int32_t)(millis() - next_station_ms) >= 0 && artwork_network_ready(6000)) {
+            ++station_tries; next_station_ms = millis() + 15000;
+            size_t n = 0;
+            if (download_url_to_buf(station_url, dl_buf, MAX_DL, &n) &&
+                decode_jpeg_to_artwork(dl_buf, n, work_pixels, st.color) && still_current()) {
+                memcpy(s_station_cache_pixels, work_pixels, ARTWORK_SIZE * ARTWORK_SIZE * sizeof(lv_color_t));
+                const bool album_active = s_art_kind.load() == 2;
+                store_current_jpeg(dl_buf, n, true, !album_active);
+                station_loaded = true;
+                if (!album_active) {
+                    memcpy(s_art_pixels, work_pixels, ARTWORK_SIZE * ARTWORK_SIZE * sizeof(lv_color_t));
+                    ++s_art_seq; s_art_kind.store(1);
+                }
+                if (!album_active && xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+                    strncpy(g_app.artwork_url, station_url, sizeof(g_app.artwork_url) - 1);
+                    xSemaphoreGive(g_app.mutex);
                 }
             }
-            if (station_jpg_tries >= 3) {
-                station_jpg_loaded = true;
-            }
         }
-
-        // 3. Did the live ICY track change? Query iTunes when buffer cushion >= 4.0s
-        if (wifi_ok && !spk_scan && cur_track[0] != '\0' && strcmp(cur_track, last_track) != 0 &&
-            (!g_app.playing || (g_app.status == STREAM_PLAYING && radio_get_buffered_ms() >= 4000))) {
-
-            bool is_real_song = (strstr(cur_track, " - ") != NULL) &&
-                                (strstr(cur_track, "Live Stream") == NULL) &&
-                                (strstr(cur_track, "Connecting") == NULL) &&
-                                (strstr(cur_track, "SomaFM") == NULL);
-
-            // Always mark search_completed = true so a tight-heap or failed TLS lookup never retries in a 250ms loop!
-            // While streaming audio (g_app.playing), skip the HTTPS iTunes lookup so mbedTLS never steals
-            // ~45 KB of Internal SRAM from lwIP's TCP RX window; keep the plain-HTTP SomaFM station cover.
-            bool search_completed = true;
-            bool got_track_art = false;
-            size_t free_int = ESP.getFreeHeap();
-            size_t largest_blk = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-            if (!g_app.playing && is_real_song && free_int >= 75000 && largest_blk >= 48000) {
-                char encoded[256];
-                url_encode_query(cur_track, encoded, sizeof(encoded));
-                char search_url[360];
-                snprintf(search_url, sizeof(search_url),
-                         "https://itunes.apple.com/search?term=%s&media=music&entity=song&limit=1", encoded);
-
-                size_t json_len = 0;
-                if (download_url_to_buf(search_url, dl_buf, 16384, &json_len)) {
-                    dl_buf[json_len] = '\0';
-                    char *art_key = strstr((char *)dl_buf, "\"artworkUrl100\":\"");
-                    if (art_key) {
-                        art_key += 17;
-                        char *art_end = strchr(art_key, '"');
-                        if (art_end && (art_end - art_key) < 230) {
-                            char art_url[256] = {0};
-                            memcpy(art_url, art_key, art_end - art_key);
-                            // Upgrade 100x100bb.jpg to 300x300bb.jpg for sharp full-screen 360x360 display
-                            char *sz_pos = strstr(art_url, "100x100bb.jpg");
-                            if (sz_pos) {
-                                memcpy(sz_pos, "300x300bb.jpg", 13);
+        bool song = strstr(track, " - ") && !strstr(track, "Live Stream") &&
+                    !strstr(track, "Connecting") && !strstr(track, "SomaFM");
+        if (song && !track_done && track_tries < 3 &&
+            (int32_t)(millis() - next_track_ms) >= 0 && artwork_network_ready(6000)) {
+            ++track_tries; next_track_ms = millis() + 15000;
+            char query[384], url[512];
+            url_encode_query(track, query, sizeof(query));
+            snprintf(url, sizeof(url), "https://itunes.apple.com/search?term=%s&media=music&entity=song&limit=1", query);
+            size_t n = 0;
+            if (download_url_to_buf(url, dl_buf, 16384, &n)) {
+                dl_buf[n] = 0;
+                char *key = strstr((char *)dl_buf, "\"artworkUrl100\":\"");
+                if (!key) track_done = true; // Successful search, no matching album.
+                else {
+                    key += strlen("\"artworkUrl100\":\"");
+                    char *end = strchr(key, '"');
+                    if (end && end - key < 240) {
+                        char art_url[256] = {0}; memcpy(art_url, key, end - key);
+                        char *size = strstr(art_url, "100x100bb.jpg");
+                        if (size) memcpy(size, "160x160bb.jpg", 13); // Baseline JPEG, supported by ROM decoder.
+                        char download[256];
+                        snprintf(download, sizeof(download), "%s", art_url);
+                        if (strncmp(download, "https://", 8) == 0) memmove(download + 4, download + 5, strlen(download + 5) + 1);
+                        if (download_url_to_buf(download, dl_buf, MAX_DL, &n) &&
+                            decode_jpeg_to_artwork(dl_buf, n, work_pixels, st.color) && still_current()) {
+                            memcpy(s_art_pixels, work_pixels, ARTWORK_SIZE * ARTWORK_SIZE * sizeof(lv_color_t));
+                            ++s_art_seq; store_current_jpeg(dl_buf, n, false); s_art_kind.store(2);
+                            if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+                                strncpy(g_app.artwork_url, art_url, sizeof(g_app.artwork_url) - 1);
+                                xSemaphoreGive(g_app.mutex);
                             }
-                            // Save HTTPS URL for Web Portal, but download JPEG over plain HTTP from mzstatic CDN
-                            // to avoid a second TLS handshake!
-                            char dl_art_url[256];
-                            if (strncmp(art_url, "https://", 8) == 0) {
-                                snprintf(dl_art_url, sizeof(dl_art_url), "http://%s", art_url + 8);
-                            } else {
-                                strncpy(dl_art_url, art_url, sizeof(dl_art_url) - 1);
-                                dl_art_url[sizeof(dl_art_url) - 1] = '\0';
-                            }
-                            size_t jpg_len = 0;
-                            if (download_url_to_buf(dl_art_url, dl_buf, MAX_DL, &jpg_len)) {
-                                if (decode_jpeg_to_artwork(dl_buf, jpg_len, work_pixels, st.color)) {
-                                    memcpy(s_art_pixels, work_pixels, ARTWORK_SIZE * ARTWORK_SIZE * sizeof(lv_color_t));
-                                    s_art_seq = s_art_seq + 1;
-                                    store_current_jpeg(dl_buf, jpg_len, false);
-                                    got_track_art = true;
-                                    if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-                                        strncpy(g_app.artwork_url, art_url, sizeof(g_app.artwork_url) - 1);
-                                        xSemaphoreGive(g_app.mutex);
-                                    }
-                                    Serial.printf("[ART] Loaded live Album Art for '%s' (%u bytes)\n", cur_track, (unsigned)jpg_len);
-                                }
-                            }
+                            track_done = true;
+                            Serial.printf("[ART] Album cover published (%u bytes)\n", (unsigned)n);
                         }
-                    }
-                }
-            }
-
-            if (search_completed) {
-                strncpy(last_track, cur_track, sizeof(last_track) - 1);
-                if (!got_track_art) {
-                    memcpy(s_art_pixels, s_station_cache_pixels, ARTWORK_SIZE * ARTWORK_SIZE * sizeof(lv_color_t));
-                    s_art_seq = s_art_seq + 1;
-                    restore_station_jpeg_as_current();
-                    char somafm_art_url[128];
-                    snprintf(somafm_art_url, sizeof(somafm_art_url), "https://somafm.com/img/%s120.jpg", st.id);
-                    if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-                        strncpy(g_app.artwork_url, somafm_art_url, sizeof(g_app.artwork_url) - 1);
-                        xSemaphoreGive(g_app.mutex);
-                    }
+                    } else track_done = true;
                 }
             }
         }
-
         vTaskDelay(pdMS_TO_TICKS(250));
     }
 }

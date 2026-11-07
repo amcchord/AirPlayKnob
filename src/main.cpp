@@ -17,6 +17,7 @@
 #include "bsp/bidi_switch_knob.h"
 #include "radio_streamer.h"
 #include "artwork_fetcher.h"
+#include "network_diagnostics.h"
 #include "knob_ui.h"
 #include "web_portal.h"
 
@@ -653,8 +654,10 @@ static void ingest_mdns_results(mdns_result_t *results, AirPlaySpeaker *found, i
 static void discover_airplay_speakers(bool manual_scan) {
     if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
         g_app.speaker_scanning = true;
+        g_app.speaker_scan_count++;
+        g_app.speaker_scan_last_ms = millis();
         xSemaphoreGive(g_app.mutex);
-    }
+    } else return;
 
     uint32_t now_ms = millis();
     mdns_result_t *raop_results = NULL;
@@ -1001,6 +1004,7 @@ static void network_manager_task(void *arg) {
         bool do_spk_scan = false;
         bool just_connected = false;
         bool modal_open = false;
+        bool defer_discovery = false;
 
         if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
             bool was_connected = g_app.wifi_connected;
@@ -1028,6 +1032,26 @@ static void network_manager_task(void *arg) {
             do_spk_scan = g_app.speaker_scan_requested;
             g_app.speaker_scan_requested = false;
 
+            bool needs_ip = g_app.current_speaker >= 0 && g_app.current_speaker < g_app.speaker_count &&
+                            !g_app.speakers[g_app.current_speaker].is_local_dac &&
+                            !g_app.speakers[g_app.current_speaker].ip[0];
+            bool native_only = g_app.sonos_native && !g_app.also_local_dac && !g_app.whitecap_active;
+            bool defer = connected && discovery_must_wait(g_app.playing, native_only, needs_ip,
+                                             last_mdns_scan_ms == 0, g_app.raop_connected,
+                                             g_app.status == STREAM_CONNECTING_AIRPLAY);
+            defer_discovery = defer;
+            if (defer && do_spk_scan) {
+                g_app.speaker_scan_requested = true;
+                do_spk_scan = false;
+            }
+            g_app.speaker_scan_deferred = defer && g_app.speaker_scan_requested;
+            if (defer && do_wifi_scan) {
+                g_app.wifi_scan_requested = true;
+                g_app.wifi_scanning = false;
+                do_wifi_scan = false;
+            }
+            g_app.wifi_scan_deferred = defer && g_app.wifi_scan_requested;
+
             modal_open = g_app.wifi_modal_open;
 
             if (do_reconnect) {
@@ -1041,6 +1065,9 @@ static void network_manager_task(void *arg) {
                 g_app.wifi_connected_since_ms = 0;
             }
             xSemaphoreGive(g_app.mutex);
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(150));
+            continue; // No snapshot means no permission to start network work.
         }
 
         if (connected) {
@@ -1188,7 +1215,7 @@ static void network_manager_task(void *arg) {
         }
 
         // Run initial mDNS speaker scan immediately upon Wi-Fi connect (before HTTP stream starts),
-        // and thereafter ONLY scan when explicitly requested, on the Speakers tab, paused, or if
+        // and thereafter ONLY scan when safe, paused, or if
         // the selected speaker still needs its IP resolved. Never blast 48-device multicast mDNS
         // queries while streaming audio on the Now Playing screen!
         uint32_t scan_interval_ms = 30000;
@@ -1202,7 +1229,7 @@ static void network_manager_task(void *arg) {
                                  (millis() - last_mdns_scan_ms >= scan_interval_ms) &&
                                  discovery_needed &&
                                  (g_app.status != STREAM_CONNECTING_AIRPLAY);
-        if (connected && !g_app.ota_in_progress && !g_app.pin_prompt_active &&
+        if (connected && !defer_discovery && !g_app.ota_in_progress && !g_app.pin_prompt_active &&
             (do_spk_scan || initial_scan_due || periodic_scan_due)) {
             discover_airplay_speakers(do_spk_scan);
             last_mdns_scan_ms = millis();

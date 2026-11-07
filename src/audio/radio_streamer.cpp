@@ -677,6 +677,12 @@ static void raop_sender_task(void *arg) {
             g_app.raop_pkts_sent = raop->getPktsSent();
             g_app.raop_ntp_replies = raop->getNtpReplies();
             g_app.raop_retransmits = raop->getRetransmits();
+            g_app.raop_tx_accepted = raop->txStats().accepted;
+            g_app.raop_tx_rejected = raop->txStats().rejected;
+            g_app.raop_tx_retries = raop->txStats().retries;
+            g_app.raop_tx_last_error = raop->txStats().last_error;
+            g_app.raop_repair_rejected = raop->repairStats().rejected;
+            g_app.raop_repair_pending = raop->pendingRepairs();
             xSemaphoreGive(g_app.mutex);
         } else {
             // A busy UI is not a playback/power-state change. Keep the current
@@ -844,7 +850,7 @@ static void raop_sender_task(void *arg) {
             }
         }
 
-        raop->pollControlAndKeepalive();
+        raop->pollControlAndKeepalive(prebuffering || !raop->acceptFrames());
 
         // Start playback once >= 1.5s of PCM + >= 16KB MP3 is buffered (or >= 2.0s PCM),
         // while the remaining Icecast burst continues decoding into the 2MB PSRAM ringbuffer!

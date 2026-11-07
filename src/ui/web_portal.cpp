@@ -9,6 +9,10 @@
 #include <WebServer.h>
 #include <Update.h>
 #include <esp_system.h>
+#include <esp_heap_caps.h>
+#include <esp_ota_ops.h>
+#include "network_diagnostics.h"
+#include "artwork_fetcher.h"
 
 static WebServer s_server(80);
 
@@ -298,7 +302,7 @@ async function refreshState() {
     document.getElementById('telWifi').textContent = `${s.wifi_speed_mbps || 72} Mbps • ${s.wifi_phy_mode || '802.11n'} • Ch ${s.wifi_channel || 1} (${s.wifi_rssi || -55} dBm)`;
     document.getElementById('telPcm').textContent = s.sonos_native && !s.local_monitor ? 'Audio buffered by Sonos' : `${s.pcm_buf_kb || 0} / 2048 KB (${((s.pcm_buf_ms || 0)/1000).toFixed(1)}s)`;
     document.getElementById('telMp3').textContent = s.sonos_native && !s.local_monitor ? 'Local monitoring off' : `${((s.mp3_buf_bytes || 0)/1024).toFixed(1)} / 256 KB • ${s.bitrate_kbps || 128} kbps`;
-    document.getElementById('telRaop').textContent = s.sonos_native ? 'Sonos radio • playing directly on speaker' : `${s.raop_connected ? (s.raop_is_ap2 ? 'AP2 ChaCha20' : 'AP1 AES') : 'Idle'} • Pkts ${s.raop_pkts_sent || 0} • NTP ${s.raop_ntp_replies || 0} • Retx ${s.raop_retransmits || 0}`;
+    document.getElementById('telRaop').textContent = s.sonos_native ? 'Sonos radio • playing directly on speaker' : `${s.raop_connected ? (s.raop_is_ap2 ? 'AP2 ChaCha20' : 'AP1 AES') : 'Idle'} • Accepted ${s.raop_tx_accepted || 0} • Local rejects ${s.raop_tx_rejected || 0} • NTP ${s.raop_ntp_replies || 0} • Retx ${s.raop_retransmits || 0}`;
 
     if (s.pin_prompt_active) {
       document.getElementById('pinBox').style.display = 'block';
@@ -396,7 +400,7 @@ async function selectSpeaker(idx) {
 
 async function scanSpeakers() {
   await api('/api/control', 'POST', { scan_speakers: true });
-  showToast('Scanning AirPlay speakers...');
+  showToast(state.playing && !state.sonos_native ? 'Scan queued; pause playback to scan' : 'Scanning AirPlay speakers...');
   setTimeout(refreshState, 3500);
 }
 
@@ -592,6 +596,8 @@ static void handle_status() {
         lv_mem_monitor(&ui_mem);
         bsp_lvgl_unlock();
     }
+    const auto driver = network_tx_snapshot();
+    const auto art = artwork_diagnostics();
     String json;
     json.reserve(6144);
 
@@ -599,10 +605,39 @@ static void handle_status() {
         char esc1[160], esc2[160], esc3[280];
         json += "{";
         json += "\"build\":\"" AIRPLAYKNOB_BUILD_ID "\",";
+        json += "\"running_partition\":\""; json += esp_ota_get_running_partition()->label; json += "\",";
         json += "\"uptime_ms\":"; json += String(millis()); json += ",";
         json += "\"reset_reason\":"; json += String((int)esp_reset_reason()); json += ",";
         json += "\"free_heap\":"; json += String(ESP.getFreeHeap()); json += ",";
         json += "\"min_free_heap\":"; json += String(ESP.getMinFreeHeap()); json += ",";
+        json += "\"driver_tx_submitted\":"; json += String(driver.submitted); json += ",";
+        json += "\"driver_tx_accepted\":"; json += String(driver.accepted); json += ",";
+        json += "\"driver_tx_rejected\":"; json += String(driver.rejected); json += ",";
+        json += "\"driver_tx_last_error\":"; json += String(driver.last_error); json += ",";
+        json += "\"mdns_tx_submitted\":"; json += String(driver.mdns_submitted); json += ",";
+        json += "\"mdns_tx_rejected\":"; json += String(driver.mdns_rejected); json += ",";
+        json += "\"speaker_scan_count\":"; json += String(g_app.speaker_scan_count); json += ",";
+        json += "\"speaker_scan_last_ms\":"; json += String(g_app.speaker_scan_last_ms); json += ",";
+        json += "\"raop_tx_accepted\":"; json += String(g_app.raop_tx_accepted); json += ",";
+        json += "\"raop_tx_rejected\":"; json += String(g_app.raop_tx_rejected); json += ",";
+        json += "\"raop_tx_retries\":"; json += String(g_app.raop_tx_retries); json += ",";
+        json += "\"raop_tx_last_error\":"; json += String(g_app.raop_tx_last_error); json += ",";
+        json += "\"raop_repair_rejected\":"; json += String(g_app.raop_repair_rejected); json += ",";
+        json += "\"raop_repair_pending\":"; json += String(g_app.raop_repair_pending); json += ",";
+        json += "\"artwork_kind\":"; json += String(art.kind); json += ",";
+        json += "\"artwork_seq\":"; json += String(artwork_get_seq()); json += ",";
+        json += "\"artwork_jpeg_seq\":"; json += String(artwork_get_jpeg_seq()); json += ",";
+        json += "\"artwork_attempts\":"; json += String(art.attempts); json += ",";
+        json += "\"artwork_failures\":"; json += String(art.failures); json += ",";
+        json += "\"artwork_http_status\":"; json += String(art.http_status); json += ",";
+        json += "\"artwork_decode_error\":"; json += String(art.decode_error); json += ",";
+        json += "\"artwork_tls_psram_allocations\":"; json += String(art.tls_psram_allocations); json += ",";
+        json += "\"largest_internal_block\":"; json += String(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)); json += ",";
+        json += "\"speaker_scan_deferred\":"; json += g_app.speaker_scan_deferred ? "true," : "false,";
+        json += "\"wifi_scan_deferred\":"; json += g_app.wifi_scan_deferred ? "true," : "false,";
+        json += "\"speaker_scanning\":"; json += g_app.speaker_scanning ? "true," : "false,";
+        json += "\"wifi_scanning\":"; json += g_app.wifi_scanning ? "true," : "false,";
+        json += "\"wifi_scan_done_seq\":"; json += String(g_app.wifi_scan_done_seq); json += ",";
         json += "\"ui_heap_free\":"; json += have_ui_mem ? String(ui_mem.free_size) : "null"; json += ",";
         json += "\"ui_heap_max_used\":"; json += have_ui_mem ? String(ui_mem.max_used) : "null"; json += ",";
         json += "\"tab\":"; json += String(knob_ui_get_tab()); json += ",";
@@ -930,9 +965,24 @@ static void handle_ota_upload() {
     }
 }
 
+static void handle_artwork_image() {
+    uint8_t *jpeg = (uint8_t *)heap_caps_malloc(64 * 1024, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint32_t seq = 0;
+    size_t n = jpeg ? artwork_copy_jpeg(jpeg, 64 * 1024, &seq) : 0;
+    if (!n) s_server.send(404, "text/plain", "Artwork not yet available");
+    else {
+        s_server.sendHeader("Cache-Control", "no-store");
+        s_server.setContentLength(n);
+        s_server.send(200, "image/jpeg", "");
+        s_server.sendContent((const char *)jpeg, n);
+    }
+    heap_caps_free(jpeg);
+}
+
 void web_portal_start(void) {
     s_server.on("/", HTTP_GET, handle_root);
     s_server.on("/api/status", HTTP_GET, handle_status);
+    s_server.on("/api/artwork.jpg", HTTP_GET, handle_artwork_image);
     s_server.on("/api/screenshot.bmp", HTTP_GET, handle_screenshot_bmp);
     s_server.on("/api/control", HTTP_POST, handle_control);
     s_server.on("/api/presets", HTTP_POST, handle_presets);

@@ -397,6 +397,10 @@ bool RaopClient::connect(const AirPlaySpeaker &spk, int initial_volume_pct) {
     m_pkts_sent = 0;
     m_ntp_replies = 0;
     m_retransmits = 0;
+    m_audio_tx = {}; m_repair_tx = {};
+    m_pending_repairs = 0; m_repair_cursor = 0;
+    m_last_repair_us = 0; m_last_reject_us = 0;
+    if (m_backlog) memset(m_backlog, 0, BACKLOG_SIZE * sizeof(BacklogSlot));
     m_latency_frames = 44100;
 
     m_peer_ip_addr = inet_addr(spk.ip);
@@ -2367,6 +2371,8 @@ bool RaopClient::sendChunk(const int16_t *stereo_pcm_352) {
 
     if (m_backlog) {
         BacklogSlot &slot = m_backlog[m_seq_num % BACKLOG_SIZE];
+        if (slot.repair_pending && m_pending_repairs) --m_pending_repairs;
+        slot.repair_pending = false;
         slot.seq = m_seq_num;
         slot.len = (uint16_t)total_len;
         slot.last_sent_us = 0;
@@ -2391,15 +2397,18 @@ bool RaopClient::sendChunk(const int16_t *stereo_pcm_352) {
     int sent = sendto(m_audio_sock, rtp_pkt, total_len, 0, (struct sockaddr *)&dst, sizeof(dst));
     for (int retry = 0; sent < 0 && (errno == ENOMEM || errno == EAGAIN) && retry < 4; retry++) {
         s_tx_retry_1s++;
+        m_audio_tx.retries++;
         s_last_errno = errno;
         vTaskDelay(pdMS_TO_TICKS(1));
         sent = sendto(m_audio_sock, rtp_pkt, total_len, 0, (struct sockaddr *)&dst, sizeof(dst));
     }
-    if (sent > 0) {
+    const bool accepted = m_audio_tx.record(sent, total_len, sent < 0 ? errno : EIO);
+    if (accepted) {
         s_tx_ok_1s++;
     } else {
         s_tx_drop_1s++;
-        s_last_errno = errno;
+        s_last_errno = m_audio_tx.last_error;
+        m_last_reject_us = esp_timer_get_time();
     }
 
     m_head_ts += RAOP_CHUNK_FRAMES;
@@ -2423,61 +2432,70 @@ bool RaopClient::sendChunk(const int16_t *stereo_pcm_352) {
         s_tx_retry_1s = 0;
         s_tx_drop_1s = 0;
     }
-    return true;
+    return accepted;
 }
 
 void RaopClient::handleControlSocket() {
     if (!m_connected || m_ctrl_sock < 0) return;
-
     uint8_t buf[64];
-    int pkts_resent = 0;
-    uint64_t now_us = esp_timer_get_time();
-    // Always drain ALL pending UDP datagrams from m_ctrl_sock so unread pbufs never accumulate in Internal SRAM
-    while (true) {
+    // Read at most 32 requests per turn so a flood cannot starve original audio.
+    for (int requests = 0; requests < 32; ++requests) {
         int n = recv(m_ctrl_sock, buf, sizeof(buf), MSG_DONTWAIT);
         if (n <= 0) break;
-        if (n < 8) continue;
-        if ((buf[1] & 0x7F) == 0x55 && m_backlog) {
-            uint16_t first = ((uint16_t)buf[4] << 8) | buf[5];
-            uint16_t cnt   = ((uint16_t)buf[6] << 8) | buf[7];
-            if (cnt > 32) cnt = 32;
-            struct sockaddr_in dst = {};
-            dst.sin_family = AF_INET;
-            dst.sin_addr.s_addr = m_peer_ip_addr;
-            dst.sin_port = htons(m_ap2 ? m_remote_audio_port : m_remote_ctrl_port);
-
-            for (uint16_t i = 0; i < cnt && pkts_resent < 8; i++) {
-                uint16_t target = first + i;
-                BacklogSlot &slot = m_backlog[target % BACKLOG_SIZE];
-                if (slot.seq == target && slot.len > 0 && m_rtp_pkt) {
-                    // Deduplicate redundant 0x55 requests for the same sequence number within 15ms of a retransmit
-                    if (slot.last_sent_us > 0 && (now_us - slot.last_sent_us) < 15000ULL) {
-                        continue;
-                    }
-                    slot.last_sent_us = now_us;
-                    if (m_ap2) {
-                        // AirPlay 2 resends the encrypted RTP packet directly to dataPort
-                        sendto(m_audio_sock, slot.data, slot.len, 0, (struct sockaddr *)&dst, sizeof(dst));
-                    } else {
-                        uint8_t *retr = m_rtp_pkt;
-                        retr[0] = 0x80;
-                        retr[1] = 0x56 | 0x80;
-                        retr[2] = 0x00;
-                        retr[3] = 0x01;
-                        memcpy(retr + 4, slot.data, slot.len);
-                        sendto(m_ctrl_sock, retr, 4 + slot.len, 0, (struct sockaddr *)&dst, sizeof(dst));
-                    }
-                    m_retransmits++;
-                    pkts_resent++;
-                }
+        if (n < 8 || (buf[1] & 0x7F) != 0x55 || !m_backlog) continue;
+        uint16_t first = ((uint16_t)buf[4] << 8) | buf[5];
+        uint16_t count = ((uint16_t)buf[6] << 8) | buf[7];
+        if (count > 32) count = 32;
+        for (uint16_t i = 0; i < count; ++i) {
+            uint16_t target = first + i;
+            BacklogSlot &slot = m_backlog[target % BACKLOG_SIZE];
+            if (slot.seq == target && slot.len && !slot.repair_pending) {
+                slot.repair_pending = true;
+                ++m_pending_repairs;
             }
         }
     }
 }
 
-void RaopClient::pollControlAndKeepalive() {
+void RaopClient::sendPendingRepair() {
+    const uint64_t now = esp_timer_get_time();
+    if (!m_pending_repairs || !m_backlog || !m_rtp_pkt ||
+        now - m_last_repair_us < 8000ULL ||
+        (m_last_pkt_us && now - m_last_pkt_us < 4000ULL) ||
+        (m_last_reject_us && now - m_last_reject_us < 20000ULL)) return;
+    for (int i = 0; i < BACKLOG_SIZE; ++i) {
+        BacklogSlot &slot = m_backlog[m_repair_cursor++ % BACKLOG_SIZE];
+        if (!slot.repair_pending || (slot.last_sent_us && now - slot.last_sent_us < 15000ULL)) continue;
+        struct sockaddr_in dst = {};
+        dst.sin_family = AF_INET; dst.sin_addr.s_addr = m_peer_ip_addr;
+        dst.sin_port = htons(m_ap2 ? m_remote_audio_port : m_remote_ctrl_port);
+        const uint8_t *data = slot.data;
+        int len = slot.len;
+        if (!m_ap2) {
+            m_rtp_pkt[0] = 0x80; m_rtp_pkt[1] = 0xD6;
+            m_rtp_pkt[2] = 0; m_rtp_pkt[3] = 1;
+            memcpy(m_rtp_pkt + 4, slot.data, slot.len);
+            data = m_rtp_pkt; len += 4;
+        }
+        int n = sendto(m_ap2 ? m_audio_sock : m_ctrl_sock, data, len, 0,
+                       (struct sockaddr *)&dst, sizeof(dst));
+        m_last_repair_us = now;
+        if (m_repair_tx.record(n, len, n < 0 ? errno : EIO)) {
+            slot.last_sent_us = now;
+            slot.repair_pending = false;
+            --m_pending_repairs;
+            ++m_retransmits;
+        } else {
+            m_last_reject_us = now;
+        }
+        return; // One paced repair, after original audio has had its turn.
+    }
+}
+
+void RaopClient::pollControlAndKeepalive(bool allow_repair) {
     if (!m_connected) return;
     handleControlSocket();
+    if (allow_repair) sendPendingRepair();
 
     uint64_t now_us = esp_timer_get_time();
     static uint64_t s_last_rtsp_poll_us = 0;
@@ -2547,8 +2565,8 @@ void RaopClient::timingTaskLoop() {
             rsp.recv_frac = htonl(frac);
             rsp.send_sec = htonl(sec);
             rsp.send_frac = htonl(frac);
-            sendto(m_time_sock, &rsp, sizeof(rsp), 0, (struct sockaddr *)&client_in, clen);
-            m_ntp_replies++;
+            if (sendto(m_time_sock, &rsp, sizeof(rsp), 0, (struct sockaddr *)&client_in, clen) == sizeof(rsp))
+                m_ntp_replies++;
         }
     }
 }
