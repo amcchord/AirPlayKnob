@@ -198,7 +198,7 @@ target after r9/app0, but original API lacks build, uptime and active-slot
 fields. Inspect OTA metadata before a direct USB flash; do not infer the slot
 from these historical commands.
 
-The original version is currently installed. Its five-minute HomePod test
+At the end of that comparison, the original version was left installed. Its five-minute HomePod test
 also failed audibly, with empty buffers and reconnect behavior. Original
 packet counters do not measure accepted sends, and counter decreases prevent
 simple endpoint subtraction for underruns. Sum observed positive increments
@@ -210,5 +210,17 @@ retained `artifacts/firmware/pcm512-2026-11-07-r9/firmware.bin` using the same
 OTA form. Check expected `pcm512-20261107-r9` build, fresh uptime,
 `running_partition`, PCM capacity, saved output/preset/volume and audible
 playback. Exact restoration SHA-256 and prior tests are in current state.
-This restoration was prepared but not performed; original firmware was left
-installed for the user.
+The restoration was subsequently completed through USB after wireless OTA
+timed out. OTA sequence 6 selected app1 at `0x610000`; writing only that
+application passed flash-hash verification and the API reported restored r9 /
+app1. Saved station/volume were preserved. **app1 is current**, and a failed
+OTA may have partially written app0: use verified host images for rollback.
+
+Workshop Sonos was verified through its device description and actual mDNS
+reply but missed ordinary knob scans. Relaying the genuine discovery records
+during a paused scan made it available without modifying firmware. Existing
+selection/API then saved Workshop normally. With native preference enabled,
+wait for receiver PLAYING after any TRANSITIONING state before beginning a
+health check. The restoration check verified Fluid URI, volume/unmute,
+artwork and stable native state for 68.68 seconds. No generic AirPlay fix was
+claimed.

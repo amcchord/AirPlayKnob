@@ -393,3 +393,49 @@
   artifact directory. Current state, network audit and legacy-OTA runbook
   updated; published this comparison in PR #1 / issue #2. No firmware fixes or
   main merge in this comparison. Next experiment should hold AP/workload fixed.
+
+
+## 2026-11-07 — Restoring smart Sonos firmware (in progress)
+
+- User requested returning to firmware supporting smart Sonos mode. Restore
+  the verified retained r9 image, source `7e4158e`, then select the verified
+  Workshop Sonos Five with `prefer_sonos_native=true`, preserving NVS station
+  and volume. Original main test image remains retained for rollback.
+- Verified Workshop device description: Sonos, Inc. / Sonos Five. Original
+  knob status requests time out despite HTTP response headers, so preserve
+  NVS without overwriting unknown live station/volume; read restored values
+  after boot. Reusing the exact previously built/tested r9 image, SHA-256
+  `215b77a783a4d05b01dbaf7deba78f65cb7f998930a6667e09ff7af06177d7b1`.
+  No source changes or rebuild. OTA upload and post-boot checks in progress;
+  private evidence in `artifacts/firmware/sonos-smart-restore-2026-11-07/`.
+
+
+## 2026-11-07 — Smart Sonos restored over USB and receiver checked
+
+- Restored exact r9/source `7e4158e` image at the user's request. Wireless OTA
+  timed out after 240 seconds with no acknowledgment; post-attempt status was
+  unavailable. USB confirmed S3 MAC 28:84:85:4b:e3:44. OTA entries 5/6 (valid
+  states/CRCs) select app1. Wrote only app1 at 0x610000 through ROM/no-stub,
+  passed flash-hash verification, rebooted, then observed expected build and
+  app1 over API. Preserved NVS and observed preset 19 / volume 24 intact.
+- Ordinary scans missed the verified Workshop Sonos Five. Queried its actual
+  mDNS advertisement directly, verified Workshop PTR / port 7000 / IP, then
+  relayed those genuine records to the knob during a paused scan. Workshop
+  appeared and was selected through the existing API. No source/firmware
+  changes or built-in location seed; discovery reliability remains open.
+- Enabled `prefer_sonos_native=true`, resumed Workshop and verified native
+  route with local monitoring off. Initial SOAP state TRANSITIONING was not
+  counted as a passing playback check; waited for receiver PLAYING first.
+  Twelve checks over 68.68 seconds then verified PLAYING, exact Fluid URI,
+  volume 24 / unmuted, zero new underruns, no observed reset and album art.
+  Acoustic confirmation requested; no audible pass inferred from telemetry.
+- Exact image hash remains
+  `215b77a783a4d05b01dbaf7deba78f65cb7f998930a6667e09ff7af06177d7b1`.
+  Reused previously passing host/build image without rebuild. Private USB,
+  metadata, discovery and native health evidence retained in ignored
+  `artifacts/firmware/sonos-smart-restore-2026-11-07/`. Original source/image
+  retained for rollback. Failed OTA may have partially changed inactive app0;
+  use retained host images, not an assumed usable alternate slot.
+- Updated current state/runbook and published device-state follow-up to
+  existing PR #1 / issue #2. Native Sonos remains the working route; broad
+  AirPlay/HomePod remains unresolved. Next action: keep smart Sonos selected.

@@ -210,8 +210,10 @@ field exists to verify AP identity. Buffer sizes, source behavior and network
 conditions were not isolated variables. The old November 3 encoder regression
 also remains present in this intentionally unmodified baseline.
 
-Original firmware remains installed for the user's comparison; r9's verified
-restoration image is retained. Exact original source/dependency manifest,
+Original firmware was left installed at the end of this comparison. The user
+subsequently requested smart Sonos again; r9 was restored via USB into app1
+and Workshop native playback was verified. See current state/runbook for the
+latest deployment; this historical test remains a failed AirPlay result. Exact original source/dependency manifest,
 image/ELF, build log and private JSON/CSV/assessment are in ignored
 `artifacts/firmware/og-main-2026-11-07/`. Original image SHA-256:
 `c9fb563e92e8c5a43f4ec37420f821a7e84988a09667bd07a1007366d9fa2a6d`.
