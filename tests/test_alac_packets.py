@@ -1,18 +1,24 @@
 """Decode firmware ALAC packets with FFmpeg, using both RAOP and default cookies.
 
 Run: python3 tests/test_alac_packets.py [path/to/raop_AnySpeaker.cpp]
+Historical comparisons: add --frames 352 --decoder-frame-length 352 (or 4096).
 Requires a host C++ compiler and ffmpeg. All generated files stay in scratch/.
 """
+import argparse
 import pathlib
 import random
 import shutil
 import struct
 import subprocess
-import sys
 import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-source = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / 'src/audio/raop_AnySpeaker.cpp'
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('source', nargs='?', type=pathlib.Path, default=ROOT / 'src/audio/raop_AnySpeaker.cpp')
+parser.add_argument('--frames', nargs='+', type=int, choices=(1, 352), default=[1, 352])
+parser.add_argument('--decoder-frame-length', nargs='+', type=int, choices=(352, 4096), default=[352, 4096])
+args = parser.parse_args()
+source = args.source
 text = source.read_text()
 start = text.index('static int encode_pcm_to_alac_raw(')
 end = text.index('// --- SRP-6a', start)
@@ -64,9 +70,9 @@ int main(int argc, char **argv) {
     checks = 0
     for name, samples in patterns.items():
         pcm = struct.pack('<704h', *samples)
-        for frames in (1, 352):
+        for frames in args.frames:
             packet = subprocess.check_output([str(temp / 'encode'), str(frames)], input=pcm)
-            for cookie_frames in (352, 4096):
+            for cookie_frames in args.decoder_frame_length:
                 (temp / 'packet.caf').write_bytes(caf(packet, frames, cookie_frames))
                 result = subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-i',
                     str(temp / 'packet.caf'), '-f', 's16le', '-y', str(temp / 'decoded.raw')],
@@ -74,4 +80,4 @@ int main(int argc, char **argv) {
                 assert result.returncode == 0, (name, frames, cookie_frames, result.stderr)
                 assert (temp / 'decoded.raw').read_bytes() == pcm[:frames * 4], (name, frames, cookie_frames)
                 checks += 1
-    print(f'PASS: {checks} bit-exact ALAC decodes (352- and 4096-frame decoder defaults).')
+    print(f'PASS: {checks} bit-exact ALAC decodes (packet frames={args.frames}; decoder defaults={args.decoder_frame_length}).')

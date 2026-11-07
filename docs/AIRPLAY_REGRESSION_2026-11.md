@@ -29,6 +29,22 @@ The fix restores explicit counts for all AirPlay outputs. The checked-in
 `tests/test_alac_packets.py` also covers one-frame packets and runs 12
 bit-exact decoder cases, protecting both decoder configurations.
 
+To reproduce a historical cell with the same harness, extract its source
+and choose the packet and decoder lengths explicitly (requires FFmpeg and
+a host C++ compiler):
+
+```sh
+mkdir -p scratch
+git show 412ad20:src/audio/raop_AnySpeaker.cpp > scratch/october-raop.cpp
+python3 tests/test_alac_packets.py scratch/october-raop.cpp --frames 352 --decoder-frame-length 4096
+git show 416c2ad:src/audio/raop_AnySpeaker.cpp > scratch/november-raop.cpp
+python3 tests/test_alac_packets.py scratch/november-raop.cpp --frames 352 --decoder-frame-length 4096
+```
+
+The October command passes; the November command is expected to fail.
+Selecting `--decoder-frame-length 352` passes for both revisions. The normal
+test command without arguments validates the current encoder's full matrix.
+
 ## Other changes in the regression window
 
 `f8a23d8` introduced HomePod AirPlay 2 support on October 26. `d5bbe90` enlarged
@@ -77,6 +93,12 @@ available APs exhibited trouble. Smaller queues, QoS changes, AP changes,
 and PHY experiments did not establish a reliable general Wi-Fi fix. Adding a
 larger buffer cannot repair a sustained input-rate deficit. The exact driver,
 RF, or scheduling cause remains unresolved.
+
+The November 7 r3 live test explicitly disabled native radio on Workshop.
+AirPlay 2 completed setup and timing, but 20 status samples recorded nine new
+buffer underruns with sustained UDP send failures and retransmissions. The
+remaining generic transport work is tracked in
+[issue #2](https://github.com/amcchord/AirPlayKnob/issues/2).
 
 The platform had been specified only as `espressif32`, which did not capture
 the installed pioarduino fork. It is now pinned to the actual 55.03.38-1

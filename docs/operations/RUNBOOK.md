@@ -94,3 +94,27 @@ Retain the known-working native firmware/settings while diagnosing the relay.
 
 See the [historical regression audit](../AIRPLAY_REGRESSION_2026-11.md) for
 confirmed defects, unresolved Wi-Fi trouble, and the receiver test matrix.
+
+
+## Current deployed r5 image
+
+Source commit `1e692db`, build `airplay-compat-20261107-r5`, is retained in
+`artifacts/firmware/airplay-compat-2026-11-07-r5/` with the image/ELF, source
+hash manifest and integration-check results. The exact firmware SHA-256 is
+`51529abf8b1258eac664a34856fff160003ac2d3abbbc281de57227d4b91a60f`.
+The previous working native r2 image remains in
+`artifacts/firmware/workshop-2026-11-07/firmware.bin` for rollback. Neither
+artifact directory is tracked or published. Follow the app0/OTA checks above
+before using any retained image.
+
+The active output and intended native route are distinct: `sonos_native`
+means connected playback; `sonos_radio_selected` also covers connecting and
+recovery. Without local monitoring, the decoder stops its existing download
+as soon as the native route is selected. r5 verified AirPlay-to-native handoff
+in 4.48 seconds; standard AirPlay remains subject to the failure in issue #2.
+
+For serial diagnostics, send a leading newline before `STATUS` or `REBOOT`
+and flush the host writer, then verify the response. Never count an issued
+command as a completed restart: check the acknowledged reboot, uptime decrease
+and reset reason. The final r5 software reboot reported reset reason 3 while
+Sonos stayed PLAYING across all 40 receiver-state observations.

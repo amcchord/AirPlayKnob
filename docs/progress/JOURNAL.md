@@ -135,3 +135,38 @@
   the Sonos handshake, including recovery from AirPlay. Active transport and
   selected route remain separate telemetry. r4 build/protocol checks pass;
   device handoff and final sustained verification are next.
+
+
+### 2026-11-07 — Final publication and r5 verification
+
+- Published native-routing recovery changes as `b12dcc8` and `1e692db`.
+  An intermediate r4 candidate was flashed, then superseded before handoff
+  qualification: the active HTTP download loop also needed the routing-intent
+  guard. Final build is `airplay-compat-20261107-r5`, source `1e692db`.
+- Deployed r5 by hash-verified app0 USB write, preserving NVS/OTA selection.
+  Firmware SHA-256:
+  `51529abf8b1258eac664a34856fff160003ac2d3abbbc281de57227d4b91a60f`.
+  Source manifest, ELF/image and integration results are retained under ignored
+  `artifacts/firmware/airplay-compat-2026-11-07-r5/`. No private compile-time
+  credentials were included in this build; saved device Wi-Fi was preserved.
+- Live r5 checks passed: 36 UI transitions without reset/new underruns, volume
+  change/restore, explicit AirPlay connection/timing, native handoff with local
+  downloading stopped (4.48 seconds after the control request), and optional
+  local visualizer monitoring followed by stopping its decoder.
+- The standard AirPlay experiment still showed UDP ENOMEM, retransmission
+  pressure and buffer depletion; native playback was restored. Issue #2
+  retains this unresolved failure and the generic receiver acceptance matrix.
+- A first final-check serial REBOOT command was not acknowledged; uptime did
+  not reset, so that attempt was not counted as a reboot. Retried on a fresh
+  serial connection with a leading newline, then verified the reboot message,
+  decreasing uptime, software reset reason 3, persisted transport/playback, and
+  all 40 receiver polls remaining PLAYING. A subsequent 30-second native
+  observation passed with no new underruns or reset. No spontaneous reset was
+  observed or inferred from these harness interruptions.
+- GitHub Linux validation passed all 12 ALAC and 16 RTSP checks plus the
+  credential-free firmware build for source `1e692db`. Added historical decoder
+  options and exact reproduction commands; independently confirmed the older
+  source passes and the November encoder fails with a 4096-frame default.
+- Final device state: Workshop, Groove Salad, volume 16, native radio on,
+  local monitoring off. PR #1 contains the published fix/audit; main has not
+  been merged. Generic AirPlay restoration remains explicitly open in issue #2.
