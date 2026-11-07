@@ -1,5 +1,9 @@
 # Local network-stack audit — November 7, 2026
 
+The r7/r8 findings below retain their original buffer sizes and test scope.
+The [r9 HomePod follow-up](#r9-homepod-follow-up--512-kib-pcm) records the
+current 512 KiB deployment and failed sustained-playback test.
+
 ## Confirmed findings
 
 The earlier data did **not** establish an over-the-air packet-loss rate.
@@ -79,7 +83,7 @@ an external-allocation failure cannot fall back into scarce network-driver
 RAM. Other tasks' TLS and AirPlay pairing retain the existing allocator.
 The SDK free hook supports either heap, as shown in Espressif's
 [memory-port source](https://github.com/espressif/esp-idf/blob/v5.5.4/components/mbedtls/port/esp_mem.c).
-Art jobs require internal headroom, wait for a six-second source cushion
+In r8, art jobs require internal headroom, wait for a six-second source cushion
 when the knob carries audio, and abort data writes below three seconds or
 during scan/OTA/reconfiguration work. Native Sonos-only playback has no local
 PCM requirement. Lower-priority artwork work does not hold the app-state mutex
@@ -115,3 +119,54 @@ methods under burst requests and failed sends. Existing ALAC/RTSP checks and
 credential-free firmware builds also run in GitHub Actions. Private live
 observations and exact image/source manifests remain in ignored firmware
 artifact directories.
+
+## r9 HomePod follow-up — 512 KiB PCM
+
+At the user's request, source `7e4158e` reduces PCM from 2 MiB to 512 KiB
+(2,972 ms usable). MP3 remains 256 KiB. Playback/rebuffering requires 1 second
+PCM with 16 KiB MP3 available, otherwise 1.5 seconds. Artwork starts at
+2 seconds PCM plus 32 KiB MP3 and aborts payload writes below 1 second PCM.
+Capacity labels and API diagnostics derive from the same configuration.
+The ring is still PSRAM: this does not directly increase internal/DMA memory.
+
+Deployed `pcm512-20261107-r9` over OTA into app0, preserving the user's
+Workshop HomePod (AudioAccessory5,1), preset 19 and volume 24. A real
+300.13-second monitor collected 126 successful snapshots. The first-to-last
+samples span 293.478 device seconds; these are the exact interval deltas:
+
+| Observation | Value |
+| --- | ---: |
+| New source underruns | 26 |
+| Additional locally rejected original submissions | 5,908 |
+| Additional driver rejections, all traffic/retries | 31,998 |
+| Observed PCM range | 1–2,968 ms |
+| Minimum compressed-input reserve | 0 bytes |
+| Maximum original-audio send gap since connection | 12,984 ms |
+| Maximum measured RTSP write since connection | 1 ms |
+| Speaker scan count, start/end | 1 / 1 |
+| Active speaker/Wi-Fi scan samples | 0 |
+| Observed device/session resets or receiver changes | 0 |
+
+The final underrun counter was 28 relative to an earlier post-boot checkpoint;
+that checkpoint predates the timed monitor, so its deltas are not the exact
+five-minute-window counts. One status request timed out. Album kind 2 was
+observed and decoder error stayed zero. The user confirmed choppy/intermittent
+audio. **The sustained-playback test failed; the smaller ring did not resolve
+the stalls.** Both compressed input and PCM deplete, so the result does not
+isolate MP3 decoder throughput as the cause. The RTSP write metric covers
+writes only, not every sender operation or wait.
+
+The reboot selected a different AP on the same channel. No AP/PHY policy was
+changed, but that prevents a controlled buffer-size A/B conclusion. The local
+rejection counts still cannot be treated as over-the-air loss rates. Further
+diagnostics should hold AP/workload constant and distinguish source-input
+starvation, sender scheduling, driver allocation eligibility and queue drain.
+HomePod remains selected with the requested smaller buffer; native Sonos is
+the previously verified fallback.
+
+Host regressions and the credential-free firmware build passed, including an
+eight-minute **simulated** actual-ring wraparound/stereo/saturation check;
+GitHub validation passed for deployed source. These checks do not override
+the failed live audio result. The exact image/ELF/source manifest and raw
+private JSON/CSV are retained in ignored
+`artifacts/firmware/pcm512-2026-11-07-r9/`.

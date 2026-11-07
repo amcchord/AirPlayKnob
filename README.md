@@ -78,7 +78,7 @@ No phone, companion app, or external server is required: the knob connects direc
 - **🔊 AirPlay 1 (RAOP) & AirPlay 2 Streaming Engine**:
   - **AirPlay 2 (`HomePod` / `HomePod mini` / `Apple TV` on OS 17–27+)**: Full HomeKit Transient Pair-Setup (`POST /pair-setup` TLV8 `M1..M4`, 3072-bit SRP-6a with SHA-512, HKDF-SHA-512 session keys), framed `ChaCha20-Poly1305` encrypted RTSP control & event channels, two-phase binary plist (`bplist00`) `SETUP`, and `ChaCha20-Poly1305` encrypted RTP audio frames.
   - **AirPlay 1 / RAOP (`Sonos`, `AirPort Express`, `ShairPort`, legacy receivers)**: Supports both `/auth-setup` Curve25519 ECDH (required by Sonos) and RSA-OAEP `AES-128-CBC` SDP `ANNOUNCE`.
-  - **Buffering & Async Control**: **2.0 MB PSRAM PCM ringbuffer** (~11.9 seconds of 44.1 kHz 16-bit stereo audio), **256 KB MP3 buffer**, 512-packet UDP retransmission backlog, dedicated Core 0 NTP timing responder task, and asynchronous RTSP control with sequence-matched synchronous responses.
+  - **Buffering & Async Control**: **512 KiB PSRAM PCM ringbuffer** (~2.97 seconds of 44.1 kHz 16-bit stereo audio), **256 KiB MP3 buffer**, 512-packet UDP retransmission backlog, dedicated Core 0 NTP timing responder task, and asynchronous RTSP control with sequence-matched synchronous responses. Startup/rebuffering uses 1–1.5 seconds; artwork waits for 2 seconds of PCM plus 32 KiB compressed reserve and yields below 1 second. Sustained HomePod playback still has underruns; see [issue #2](https://github.com/amcchord/AirPlayKnob/issues/2).
 - **Artwork and Network Diagnostics**:
   - Live album covers and station fallbacks work during native Sonos playback, with bounded background requests and large artwork HTTPS buffers in PSRAM.
   - Local socket/driver rejections are counted separately from attempts. Repairs are paced, and scan requests wait during AirPlay playback. See the [local network audit](docs/NETWORK_AUDIT_2026-11.md) for evidence and remaining limits.
@@ -224,7 +224,7 @@ AirPlayKnob/
 │   ├── audio/
 │   │   ├── artwork_fetcher.cpp # iTunes Search API + SomaFM JPEG decode + bilinear 360x360 upscale
 │   │   ├── plist_bin.c         # Binary plist encoder/decoder for AirPlay 2 SETUP handshakes
-│   │   ├── radio_streamer.cpp  # 2MB PSRAM ringbuffer, ICY parser, RTP pacing, async RTSP worker
+│   │   ├── radio_streamer.cpp  # 512 KiB PSRAM ringbuffer, ICY parser, RTP pacing, async RTSP worker
 │   │   └── raop_AnySpeaker.cpp # AirPlay 1 & 2 crypto, SRP-6a, ChaCha20-Poly1305, NTP sync
 │   ├── bsp/                    # Board Support Package (SH8601 QSPI, CST816S touch, DRV2605, I2S DAC)
 │   ├── crypto/                 # Curve25519 Donna implementation for Sonos /auth-setup

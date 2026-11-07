@@ -317,3 +317,33 @@
   ring across eight simulated minutes with wraparound/stereo/saturation checks.
   Credential-free firmware build, portal syntax and whitespace checks passed.
   Candidate r9 is ready; deployment and five-minute live qualification follow.
+
+
+## 2026-11-07 — r9 deployed; five-minute HomePod test reproduces interruptions
+
+- Published source `7e4158e` on `codex/workshop-audio`; GitHub Linux validation
+  passed (run 42404567449). Deployed `pcm512-20261107-r9` through accepted web
+  OTA, observed expected boot in app0 and verified 524,288-byte PCM capacity /
+  2,972 ms, unchanged 262,144-byte MP3 reserve and saved HomePod/preset/volume.
+  Firmware SHA-256:
+  `215b77a783a4d05b01dbaf7deba78f65cb7f998930a6667e09ff7af06177d7b1`.
+- Real HomePod monitoring ran 300.13 seconds with 126 successful snapshots;
+  first-to-last device uptime spans 293.478 seconds. That bounded interval
+  recorded 26 new underruns, 5,908 locally rejected original submissions and
+  31,998 all-traffic/retry driver rejections. Final underruns were 28 since the
+  earlier boot checkpoint; those checkpoint deltas include time before the
+  monitor. PCM reached 1 ms, MP3 zero, maximum original-send gap 12,984 ms and
+  maximum measured RTSP write 1 ms. Timing maxima cover the connection.
+- User confirmed choppy/intermittent HomePod audio. Album artwork appeared;
+  no device/session reset or output change was observed. One status request
+  timed out. Scan count stayed 1 with no active scan observed. The reboot
+  selected a different AP on the same channel, preventing a controlled
+  buffer-size A/B. No AP/PHY/antenna configuration changed.
+- The requested deployment and sustained test are complete, but sustained
+  AirPlay qualification failed. Leave 512 KiB/HomePod selected; do not claim
+  decoder, RTSP writes, RF or universal receiver compatibility isolated/fixed.
+  Exact manifests and private JSON/CSV retained in ignored r9 artifacts;
+  r8 rollback image retained. README/architecture, current state, audit and
+  runbook updated; published results to PR #1 and kept issue #2 open.
+- Next diagnostic: hold AP/workload constant while separating source-input
+  starvation, sender scheduling, internal/DMA allocation and TX queue drain.

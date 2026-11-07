@@ -2,7 +2,7 @@
 
 AirPlayKnob runs a simultaneous real-time internet radio MP3 decoder, an AirPlay 1 / AirPlay 2 cryptographic RTP transmitter, a live album art HTTP/JPEG pipeline, an embedded web server, and a **60 FPS** 360×360 circular touchscreen UI on a single **ESP32-S3** (240 MHz dual-core Xtensa LX7 with 512 KB internal SRAM and 8 MB Octal PSRAM).
 
-This document explains how CPU cores, memory hierarchies, DMA buses, and FreeRTOS tasks are partitioned so UI animations never stutter and audio never drops a frame.
+This document describes CPU cores, memory, DMA buses and FreeRTOS tasks. Sustained AirPlay reliability remains under investigation; the latest HomePod test reproduced audible interruptions and source underruns.
 
 ---
 
@@ -21,8 +21,14 @@ The current source creates these tasks (higher numbers have higher priority):
 | Arduino `loop()` | 1 | Framework default | Input, web portal and preferences |
 
 The framework also runs its own Wi-Fi/lwIP tasks. MP3 input uses a **256 KB
-PSRAM compressed buffer** plus a **2 MB PCM ring** (~11.89 seconds). Incoming
+PSRAM compressed buffer** plus a **512 KiB PCM ring** (~2.97 seconds). Incoming
 HTTP and outgoing audio therefore have separate tasks and bounded storage.
+`include/audio_buffer_config.h` defines capacity and thresholds together.
+Playback/rebuffering requires 1 second PCM with at least 16 KiB MP3 available,
+otherwise 1.5 seconds. Artwork starts with 2 seconds PCM plus 32 KiB MP3 and
+aborts payload writes below 1 second PCM. Native Sonos-only playback bypasses
+these local buffer requirements. Reducing PCM releases PSRAM, not the driver's
+internal/DMA memory, and did not resolve the sustained HomePod failure.
 
 Timing uses its own socket/task so it can respond while the sender handles
 control traffic. However, there is **no separate volume worker** in the
@@ -51,8 +57,8 @@ AirPlayKnob strictly separates allocations between **Internal SRAM** (zero wait-
 | **LVGL Double DMA Draw Buffers** | `2 × (360 × 40 × 2 B)` = `57.6 KB` | **Internal DMA SRAM** | Ping-pong 40-line strip buffers; CPU renders strip `N+1` while SPI DMA transmits strip `N` at 80 MHz |
 | **WhiteCap 3D Mesh & Vertex Tables** | `~4.6 KB` (`34×26` grid) | **Internal SRAM** | `s_wc_wave`, `s_wc_vx`, `s_wc_vy`, row Y-bounds, and RGB565 palette LUTs |
 | **Wi-Fi MAC & lwIP Buffers** | `~65 KB` | **Internal SRAM** | Initialized at boot before PSRAM/LVGL allocations to guarantee contiguous internal DMA memory |
-| **Decoded PCM Ringbuffer** | `2,097,152 B` (`2.0 MB`) | **Octal PSRAM** | 11.6 seconds of decoded 44.1 kHz 16-bit stereo audio |
-| **MP3 Stream Input Buffer** | `65,536 B` (`64 KB`) | **Octal PSRAM** | Sliding frame buffer for `minimp3` |
+| **Decoded PCM Ringbuffer** | `524,288 B` (`512 KiB`) | **Octal PSRAM** | 2.97 seconds of decoded 44.1 kHz 16-bit stereo audio; one frame reserved by the ring |
+| **MP3 Stream Input Buffer** | `262,144 B` (`256 KiB`) | **Octal PSRAM** | Compressed network-jitter reserve feeding `minimp3` |
 | **RAOP Retransmit Backlog** | `512 × 1,484 B` (`~760 KB`) | **Octal PSRAM** | Circular buffer of recent encrypted RTP audio packets for UDP `PT=0x55` retransmit requests |
 | **360×360 Album Art Canvas** | `259,200 B` (`253 KB`) | **Octal PSRAM** | Bilinear-upscaled RGB565 cover art + pre-composited bottom typography scrim |
 | **Screen Capture Mirror** | `259,200 B` (`253 KB`) | **Octal PSRAM** | Live copy of the 360×360 display updated during DMA flush for `/api/screenshot.bmp` and `SCREENSHOT` |

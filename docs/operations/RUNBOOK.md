@@ -10,12 +10,13 @@ Validated on 2026-11-06 with the attached ESP32-S3 knob. Read
 /Users/austinmcchord/.platformio/penv/bin/python tests/test_alac_packets.py
 /Users/austinmcchord/.platformio/penv/bin/python tests/test_rtsp_responses.py
 /Users/austinmcchord/.platformio/penv/bin/python tests/test_network_policy.py
+/Users/austinmcchord/.platformio/penv/bin/python tests/test_pcm_buffer.py
 git diff --check
 ```
 
 The decoder regression check requires FFmpeg and a host C++ compiler.
 The RTSP check runs 16 cases against the actual firmware transaction method.
-GitHub Actions runs both checks and a firmware build without private credentials.
+GitHub Actions runs protocol, network-policy and PCM-ring checks plus a firmware build without private credentials.
 Build dependencies are pinned in `platformio.ini`.
 `STATUS\n` over the USB serial port at 115200 baud reports the active speaker,
 packet and retransmission counters, PCM cushion, underruns, and available heap.
@@ -97,7 +98,7 @@ See the [historical regression audit](../AIRPLAY_REGRESSION_2026-11.md) for
 confirmed defects, unresolved Wi-Fi trouble, and the receiver test matrix.
 
 
-## Current deployed r5 image
+## Retained r5 image
 
 Source commit `1e692db`, build `airplay-compat-20261107-r5`, is retained in
 `artifacts/firmware/airplay-compat-2026-11-07-r5/` with the image/ELF, source
@@ -121,10 +122,10 @@ and reset reason. The final r5 software reboot reported reset reason 3 while
 Sonos stayed PLAYING across all 40 receiver-state observations.
 
 
-## Artwork and local-stack diagnostics (r8)
+## Artwork and local-stack diagnostics (r8 procedure)
 
 Read `docs/progress/CURRENT.md` for the latest image/hash. The r8 update was
-installed using the existing `/api/ota` multipart endpoint and runs in app1.
+installed using the existing `/api/ota` multipart endpoint and ran in app1.
 **The earlier app0 USB address is no longer the active-slot assumption.**
 Check `running_partition` in `/api/status` and inspect OTA metadata before
 any future direct flash. The updater chooses the inactive OTA partition;
@@ -156,3 +157,33 @@ telemetry. `raop_pkts_sent` remains a legacy original-attempt counter. The
 knob and portal now show accepted/queued originals and local rejects. Driver
 success is queue acceptance, not RF/receiver delivery. See the
 [network audit](../NETWORK_AUDIT_2026-11.md) for tested values and limits.
+
+## Current r9 PCM configuration and sustained checks
+
+`pcm512-20261107-r9`, source `7e4158e`, was deployed through the validated OTA
+upload above and now runs in **app0**. The previous r8 image is retained at
+`artifacts/firmware/art-network-2026-11-07-r8/firmware.bin`. Restoring through
+OTA uses the same multipart procedure; verify the resulting build, partition
+and saved output. Do not use an old USB address without checking the slot.
+
+Check `/api/status`: `pcm_capacity_bytes=524288`, `pcm_capacity_ms=2972`,
+`mp3_capacity_bytes=262144`, `pcm_start_ms=1000`,
+`artwork_start_pcm_ms=2000`, `artwork_start_mp3_bytes=32768`. Rebuffering uses
+1.5 seconds instead of 1 second when compressed reserve is below 16 KiB.
+Artwork payload writes yield below 1 second PCM; native-only Sonos still
+does not require local PCM. Capacity is allocated in PSRAM.
+
+For a live monitor, obtain a **fresh** connected-status baseline at the start
+of the timed interval. Sample for at least five minutes and retain uptime,
+selected receiver, PCM/MP3, underruns, socket/driver rejection, active/deferred
+scans, artwork state and `raop_max_audio_gap_ms` /
+`raop_max_control_write_ms`. Compare the first and last device uptime as well
+as wall time; a saved boot checkpoint may predate monitoring. Maximum timing
+fields cover the connection lifetime and are not necessarily window deltas.
+Preserve selection/preset/volume and confirm audible playback with the user.
+Record the AP before and after deployment to identify A/B confounders.
+
+The r9 five-minute HomePod run failed audibly and recorded repeated source
+underruns and local send rejections. Album art loaded and no reset was
+observed. Exact bounded results are in the network audit and current-state
+file; a successful build or connected session is not a sustained-audio pass.
