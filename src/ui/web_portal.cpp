@@ -637,6 +637,7 @@ static void handle_status() {
         json += "\"raop_connected\":"; json += (g_app.raop_connected ? "true" : "false"); json += ",";
         json += "\"raop_is_ap2\":"; json += (g_app.raop_is_ap2 ? "true" : "false"); json += ",";
         json += "\"sonos_native\":"; json += (g_app.sonos_native ? "true" : "false"); json += ",";
+        json += "\"sonos_radio_selected\":"; json += (g_app.sonos_radio_selected ? "true" : "false"); json += ",";
         json += "\"local_monitor\":"; json += (g_app.also_local_dac || g_app.whitecap_active) ? "true" : "false"; json += ",";
         json += "\"raop_pkts_sent\":"; json += String(g_app.raop_pkts_sent); json += ",";
         json += "\"raop_ntp_replies\":"; json += String(g_app.raop_ntp_replies); json += ",";

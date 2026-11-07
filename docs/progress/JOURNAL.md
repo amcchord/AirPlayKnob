@@ -111,3 +111,27 @@
   firmware build and whitespace checks pass. Private configuration literal
   scan found no matches in files being published. Device remains on working
   r2 pending r3 verification. No claim of universal receiver qualification.
+
+
+### 2026-11-07 — GitHub publication and explicit AirPlay live check
+
+- Committed source as `c7a4d55` and pushed `codex/workshop-audio`; opened
+  [PR #1](https://github.com/amcchord/AirPlayKnob/pull/1). GitHub's protocol
+  checks and credential-free firmware build passed on Linux.
+- Deployed `airplay-compat-20261107-r3`, firmware SHA-256
+  `67d7d4cc5126939948aec1e636e37fa24f220cd40204cc8ff7efb0f945a04b30`,
+  by hash-verified app0 write after checking OTA metadata. Saved station and
+  volume restored; 36 UI transitions, volume change/restore, explicit AirPlay
+  selection, and paused AirPlay preference persistence across reboot passed.
+- Standard AirPlay 2 completed setup and timing, but 20 live samples showed
+  nine new buffer underruns and sustained UDP ENOMEM/retransmission pressure.
+  This remains unresolved; tracked in
+  [issue #2](https://github.com/amcchord/AirPlayKnob/issues/2). Native mode was
+  restored. Its reconnect was slow while the local decoder kept downloading.
+- An extra operator-issued REBOOT interrupted the final sustained native
+  observation. That observation is not counted as passed and is being rerun.
+  No spontaneous reset was inferred from this interruption.
+- Added a native routing-intent state so local MP3 downloading stops before
+  the Sonos handshake, including recovery from AirPlay. Active transport and
+  selected route remain separate telemetry. r4 build/protocol checks pass;
+  device handoff and final sustained verification are next.

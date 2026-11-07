@@ -8,7 +8,7 @@
 #define MAX_PRESETS        48
 #define MAX_SPEAKERS       48
 #define MAX_WIFI_SCAN      20
-#define AIRPLAYKNOB_BUILD_ID "airplay-compat-20261107-r3"
+#define AIRPLAYKNOB_BUILD_ID "airplay-compat-20261107-r4"
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -100,6 +100,7 @@ struct AppState {
     bool raop_connected;
     bool raop_is_ap2;
     bool sonos_native;
+    bool sonos_radio_selected; // Includes native connection/recovery, before PLAYING.
     uint32_t raop_pkts_sent;
     uint32_t raop_ntp_replies;
     uint32_t raop_retransmits;

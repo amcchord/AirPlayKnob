@@ -205,7 +205,8 @@ static void http_decoder_task(void *arg) {
         bool boot_mdns_busy = false;
         if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
             want_play = g_app.playing && !g_app.ota_in_progress;
-            native_without_monitor = g_app.sonos_native && !g_app.also_local_dac && !g_app.whitecap_active;
+            native_without_monitor = (g_app.sonos_native || g_app.sonos_radio_selected) &&
+                                     !g_app.also_local_dac && !g_app.whitecap_active;
             wifi_ok = g_app.wifi_connected;
             uint32_t since_wifi = (g_app.wifi_connected_since_ms > 0) ? (millis() - g_app.wifi_connected_since_ms) : 0;
             boot_mdns_busy = wifi_ok && (g_app.speaker_scanning || since_wifi < 1400) && (ring_available_frames() == 0);
@@ -666,6 +667,12 @@ static void raop_sender_task(void *arg) {
             g_app.raop_connected = raop->isConnected();
             g_app.raop_is_ap2 = raop->isAirPlay2();
             g_app.sonos_native = sonos.isConnected();
+            // Stop the duplicate source download before the native handshake,
+            // rather than waiting until it succeeds. Otherwise recovery from
+            // a congested AirPlay stream keeps competing with local decoding.
+            g_app.sonos_radio_selected = prefer_sonos_native && !force_pin_reconnect &&
+                                        SonosRadioClient::isCandidate(spk) &&
+                                        strcmp(native_rejected_ip, spk.ip) != 0;
             g_app.raop_pkts_sent = raop->getPktsSent();
             g_app.raop_ntp_replies = raop->getNtpReplies();
             g_app.raop_retransmits = raop->getRetransmits();
