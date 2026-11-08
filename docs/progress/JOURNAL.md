@@ -448,3 +448,35 @@
   addition to the receiver/URI/volume/artwork checks already recorded.
 - No further device, firmware or playback changes. Keep Workshop on smart
   Sonos; generic AirPlay/HomePod and discovery work remain open in issue #2.
+
+
+## 2026-11-07 — Recovered after accidental foreign-project flash
+
+- User requested reflashing after accidentally installing another project.
+  Confirmed the original S3 MAC on /dev/cu.usbmodem14201; other attached USB
+  device was not touched. Port was briefly busy, then a retry succeeded.
+  Private first-64-KiB backup showed different bootloader/partition table and
+  all old NVS pages 0x9000–0xdfff blank. The foreign layout put OTA at 0x9000
+  and NVS at 0x390000; the previous app1 address could not simply be reused.
+- Restored matching saved r9 bootloader (0), partition table (0x8000), rebuilt
+  settings (0x9000), saved OTA initialization (0xe000) and exact r9 application
+  (0x10000). Five USB ROM write hashes verified. Reused source 7e4158e/image
+  SHA-256 215b77a783a4d05b01dbaf7deba78f65cb7f998930a6667e09ff7af06177d7b1.
+  No source changes/rebuild or full-flash erase. API confirmed r9 in app0.
+- Rebuilt NVS privately with the official Espressif generator, using existing
+  project Wi-Fi configuration and last verified Workshop/Fluid/volume-24
+  selection. Cached 30 presets match defaults. Speaker struct size/offsets
+  were checked; its model/host came from genuine recorded discovery. NVS
+  integrity check passed. Old erased AirPlay identity regenerates normally;
+  do not claim old pairing state preserved. Private material is ignored and
+  protected; no credentials were printed or committed.
+- Smart Sonos resumed automatically. Boot volume observed 18; API restored
+  last-known 24, then observed volume 8. First fixed-volume monitor stopped on
+  that control change, not transport failure. Left the current adjustment and
+  reran receiver checks allowing controls: 66.47 seconds / 13 samples all
+  PLAYING, correct Fluid URI, receiver matching current volume 8/unmuted,
+  album art, zero new underruns/reset. Screen/listening confirmation requested.
+- Recovery evidence retained in ignored accidental-reflash artifact directory;
+  current state/runbook and GitHub deployment notes updated. Next action:
+  leave native Workshop selected; app0 is now current. Generic AirPlay issue
+  remains unresolved and no new compatibility claim is made.

@@ -213,7 +213,7 @@ playback. Exact restoration SHA-256 and prior tests are in current state.
 The restoration was subsequently completed through USB after wireless OTA
 timed out. OTA sequence 6 selected app1 at `0x610000`; writing only that
 application passed flash-hash verification and the API reported restored r9 /
-app1. Saved station/volume were preserved. **app1 is current**, and a failed
+app1. Saved station/volume were preserved. **app1 was current at that restoration**, and a failed
 OTA may have partially written app0: use verified host images for rollback.
 
 Workshop Sonos was verified through its device description and actual mDNS
@@ -224,3 +224,34 @@ wait for receiver PLAYING after any TRANSITIONING state before beginning a
 health check. The restoration check verified Fluid URI, volume/unmute,
 artwork and stable native state for 68.68 seconds. No generic AirPlay fix was
 claimed.
+
+
+## Recovery after flashing another project
+
+The accidental-project recovery on 2026-11-07 changed the current slot to
+**app0**. Always read hardware identity and the actual partition table first.
+A foreign project may change the bootloader, app offsets and NVS location;
+application-only flashing at a historical address may not restore this app.
+The confirmed target S3 MAC is 28:84:85:4b:e3:44. Leave other USB devices alone.
+
+Back up the first 64 KiB into protected ignored artifacts before recovery.
+Compare the bootloader/table with the saved AirPlayKnob build. In this case
+all former NVS pages were blank; rebuild settings only from trusted existing
+project configuration and retained user settings, with credentials private.
+Generated NVS must match the 0x5000 partition and pass integrity validation.
+The recovery used Espressif's NVS generator in a project-contained environment.
+
+Validated separate writes for this layout: bootloader at 0, partition table
+at 0x8000, reconstructed NVS at 0x9000, OTA initialization at 0xe000 and the
+saved application at 0x10000. Use matching segments from the same validated
+factory build, check image hashes and let esptool verify every write. Do not
+write a combined factory image over existing settings when preserving them.
+The recovery manifest under `artifacts/firmware/accidental-reflash-2026-11-07/`
+records exact segments/hashes and protected settings sources. Original erased
+pairing identity is not recoverable from application images alone.
+
+After reboot verify expected build/app0, network, Workshop native mode,
+requested station/volume, receiver PLAYING/URI/volume/mute and artwork. Allow
+normal volume adjustments during monitoring; compare receiver volume with
+the knob's current request. This recovery passed 13 samples over 66.47 seconds
+with zero new underruns/reset, exact Fluid URI and current volume 8.

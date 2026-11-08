@@ -1,51 +1,54 @@
 # Current state — 2026-11-07
 
-**Smart Sonos playback restored.** Device runs `pcm512-20261107-r9`, source
-`7e4158e`, in **app1**. Selected **Workshop Sonos Five**, preset **19 (Fluid)**,
-volume **24**, `prefer_sonos_native=true`, `sonos_native=true`, local monitoring
-and WhiteCap off. Sonos fetches the station directly; zero local PCM/MP3 is
-intentional. The screen/portal should show **Audio buffered by Sonos**.
+**Recovered after an accidental flash of another project.** The knob again
+runs `pcm512-20261107-r9`, source `7e4158e`, now in **app0**. Workshop Sonos
+Five is selected in smart/native mode, preset **19 (Fluid)**, current volume
+**8**, local monitoring and WhiteCap off. Sonos fetches audio directly;
+zero local PCM/MP3 is intentional. Album art is active.
 
-Restored the exact retained/tested r9 image without rebuilding or changing
-source. Wireless upload timed out after 240 seconds without acknowledgment;
-completed through USB on the confirmed ESP32-S3 (MAC 28:84:85:4b:e3:44).
-Read OTA metadata: sequence 6 selects app1. Application-only write at
-`0x610000` passed flash-hash verification; NVS, bootloader, partition table
-and OTA selection were preserved. Restored build/app1 and preset/volume were
-then observed over the web API. Failed OTA may have partially written app0;
-do not assume that inactive slot contains a usable fallback.
+The foreign firmware replaced the bootloader/partition layout and erased the
+old AirPlayKnob settings area. Confirmed the S3 MAC 28:84:85:4b:e3:44 on
+`/dev/cu.usbmodem14201` before writing. Backed up the first 64 KiB privately.
+Restored the exact saved r9 bootloader/partition table, reconstructed NVS at
+0x9000, OTA initialization at 0xe000 and firmware at 0x10000. All five segment
+hash checks passed; generated NVS passed the official integrity check.
+The combined factory image was validated but not flashed over the settings.
 
-Workshop's Sonos description and genuine mDNS response were verified. The
-knob missed it in ordinary scans; relayed the receiver's verified discovery
-records during a paused scan to make selection available. No firmware seed
-or source change. The selected receiver is now saved by the normal UI/API
-selection path. This assistance is not a general discovery reliability fix.
+Reconstructed Wi-Fi from existing private project configuration and the last
+verified Workshop/Fluid settings. The cached 30 presets exactly match source
+defaults. The saved speaker record uses genuine previously verified discovery
+metadata, so it resumed native Sonos without a new discovery workaround or
+source seed. Original erased pairing identity cannot be preserved; firmware
+regenerates its controller identity normally. No firmware source change or
+rebuild. Other attached USB devices were left untouched.
 
-After the receiver finished TRANSITIONING, observed 12 native/receiver checks
-over **68.68 seconds**: every receiver sample PLAYING, exact Fluid stream URI,
-volume 24 / unmuted, zero new source underruns, no observed reset, album art
-kind 2 present. User then confirmed Workshop is playing steadily in smart
-Sonos mode. Generic AirPlay/HomePod failures remain unresolved.
+The initial restored volume was observed at 18, then set to last-known 24;
+it moved to 8 during verification. Kept the resulting current value instead
+of repeatedly forcing 24. An initial strict fixed-volume monitor stopped on
+that change; it was not a playback failure. The completed monitor then ran
+**66.47 seconds / 13 samples**, all receiver PLAYING, exact Fluid stream URI,
+receiver volume matching the knob, unmuted, zero new underruns or observed
+reset, and album art. Physical screen/listening confirmation was requested
+separately. Earlier smart Sonos playback had been user-confirmed steady.
 
-Firmware SHA-256:
+Exact firmware SHA-256:
 `215b77a783a4d05b01dbaf7deba78f65cb7f998930a6667e09ff7af06177d7b1`.
-Retained image/ELF/source/build validation:
-`artifacts/firmware/pcm512-2026-11-07-r9/` (ignored).
-Restoration manifest, OTA failure, USB/OTA metadata, discovery assistance,
-boot/native snapshots and checks:
-`artifacts/firmware/sonos-smart-restore-2026-11-07/` (ignored).
-Original main `416c2ad` rebuild remains retained in its linked worktree and
-`artifacts/firmware/og-main-2026-11-07/`; it is no longer installed. Other
-rollback images and original backups remain retained on the host.
+Saved image/ELF/source validation: `artifacts/firmware/pcm512-2026-11-07-r9/`.
+Recovery manifests, private backup/settings, flash/integrity logs and native
+checks: `artifacts/firmware/accidental-reflash-2026-11-07/` (ignored, protected).
+Previously retained images and original-main worktree remain available.
 
-The source still has 512 KiB PCM / 256 KiB MP3 and revised startup/artwork
-thresholds for controller audio. Both r9 and rebuilt original main failed
-five-minute HomePod tests; see the [network audit](../NETWORK_AUDIT_2026-11.md).
-Host/build checks passed for the exact reused r9 image; no source changes
-required a rebuild or repeated host suite during restoration.
+Generic AirPlay/HomePod reliability is still unresolved; both r9 and rebuilt
+original main failed five-minute HomePod tests. The source retains 512 KiB
+PCM / 256 KiB MP3 and revised startup/artwork thresholds for controller audio.
+No source changes required repeated host tests; this recovery reused the
+previously validated image and verified the actual flashed layout/settings.
 
-Git: root `codex/workshop-audio`, [PR #1](https://github.com/amcchord/AirPlayKnob/pull/1),
-main unmerged. Broader AirPlay/discovery work stays open in
+Root integration branch: `codex/workshop-audio`, published through
+[PR #1](https://github.com/amcchord/AirPlayKnob/pull/1), main unmerged.
+Broader transport/discovery work remains in
 [issue #2](https://github.com/amcchord/AirPlayKnob/issues/2).
-Next safe action: leave Workshop on smart Sonos playback. Before another
-USB flash, recheck `running_partition` and OTA metadata; app1 is current.
+Next safe action: leave Workshop in smart Sonos mode. Before any future flash,
+recheck hardware identity, partition table and OTA selection; **app0 is now
+current**, and another project's layout requires recovery before application
+addresses from this project can be assumed.
