@@ -159,6 +159,27 @@ The later [network audit](NETWORK_AUDIT_2026-11.md) supersedes any implication
 that the older attempted-send or repair counts measure RF loss. The controlled
 r7 test observed local socket and driver rejections while discovery was
 explicitly deferred. Pacing repairs kept source buffers full during the short
-observation, but driver pressure and broader AirPlay reliability remain open.
-Album artwork was restored and confirmed visible by the user. The current
-working output remains native Sonos radio.
+observation, but driver pressure and broader AirPlay reliability remained open
+on November 7. Album artwork was restored and confirmed visible by the user.
+
+---
+
+## 2026-11-13 update — v1.1.0 HomePod AirPlay 2 qualification & discovery fixes
+
+All local-stack, HTTP ingest, Wi-Fi TX staging, and RTP clock-synchronization
+defects behind the November 7 HomePod interruptions were isolated and resolved
+in **v1.1.0** (see the [2026-11-13 network audit resolution](NETWORK_AUDIT_2026-11.md#2026-11-13-resolution--v110-http--airplay-2-homepod-qualification) for full telemetry):
+
+- **Monotonic Wall-Clock `PT=0xD4` Sync (`RaopClient::sendSyncPacket`)**: Fixed `sync_rtp_ts` to derive monotonically from `ntp_to_ts(sync_ntp, 44100)` (`m_latency_frames = 88,200` / `2.0 s` default on AirPlay 2) instead of `m_head_ts`, eliminating `-250 ms` / `+250 ms` playout clock warps on HomePod when transient MAC queuing delays packet emission.
+- **Zero-Drop PSRAM-to-MAC TX Staging & Lossless Hold**: Expanded ESP-IDF's PSRAM TX staging ring (`cache_tx_buf_num = 64`) and dynamic MAC TX pool (`dynamic_tx_buf_num = 48`) with `~92 KB` free Internal SRAM (`81.9 KB` largest block), switched UDP QoS to `IP_TOS = 0xA0` (`DSCP CS5` / `AC_VI`) over 802.11n HT20 so A-MPDU aggregation stays active across both Wi-Fi hops, retained unsent packets losslessly for up to `750 ms` (`flushUnsentPacket()`), and tightened `PT=0x55 -> 0x56` NACK repair pacing to `4.0 ms`.
+- **Raw lwIP HTTP Client (`IcyRawTcp`) & BSSID Failover**: Eliminated upstream MP3/PCM underruns (`16 × MSS` window, `TF_SACK` cleared, immediate ACKs, DNS cache, and multi-AP BSSID stall scoring).
+- **Two-Pass Alphabetical mDNS Discovery**: `discover_airplay_speakers()` now queries `_airplay._tcp` and `_raop._tcp` sequentially into PSRAM buffers (up to 48 receivers) and sorts speakers case-insensitively (`A -> Z`, `Local 3.5mm Jack` last), capturing dense multi-room Sonos + HomePod + Apple TV networks reliably without manual mDNS relay workarounds.
+
+### Updated Qualification Snapshot (`v1.1.0`)
+
+| Receiver path | `v1.1.0` Evidence (2026-11-13) | Status |
+| :--- | :--- | :--- |
+| **HomePod over AirPlay 2 (`AudioAccessory5,1`)** | `27,605 / 27,605` RTP originals accepted (`0` driver/socket rejects, `0` retries, `0` underruns, `16 ms` max audio gap, `2,955 ms` PCM cushion) + multi-hour continuous user listening confirmation on Workshop HomePod | **Qualified** |
+| **Sonos native radio (`Sonos Five`)** | Audibly verified across station changes, volume, artwork, and controller reboots | **Qualified** |
+| **Onboard 3.5mm Stereo DAC (`PCM5100A`)** | Sustained `2,950+ ms` PCM / `~252 KB` MP3 buffer stability via `IcyRawTcp` | **Qualified** |
+| **Sonos over AirPlay / Legacy RAOP / PIN receivers** | Explicit-count ALAC encoder (`12/12` FFmpeg cases), CSeq-matched RTSP (`16/16` cases), and PIN/Pair-Verify supported in code; test individual legacy/PIN hardware as deployed | **Supported (test per receiver)** |

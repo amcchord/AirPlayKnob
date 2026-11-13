@@ -26,7 +26,7 @@ static std::atomic<uint8_t> s_art_kind{0};
 extern "C" void *__real_esp_mbedtls_mem_calloc(size_t, size_t);
 extern "C" void *__wrap_esp_mbedtls_mem_calloc(size_t n, size_t size) {
     if (n && size > SIZE_MAX / n) return nullptr;
-    if (xTaskGetCurrentTaskHandle() == s_art_task.load() && n * size >= 1024) {
+    if (xTaskGetCurrentTaskHandle() == s_art_task.load() && n * size >= 512) {
         void *p = heap_caps_calloc(n, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (p) s_tls_psram.fetch_add(1);
         return p; // Optional artwork must not fall back into scarce driver RAM.
@@ -282,7 +282,7 @@ static bool decode_jpeg_to_artwork(const uint8_t *jpg_data, size_t jpg_len, lv_c
     return true;
 }
 
-static bool artwork_network_ready(uint32_t cushion_ms, uint32_t min_mp3_bytes = 0) {
+static bool artwork_network_ready(uint32_t cushion_ms, uint32_t min_mp3_bytes = 0, bool check_heap_floor = true) {
     if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(10)) != pdTRUE) return false;
     bool native_only = g_app.prefer_sonos_native && g_app.sonos_native &&
                        !g_app.also_local_dac && !g_app.whitecap_active;
@@ -292,14 +292,17 @@ static bool artwork_network_ready(uint32_t cushion_ms, uint32_t min_mp3_bytes = 
     bool ok = artwork_network_allowed(g_app.playing, native_only, busy,
                                        radio_get_buffered_ms(), cushion_ms, g_app.mp3_buf_bytes, min_mp3_bytes);
     xSemaphoreGive(g_app.mutex);
-    return ok && ESP.getFreeHeap() >= 32000;
+    if (!ok) return false;
+    if (!check_heap_floor) return true;
+    return ESP.getFreeHeap() >= 36000 &&
+           heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= 16384;
 }
 
 class ArtworkBufferStream : public Stream {
 public:
     ArtworkBufferStream(uint8_t *data, size_t cap) : data(data), cap(cap) {}
     size_t write(const uint8_t *p, size_t n) override {
-        if (n > cap - used || !artwork_network_ready(AudioBuffer::ARTWORK_ABORT_PCM_MS)) return 0;
+        if (n > cap - used || !artwork_network_ready(AudioBuffer::ARTWORK_ABORT_PCM_MS, 0, false)) return 0;
         memcpy(data + used, p, n); used += n; return n;
     }
     size_t write(uint8_t c) override { return write(&c, 1); }
@@ -322,7 +325,7 @@ static bool download_url_to_buf(const char *url, uint8_t *buf, size_t max_len, s
     HTTPClient http;
     http.setUserAgent("AirPlayKnob/1.0");
     http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-    http.setConnectTimeout(2500); http.setTimeout(2500);
+    http.setConnectTimeout(4500); http.setTimeout(4500);
     bool begun = secure ? http.begin(sc, url) : http.begin(pc, url);
     bool ok = false;
     if (begun) {
@@ -411,7 +414,7 @@ static void artwork_worker_task(void *arg) {
         char station_url[128];
         snprintf(station_url, sizeof(station_url), "http://somafm.com/img/%s120.jpg", st.id);
         if (!station_loaded && station_tries < 3 && st.id[0] &&
-            (int32_t)(millis() - next_station_ms) >= 0 && artwork_network_ready(AudioBuffer::ARTWORK_START_PCM_MS, AudioBuffer::ARTWORK_START_MP3_BYTES)) {
+            (int32_t)(millis() - next_station_ms) >= 0 && artwork_network_ready(2400, 128 * 1024)) {
             ++station_tries; next_station_ms = millis() + 15000;
             size_t n = 0;
             if (download_url_to_buf(station_url, dl_buf, MAX_DL, &n) &&
@@ -433,7 +436,7 @@ static void artwork_worker_task(void *arg) {
         bool song = strstr(track, " - ") && !strstr(track, "Live Stream") &&
                     !strstr(track, "Connecting") && !strstr(track, "SomaFM");
         if (song && !track_done && track_tries < 3 &&
-            (int32_t)(millis() - next_track_ms) >= 0 && artwork_network_ready(AudioBuffer::ARTWORK_START_PCM_MS, AudioBuffer::ARTWORK_START_MP3_BYTES)) {
+            (int32_t)(millis() - next_track_ms) >= 0 && artwork_network_ready(2400, 128 * 1024)) {
             ++track_tries; next_track_ms = millis() + 15000;
             char query[384], url[512];
             url_encode_query(track, query, sizeof(query));
@@ -503,7 +506,9 @@ void artwork_fetcher_start(void) {
 
     StackType_t *art_stack = (StackType_t *)heap_caps_malloc(16384, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     StaticTask_t *art_tcb  = (StaticTask_t *)heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    xTaskCreateStaticPinnedToCore(artwork_worker_task, "art_fetch", 16384 / sizeof(StackType_t), NULL, 1, art_stack, art_tcb, 0);
+    // Pin background TLS + PSRAM JPEG decoder to Core 1 (lowest priority 1) so ECDHE/RSA
+    // handshakes never contend with Core 0 Wi-Fi MAC / lwIP tcpip_thread instruction/PSRAM caches.
+    xTaskCreateStaticPinnedToCore(artwork_worker_task, "art_fetch", 16384 / sizeof(StackType_t), NULL, 1, art_stack, art_tcb, 1);
 }
 
 const lv_img_dsc_t *artwork_get_dsc(void) {

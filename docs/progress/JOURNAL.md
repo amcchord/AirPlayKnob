@@ -480,3 +480,44 @@
   current state/runbook and GitHub deployment notes updated. Next action:
   leave native Workshop selected; app0 is now current. Generic AirPlay issue
   remains unresolved and no new compatibility claim is made.
+
+
+## 2026-11-13 — Battery telemetry, raw lwIP HTTP, sustained HomePod AirPlay 2 fix, and v1.1.0 release
+
+- **Battery & charge-state support**: Flashed newly attached battery-equipped
+  Waveshare ESP32-S3-Knob-Touch-LCD-1.8 and implemented `src/bsp/battery_monitor.cpp`
+  (`include/battery_monitor.h`) sampling `BATT_ADC` (`GPIO 1` / `ADC1_CHANNEL_0`,
+  `2:1` divider) with ESP-IDF curve-fitting calibration, `USB_SERIAL_JTAG` SOF
+  host tracking, sliding 4-second step and 60-second linear-regression slope
+  detection for USB wall bricks, CC/CV lift compensation, and full-charge CV
+  termination. Per user UI direction, Home (`Tab 0`) hides the battery pill
+  unless actively charging or `< 20%` (and hides when full); Settings (`Tab 3`),
+  Web Portal, `/api/status`, and `BATTERY` CLI show continuous telemetry. Added
+  host regression suite `tests/test_battery_monitor.py`.
+- **Two-pass alphabetical AirPlay discovery**: Upgraded `discover_airplay_speakers()`
+  to run sequential PSRAM-backed `_airplay._tcp` and `_raop._tcp` mDNS queries
+  (up to 48 receivers) and sort discovered speakers case-insensitively (`A -> Z`,
+  keeping `Local 3.5mm Jack` last).
+- **Raw lwIP HTTP streaming & multi-AP BSSID failover**: Replaced Arduino
+  `WiFiClient` radio streaming with `IcyRawTcp` (`16 × MSS = 22,976 B` window,
+  `TF_SACK` cleared, immediate `tcp_output()` ACKs, DNS cache) plus BSSID stall
+  scoring/failover and NVS `pref_bssid` persistence after 45 seconds of clean
+  streaming, resolving local 3.5mm DAC buffer starvation.
+- **Sustained HomePod AirPlay 2 qualification**: Reclaimed `~92 KB` free Internal
+  DMA SRAM (`81,908 B` largest contiguous block) by moving audio/art task stacks,
+  `mp3dec_t`, and `RaopClient` to PSRAM and reducing LVGL DMA strips to 16 lines.
+  Configured `__wrap_esp_wifi_init()` (`custom_cfg_err=0`) with `64` PSRAM
+  `cache_tx_buf` staging slots + `48` dynamic MAC TX buffers, `802.11b/g/n` HT20
+  A-MPDU aggregation, and `IP_TOS = 0xA0` (`DSCP CS5` / `AC_VI`). Added lossless
+  `flushUnsentPacket()` (`750 ms` hold), `4.0 ms` NACK repair pacing, `20 ms`
+  lock-free `raop_tx` state caching, and monotonic wall-clock `PT=0xD4` RTP sync
+  (`sync_rtp_ts = ntp_to_ts(sync_ntp, 44100)` with `88,200`-frame AirPlay 2
+  latency) to eliminate `-250 ms` / `+250 ms` HomePod playout clock warps.
+- **Live verification & v1.1.0 release**: Verified over 27,605 RTP packets /
+  30,923 Wi-Fi driver frames to Workshop HomePod (`AudioAccessory5,1`) with `0`
+  driver rejects, `0` socket rejects, `0` retries, `0` audio gap events, `16 ms`
+  max audio gap, `0` underruns, `2,955 ms` PCM cushion, and `252,613 B` MP3
+  reserve, followed by multi-hour uninterrupted user listening confirmation.
+  Updated all repository documentation, verified all 5 host test suites, built
+  credential-free `v1.1.0` factory and OTA binaries in a clean worktree, merged
+  to `main`, and published GitHub Release `v1.1.0`.

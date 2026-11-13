@@ -28,9 +28,14 @@ static uint32_t s_prev_theme_col = 0;
 static int s_prev_arc_max = -1;
 static int s_prev_arc_val = -1;
 
-// Tab 0: Full-Screen Album Art (360x360) + Bottom Scrim Typography Overlay
+// Tab 0: Full-Screen Album Art (360x360) + Top Battery Pill + Bottom Scrim Typography Overlay
 static lv_obj_t *s_art_cont = NULL;
 static lv_obj_t *s_art_img = NULL;
+static lv_obj_t *s_batt_pill = NULL;
+static lv_obj_t *s_batt_body = NULL;
+static lv_obj_t *s_batt_cap = NULL;
+static lv_obj_t *s_batt_fill = NULL;
+static lv_obj_t *s_lbl_batt_home = NULL;
 static lv_obj_t *s_pause_badge = NULL;
 static lv_obj_t *s_lbl_track = NULL;
 static lv_obj_t *s_lbl_artist = NULL;
@@ -122,10 +127,13 @@ static int8_t    s_page_anim_dir_y    = 0;
 static float     s_page_anim_progress = 0.0f;
 static bool      s_prev_wc_active     = false;
 
-// Tab 3: Settings (Live Buffers, Streaming Telemetry, Wi-Fi, Tap-for-QR & PIN Pairing)
+// Tab 3: Settings (Battery, Live Buffers, Streaming Telemetry, Wi-Fi, Tap-for-QR & PIN Pairing)
 static lv_obj_t *s_lbl_wifi_ssid = NULL;
 static lv_obj_t *s_lbl_wifi_link = NULL;
 static lv_obj_t *s_lbl_wifi_ip = NULL;
+static lv_obj_t *s_lbl_batt_hdr = NULL;
+static lv_obj_t *s_lbl_batt_set = NULL;
+static lv_obj_t *s_bar_batt = NULL;
 static lv_obj_t *s_lbl_buf_pcm = NULL;
 static lv_obj_t *s_bar_buf_pcm = NULL;
 static lv_obj_t *s_lbl_buf_mp3 = NULL;
@@ -864,6 +872,11 @@ static void update_station_wheel(bool sync_cursor_to_active) {
     set_wheel_arc_state(count, s_station_cursor, s_st_anim_offset);
 }
 
+static char s_sp_cursor_ip[20] = {0};
+static char s_sp_cursor_name[48] = {0};
+static bool s_sp_cursor_local = false;
+static uint32_t s_sp_cursor_seq = 0;
+
 static void update_speaker_wheel(bool sync_cursor_to_active) {
     if (!s_sp_slots[0]) return;
 
@@ -871,6 +884,7 @@ static void update_speaker_wheel(bool sync_cursor_to_active) {
     int count = g_app.speaker_count;
     int active_idx = g_app.current_speaker;
     bool scanning = g_app.speaker_scanning;
+    uint32_t list_seq = g_app.speaker_list_seq;
     if (count > MAX_SPEAKERS) count = MAX_SPEAKERS;
     if (count <= 0) {
         xSemaphoreGive(g_app.mutex);
@@ -881,7 +895,44 @@ static void update_speaker_wheel(bool sync_cursor_to_active) {
         s_speaker_cursor = active_idx;
         s_sp_anim_offset = 0.0f;
         for (int i = 0; i < WHEEL_SLOTS; i++) s_sp_cache[i].item_idx = -1;
+    } else if (list_seq != s_sp_cursor_seq) {
+        int mapped = -1;
+        if (s_sp_cursor_local) {
+            for (int i = 0; i < count; i++) {
+                if (g_app.speakers[i].is_local_dac) { mapped = i; break; }
+            }
+        } else {
+            if (s_sp_cursor_ip[0] != '\0') {
+                for (int i = 0; i < count; i++) {
+                    if (!g_app.speakers[i].is_local_dac && strcmp(g_app.speakers[i].ip, s_sp_cursor_ip) == 0) {
+                        mapped = i;
+                        break;
+                    }
+                }
+            }
+            if (mapped < 0 && s_sp_cursor_name[0] != '\0') {
+                for (int i = 0; i < count; i++) {
+                    if (!g_app.speakers[i].is_local_dac && strcasecmp(g_app.speakers[i].name, s_sp_cursor_name) == 0) {
+                        mapped = i;
+                        break;
+                    }
+                }
+            }
+        }
+        if (mapped >= 0) {
+            s_speaker_cursor = mapped;
+        }
+        for (int i = 0; i < WHEEL_SLOTS; i++) s_sp_cache[i].item_idx = -1;
     }
+
+    if (s_speaker_cursor >= 0 && s_speaker_cursor < count) {
+        s_sp_cursor_local = g_app.speakers[s_speaker_cursor].is_local_dac;
+        strncpy(s_sp_cursor_ip, g_app.speakers[s_speaker_cursor].ip, sizeof(s_sp_cursor_ip) - 1);
+        s_sp_cursor_ip[sizeof(s_sp_cursor_ip) - 1] = '\0';
+        strncpy(s_sp_cursor_name, g_app.speakers[s_speaker_cursor].name, sizeof(s_sp_cursor_name) - 1);
+        s_sp_cursor_name[sizeof(s_sp_cursor_name) - 1] = '\0';
+    }
+    s_sp_cursor_seq = list_seq;
 
     if (s_lbl_spkr_hdr && (s_sp_hdr_cursor != s_speaker_cursor || s_sp_hdr_count != count || s_sp_hdr_scanning != scanning)) {
         s_sp_hdr_cursor = s_speaker_cursor;
@@ -889,6 +940,8 @@ static void update_speaker_wheel(bool sync_cursor_to_active) {
         s_sp_hdr_scanning = scanning;
         if (scanning && count <= 1) {
             lv_label_set_text(s_lbl_spkr_hdr, "SCANNING AIRPLAY...");
+        } else if (scanning) {
+            lv_label_set_text_fmt(s_lbl_spkr_hdr, "AIRPLAY  •  %d / %d  •  SCANNING", s_speaker_cursor + 1, count);
         } else {
             lv_label_set_text_fmt(s_lbl_spkr_hdr, "AIRPLAY  •  %d / %d  •  LIVE", s_speaker_cursor + 1, count);
         }
@@ -1145,6 +1198,12 @@ static void switch_tab(ActiveTab tab, int dir_x = 0, int dir_y = 0) {
         s_st_hdr_cursor = -1;
         update_station_wheel(true);
     } else if (tab == TAB_SPEAKERS) {
+        if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(15)) == pdTRUE) {
+            if (!g_app.speaker_scanning && (millis() - g_app.speaker_scan_last_ms >= 20000U)) {
+                g_app.speaker_scan_requested = true;
+            }
+            xSemaphoreGive(g_app.mutex);
+        }
         s_sp_anim_offset = 0.0f;
         s_sp_hdr_cursor = -1;
         update_speaker_wheel(true);
@@ -2114,6 +2173,35 @@ void knob_ui_init(void) {
         if (bsp_was_touch_dragged()) return;
         lv_point_t pt;
         lv_indev_get_point(lv_indev_get_act(), &pt);
+        if (s_batt_pill && !lv_obj_has_flag(s_batt_pill, LV_OBJ_FLAG_HIDDEN) &&
+            pt.y <= 48 && abs(pt.x - 180) <= 78) {
+            // Tapping the visible top battery pill pops up full battery & charge telemetry HUD
+            BatteryTelemetry bt = battery_monitor_snapshot();
+            haptic_play_effect(HAPTIC_SHARP_CLICK);
+            char hdr[36];
+            char val[44];
+            uint32_t col = 0x10B981;
+            if (bt.charging) {
+                snprintf(hdr, sizeof(hdr), "BATTERY  •  CHARGING");
+                if (bt.percent >= 0) snprintf(val, sizeof(val), "%d%%  •  %d.%02d V", bt.percent, bt.voltage_mv / 1000, (bt.voltage_mv % 1000) / 10);
+                else                 snprintf(val, sizeof(val), "USB Power  •  %d.%02d V", bt.voltage_mv / 1000, (bt.voltage_mv % 1000) / 10);
+                col = 0x10B981;
+            } else if (bt.charged) {
+                snprintf(hdr, sizeof(hdr), "BATTERY  •  CHARGED");
+                snprintf(val, sizeof(val), "100%%  •  %d.%02d V", bt.voltage_mv / 1000, (bt.voltage_mv % 1000) / 10);
+                col = 0x10B981;
+            } else if (bt.state == BATT_STATE_DISCHARGING && bt.percent >= 0) {
+                snprintf(hdr, sizeof(hdr), bt.low_battery ? "LOW BATTERY" : "ON BATTERY");
+                snprintf(val, sizeof(val), "%d%%  •  %d.%02d V", bt.percent, bt.voltage_mv / 1000, (bt.voltage_mv % 1000) / 10);
+                col = bt.critical_battery ? 0xEF4444 : (bt.low_battery ? 0xF59E0B : 0x38BDF8);
+            } else {
+                snprintf(hdr, sizeof(hdr), "USB POWER  •  CHARGING");
+                snprintf(val, sizeof(val), "%d.%02d V Rail  •  Unplug for %%", bt.voltage_mv / 1000, (bt.voltage_mv % 1000) / 10);
+                col = 0x38BDF8;
+            }
+            show_hud(hdr, val, col, 2200);
+            return;
+        }
         if (pt.y >= 285) {
             // Tapping the bottom station/speaker line cycles Knob Mode
             KnobMode next = KNOB_MODE_VOLUME;
@@ -2134,6 +2222,66 @@ void knob_ui_init(void) {
             app_toggle_play();
         }
     }, LV_EVENT_CLICKED, NULL);
+
+    // Top-center frosted Battery & Charge Pill (y = 14..38)
+    s_batt_pill = lv_obj_create(p0);
+    lv_obj_set_size(s_batt_pill, LV_SIZE_CONTENT, 24);
+    lv_obj_align(s_batt_pill, LV_ALIGN_TOP_MID, 0, 14);
+    lv_obj_set_style_radius(s_batt_pill, 12, 0);
+    lv_obj_set_style_bg_color(s_batt_pill, hex_to_lv(0x050608), 0);
+    lv_obj_set_style_bg_opa(s_batt_pill, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(s_batt_pill, 1, 0);
+    lv_obj_set_style_border_color(s_batt_pill, hex_to_lv(0x1E293B), 0);
+    lv_obj_set_style_pad_left(s_batt_pill, 9, 0);
+    lv_obj_set_style_pad_right(s_batt_pill, 9, 0);
+    lv_obj_set_style_pad_top(s_batt_pill, 0, 0);
+    lv_obj_set_style_pad_bottom(s_batt_pill, 0, 0);
+    lv_obj_set_style_pad_column(s_batt_pill, 5, 0);
+    lv_obj_set_flex_flow(s_batt_pill, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(s_batt_pill, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(s_batt_pill, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_batt_pill, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t *batt_icon_wrap = lv_obj_create(s_batt_pill);
+    lv_obj_set_size(batt_icon_wrap, 21, 10);
+    lv_obj_set_style_bg_opa(batt_icon_wrap, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(batt_icon_wrap, 0, 0);
+    lv_obj_set_style_pad_all(batt_icon_wrap, 0, 0);
+    lv_obj_clear_flag(batt_icon_wrap, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+    s_batt_body = lv_obj_create(batt_icon_wrap);
+    lv_obj_set_size(s_batt_body, 18, 10);
+    lv_obj_set_pos(s_batt_body, 0, 0);
+    lv_obj_set_style_radius(s_batt_body, 3, 0);
+    lv_obj_set_style_bg_opa(s_batt_body, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_batt_body, 1, 0);
+    lv_obj_set_style_border_color(s_batt_body, hex_to_lv(0xCBD5E1), 0);
+    lv_obj_set_style_pad_all(s_batt_body, 0, 0);
+    lv_obj_clear_flag(s_batt_body, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+    s_batt_fill = lv_obj_create(s_batt_body);
+    lv_obj_set_size(s_batt_fill, 14, 6);
+    lv_obj_align(s_batt_fill, LV_ALIGN_LEFT_MID, 1, 0);
+    lv_obj_set_style_radius(s_batt_fill, 1, 0);
+    lv_obj_set_style_bg_color(s_batt_fill, hex_to_lv(0x10B981), 0);
+    lv_obj_set_style_bg_opa(s_batt_fill, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_batt_fill, 0, 0);
+    lv_obj_clear_flag(s_batt_fill, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+    s_batt_cap = lv_obj_create(batt_icon_wrap);
+    lv_obj_set_size(s_batt_cap, 2, 4);
+    lv_obj_set_pos(s_batt_cap, 19, 3);
+    lv_obj_set_style_radius(s_batt_cap, 1, 0);
+    lv_obj_set_style_bg_color(s_batt_cap, hex_to_lv(0xCBD5E1), 0);
+    lv_obj_set_style_bg_opa(s_batt_cap, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_batt_cap, 0, 0);
+    lv_obj_clear_flag(s_batt_cap, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+    s_lbl_batt_home = lv_label_create(s_batt_pill);
+    lv_label_set_text(s_lbl_batt_home, "--%");
+    lv_obj_set_style_text_font(s_lbl_batt_home, &ui_font_sm, 0);
+    lv_obj_set_style_text_color(s_lbl_batt_home, hex_to_lv(0xF8FAFC), 0);
+    lv_obj_clear_flag(s_lbl_batt_home, LV_OBJ_FLAG_CLICKABLE);
 
     // Subtle frosted pause indicator on artwork when paused
     s_pause_badge = lv_obj_create(p0);
@@ -2341,28 +2489,60 @@ void knob_ui_init(void) {
     lv_label_set_text_fmt(s_lbl_wifi_ssid, LV_SYMBOL_WIFI " %s", g_app.wifi_ssid[0] ? g_app.wifi_ssid : "Select network");
     lv_obj_set_style_text_font(s_lbl_wifi_ssid, &ui_font_md, 0);
     lv_obj_set_style_text_color(s_lbl_wifi_ssid, hex_to_lv(0xF8FAFC), 0);
-    lv_obj_align(s_lbl_wifi_ssid, LV_ALIGN_TOP_MID, 0, 20);
+    lv_obj_align(s_lbl_wifi_ssid, LV_ALIGN_TOP_MID, 0, 18);
     lv_obj_clear_flag(s_lbl_wifi_ssid, LV_OBJ_FLAG_CLICKABLE);
 
     s_lbl_wifi_link = lv_label_create(p3);
     lv_label_set_text(s_lbl_wifi_link, "Negotiating Wi-Fi Link...");
     lv_obj_set_style_text_font(s_lbl_wifi_link, &ui_font_sm, 0);
     lv_obj_set_style_text_color(s_lbl_wifi_link, hex_to_lv(0x10B981), 0);
-    lv_obj_align(s_lbl_wifi_link, LV_ALIGN_TOP_MID, 0, 40);
+    lv_obj_align(s_lbl_wifi_link, LV_ALIGN_TOP_MID, 0, 37);
     lv_obj_clear_flag(s_lbl_wifi_link, LV_OBJ_FLAG_CLICKABLE);
 
     s_lbl_wifi_ip = lv_label_create(p3);
     lv_label_set_text(s_lbl_wifi_ip, "http://airplayknob.local/  •  Tap for QR");
     lv_obj_set_style_text_font(s_lbl_wifi_ip, &ui_font_sm, 0);
     lv_obj_set_style_text_color(s_lbl_wifi_ip, hex_to_lv(0x38BDF8), 0);
-    lv_obj_align(s_lbl_wifi_ip, LV_ALIGN_TOP_MID, 0, 58);
+    lv_obj_align(s_lbl_wifi_ip, LV_ALIGN_TOP_MID, 0, 54);
     lv_obj_clear_flag(s_lbl_wifi_ip, LV_OBJ_FLAG_CLICKABLE);
 
-    // Card 1: PCM Ringbuffer Telemetry (2.0 MB PSRAM)
+    // Card 0: Battery & Charge State Telemetry
+    lv_obj_t *batt_card = lv_obj_create(p3);
+    lv_obj_set_size(batt_card, 262, 38);
+    lv_obj_align(batt_card, LV_ALIGN_TOP_MID, 0, 74);
+    lv_obj_set_style_radius(batt_card, 11, 0);
+    lv_obj_set_style_bg_color(batt_card, hex_to_lv(0x0B0F17), 0);
+    lv_obj_set_style_bg_opa(batt_card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(batt_card, 1, 0);
+    lv_obj_set_style_border_color(batt_card, hex_to_lv(0x162030), 0);
+    lv_obj_set_style_pad_all(batt_card, 0, 0);
+    lv_obj_clear_flag(batt_card, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+
+    s_lbl_batt_hdr = lv_label_create(batt_card);
+    lv_label_set_text(s_lbl_batt_hdr, "BATTERY");
+    lv_obj_set_style_text_font(s_lbl_batt_hdr, &ui_font_sm, 0);
+    lv_obj_set_style_text_color(s_lbl_batt_hdr, hex_to_lv(0x94A3B8), 0);
+    lv_obj_align(s_lbl_batt_hdr, LV_ALIGN_TOP_LEFT, 12, 5);
+
+    s_lbl_batt_set = lv_label_create(batt_card);
+    lv_label_set_text(s_lbl_batt_set, "Checking...");
+    lv_obj_set_style_text_font(s_lbl_batt_set, &ui_font_sm, 0);
+    lv_obj_set_style_text_color(s_lbl_batt_set, hex_to_lv(0x10B981), 0);
+    lv_obj_align(s_lbl_batt_set, LV_ALIGN_TOP_RIGHT, -12, 5);
+
+    s_bar_batt = lv_bar_create(batt_card);
+    lv_obj_set_size(s_bar_batt, 238, 5);
+    lv_obj_align(s_bar_batt, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_bar_set_range(s_bar_batt, 0, 100);
+    lv_bar_set_value(s_bar_batt, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(s_bar_batt, hex_to_lv(0x1E293B), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_bar_batt, hex_to_lv(0x10B981), LV_PART_INDICATOR);
+
+    // Card 1: PCM Ringbuffer Telemetry (512 KB PSRAM)
     lv_obj_t *pcm_card = lv_obj_create(p3);
-    lv_obj_set_size(pcm_card, 286, 44);
-    lv_obj_align(pcm_card, LV_ALIGN_TOP_MID, 0, 82);
-    lv_obj_set_style_radius(pcm_card, 12, 0);
+    lv_obj_set_size(pcm_card, 294, 38);
+    lv_obj_align(pcm_card, LV_ALIGN_TOP_MID, 0, 116);
+    lv_obj_set_style_radius(pcm_card, 11, 0);
     lv_obj_set_style_bg_color(pcm_card, hex_to_lv(0x0B0F17), 0);
     lv_obj_set_style_bg_opa(pcm_card, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(pcm_card, 1, 0);
@@ -2374,27 +2554,27 @@ void knob_ui_init(void) {
     lv_label_set_text(pcm_hdr, "PCM BUFFER");
     lv_obj_set_style_text_font(pcm_hdr, &ui_font_sm, 0);
     lv_obj_set_style_text_color(pcm_hdr, hex_to_lv(0x94A3B8), 0);
-    lv_obj_align(pcm_hdr, LV_ALIGN_TOP_LEFT, 12, 6);
+    lv_obj_align(pcm_hdr, LV_ALIGN_TOP_LEFT, 12, 5);
 
     s_lbl_buf_pcm = lv_label_create(pcm_card);
     lv_label_set_text_fmt(s_lbl_buf_pcm, "0 KB / %u KB (0.0s)", (unsigned)AudioBuffer::PCM_KIB);
     lv_obj_set_style_text_font(s_lbl_buf_pcm, &ui_font_sm, 0);
     lv_obj_set_style_text_color(s_lbl_buf_pcm, hex_to_lv(0x10B981), 0);
-    lv_obj_align(s_lbl_buf_pcm, LV_ALIGN_TOP_RIGHT, -12, 6);
+    lv_obj_align(s_lbl_buf_pcm, LV_ALIGN_TOP_RIGHT, -12, 5);
 
     s_bar_buf_pcm = lv_bar_create(pcm_card);
-    lv_obj_set_size(s_bar_buf_pcm, 262, 6);
-    lv_obj_align(s_bar_buf_pcm, LV_ALIGN_BOTTOM_MID, 0, -7);
+    lv_obj_set_size(s_bar_buf_pcm, 270, 5);
+    lv_obj_align(s_bar_buf_pcm, LV_ALIGN_BOTTOM_MID, 0, -6);
     lv_bar_set_range(s_bar_buf_pcm, 0, 100);
     lv_bar_set_value(s_bar_buf_pcm, 0, LV_ANIM_OFF);
     lv_obj_set_style_bg_color(s_bar_buf_pcm, hex_to_lv(0x1E293B), LV_PART_MAIN);
     lv_obj_set_style_bg_color(s_bar_buf_pcm, hex_to_lv(0x10B981), LV_PART_INDICATOR);
 
-    // Card 2: MP3 Stream & Decoder Buffer (64 KB)
+    // Card 2: MP3 Stream & Decoder Buffer (256 KB)
     lv_obj_t *mp3_card = lv_obj_create(p3);
-    lv_obj_set_size(mp3_card, 304, 44);
-    lv_obj_align(mp3_card, LV_ALIGN_TOP_MID, 0, 131);
-    lv_obj_set_style_radius(mp3_card, 12, 0);
+    lv_obj_set_size(mp3_card, 304, 38);
+    lv_obj_align(mp3_card, LV_ALIGN_TOP_MID, 0, 158);
+    lv_obj_set_style_radius(mp3_card, 11, 0);
     lv_obj_set_style_bg_color(mp3_card, hex_to_lv(0x0B0F17), 0);
     lv_obj_set_style_bg_opa(mp3_card, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(mp3_card, 1, 0);
@@ -2406,17 +2586,17 @@ void knob_ui_init(void) {
     lv_label_set_text(mp3_hdr, "MP3 STREAM");
     lv_obj_set_style_text_font(mp3_hdr, &ui_font_sm, 0);
     lv_obj_set_style_text_color(mp3_hdr, hex_to_lv(0x94A3B8), 0);
-    lv_obj_align(mp3_hdr, LV_ALIGN_TOP_LEFT, 12, 6);
+    lv_obj_align(mp3_hdr, LV_ALIGN_TOP_LEFT, 12, 5);
 
     s_lbl_buf_mp3 = lv_label_create(mp3_card);
-    lv_label_set_text(s_lbl_buf_mp3, "0 / 64 KB  •  128 kbps");
+    lv_label_set_text(s_lbl_buf_mp3, "0 / 256 KB  •  128 kbps");
     lv_obj_set_style_text_font(s_lbl_buf_mp3, &ui_font_sm, 0);
     lv_obj_set_style_text_color(s_lbl_buf_mp3, hex_to_lv(0x38BDF8), 0);
-    lv_obj_align(s_lbl_buf_mp3, LV_ALIGN_TOP_RIGHT, -12, 6);
+    lv_obj_align(s_lbl_buf_mp3, LV_ALIGN_TOP_RIGHT, -12, 5);
 
     s_bar_buf_mp3 = lv_bar_create(mp3_card);
-    lv_obj_set_size(s_bar_buf_mp3, 280, 6);
-    lv_obj_align(s_bar_buf_mp3, LV_ALIGN_BOTTOM_MID, 0, -7);
+    lv_obj_set_size(s_bar_buf_mp3, 280, 5);
+    lv_obj_align(s_bar_buf_mp3, LV_ALIGN_BOTTOM_MID, 0, -6);
     lv_bar_set_range(s_bar_buf_mp3, 0, 100);
     lv_bar_set_value(s_bar_buf_mp3, 0, LV_ANIM_OFF);
     lv_obj_set_style_bg_color(s_bar_buf_mp3, hex_to_lv(0x1E293B), LV_PART_MAIN);
@@ -2424,9 +2604,9 @@ void knob_ui_init(void) {
 
     // Card 3: AirPlay & Streaming Engine Status
     lv_obj_t *str_card = lv_obj_create(p3);
-    lv_obj_set_size(str_card, 304, 46);
-    lv_obj_align(str_card, LV_ALIGN_TOP_MID, 0, 180);
-    lv_obj_set_style_radius(str_card, 12, 0);
+    lv_obj_set_size(str_card, 296, 42);
+    lv_obj_align(str_card, LV_ALIGN_TOP_MID, 0, 200);
+    lv_obj_set_style_radius(str_card, 11, 0);
     lv_obj_set_style_bg_color(str_card, hex_to_lv(0x0B0F17), 0);
     lv_obj_set_style_bg_opa(str_card, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(str_card, 1, 0);
@@ -2439,30 +2619,30 @@ void knob_ui_init(void) {
     lv_obj_set_style_text_font(s_lbl_stream_state, &ui_font_sm, 0);
     lv_obj_set_style_text_color(s_lbl_stream_state, hex_to_lv(0xF8FAFC), 0);
     lv_label_set_long_mode(s_lbl_stream_state, LV_LABEL_LONG_DOT);
-    lv_obj_set_size(s_lbl_stream_state, 280, 18);
+    lv_obj_set_size(s_lbl_stream_state, 272, 18);
     lv_obj_set_style_text_align(s_lbl_stream_state, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(s_lbl_stream_state, LV_ALIGN_TOP_MID, 0, 5);
+    lv_obj_align(s_lbl_stream_state, LV_ALIGN_TOP_MID, 0, 4);
 
     s_lbl_stream_pkts = lv_label_create(str_card);
     lv_label_set_text(s_lbl_stream_pkts, "Queued: 0  •  Reject: 0  •  Repair: 0");
     lv_obj_set_style_text_font(s_lbl_stream_pkts, &ui_font_sm, 0);
     lv_obj_set_style_text_color(s_lbl_stream_pkts, hex_to_lv(0x64748B), 0);
     lv_label_set_long_mode(s_lbl_stream_pkts, LV_LABEL_LONG_DOT);
-    lv_obj_set_size(s_lbl_stream_pkts, 284, 18);
+    lv_obj_set_size(s_lbl_stream_pkts, 276, 18);
     lv_obj_set_style_text_align(s_lbl_stream_pkts, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(s_lbl_stream_pkts, LV_ALIGN_TOP_MID, 0, 24);
+    lv_obj_align(s_lbl_stream_pkts, LV_ALIGN_TOP_MID, 0, 21);
 
     // Bottom Action Buttons: Wi-Fi | QR Code | Pair PIN
-    lv_obj_t *w_scan_btn = create_pill_btn(p3, 80, 32, 0x0F141D, 0x1E293B, "Wi-Fi", 0xCBD5E1);
-    lv_obj_align(w_scan_btn, LV_ALIGN_TOP_MID, -86, 236);
+    lv_obj_t *w_scan_btn = create_pill_btn(p3, 78, 30, 0x0F141D, 0x1E293B, "Wi-Fi", 0xCBD5E1);
+    lv_obj_align(w_scan_btn, LV_ALIGN_TOP_MID, -84, 248);
     lv_obj_add_event_cb(w_scan_btn, open_wifi_scan_modal, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t *w_qr_btn = create_pill_btn(p3, 84, 32, 0x0F141D, 0x38BDF8, "QR Code", 0x38BDF8);
-    lv_obj_align(w_qr_btn, LV_ALIGN_TOP_MID, 0, 236);
+    lv_obj_t *w_qr_btn = create_pill_btn(p3, 82, 30, 0x0F141D, 0x38BDF8, "QR Code", 0x38BDF8);
+    lv_obj_align(w_qr_btn, LV_ALIGN_TOP_MID, 0, 248);
     lv_obj_add_event_cb(w_qr_btn, open_qr_modal, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t *w_pin_btn = create_pill_btn(p3, 80, 32, 0x0F141D, 0xF59E0B, "Pair PIN", 0xF59E0B);
-    lv_obj_align(w_pin_btn, LV_ALIGN_TOP_MID, 86, 236);
+    lv_obj_t *w_pin_btn = create_pill_btn(p3, 78, 30, 0x0F141D, 0xF59E0B, "Pair PIN", 0xF59E0B);
+    lv_obj_align(w_pin_btn, LV_ALIGN_TOP_MID, 84, 248);
     lv_obj_add_event_cb(w_pin_btn, [](lv_event_t *e) {
         (void)e;
         if (bsp_was_touch_dragged()) return;
@@ -2486,7 +2666,7 @@ void knob_ui_init(void) {
     lv_label_set_text(set_hint, "TAP FOR QR  •  SWIPE UP HOME");
     lv_obj_set_style_text_font(set_hint, &ui_font_sm, 0);
     lv_obj_set_style_text_color(set_hint, hex_to_lv(0x475569), 0);
-    lv_obj_align(set_hint, LV_ALIGN_TOP_MID, 0, 286);
+    lv_obj_align(set_hint, LV_ALIGN_TOP_MID, 0, 288);
     lv_obj_clear_flag(set_hint, LV_OBJ_FLAG_CLICKABLE);
 
     // =========================================================================
@@ -2904,6 +3084,8 @@ void knob_ui_tick(void) {
     int ota_pct = 0;
     int spk_count = 1;
     bool spk_scanning = false;
+    uint32_t spk_list_seq = 0;
+    BatteryTelemetry batt = {};
 
     if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
         if (g_app.current_preset >= 0 && g_app.current_preset < g_app.preset_count) {
@@ -2953,6 +3135,8 @@ void knob_ui_tick(void) {
         ota_pct = g_app.ota_progress_pct;
         spk_count = g_app.speaker_count;
         spk_scanning = g_app.speaker_scanning;
+        spk_list_seq = g_app.speaker_list_seq;
+        batt = g_app.battery;
         xSemaphoreGive(g_app.mutex);
     } else {
         bsp_lvgl_unlock();
@@ -2967,6 +3151,164 @@ void knob_ui_tick(void) {
     }
     if (pin_toast) {
         show_hud(pin_toast_t, pin_toast_m, pin_toast_c, 2600);
+    }
+
+    // Startup Screen Header Battery Status + Charge-Transition / Low-Battery HUD Notifications
+    if (batt.valid) {
+        if (s_conn_lbl_title && !s_conn_dismissed) {
+            char conn_hdr[44];
+            if (batt.charging && batt.percent >= 0) {
+                snprintf(conn_hdr, sizeof(conn_hdr), "AIRPLAY KNOB  •  " LV_SYMBOL_CHARGE " %d%%", batt.percent);
+            } else if (batt.charged) {
+                snprintf(conn_hdr, sizeof(conn_hdr), "AIRPLAY KNOB  •  " LV_SYMBOL_CHARGE " 100%%");
+            } else if (batt.state == BATT_STATE_DISCHARGING && batt.percent >= 0) {
+                snprintf(conn_hdr, sizeof(conn_hdr), "AIRPLAY KNOB  •  %d%%", batt.percent);
+            } else {
+                snprintf(conn_hdr, sizeof(conn_hdr), "AIRPLAY KNOB");
+            }
+            static char s_prev_conn_hdr[44] = {0};
+            if (strcmp(conn_hdr, s_prev_conn_hdr) != 0) {
+                strncpy(s_prev_conn_hdr, conn_hdr, sizeof(s_prev_conn_hdr) - 1);
+                lv_label_set_text(s_conn_lbl_title, conn_hdr);
+            }
+        }
+
+        static BatteryChargeState s_prev_batt_state = BATT_STATE_UNKNOWN;
+        static bool s_warned_low15 = false;
+        static bool s_warned_crit5 = false;
+
+        if (batt.usb_present || batt.percent >= 22) s_warned_low15 = false;
+        if (batt.usb_present || batt.percent >= 12) s_warned_crit5 = false;
+
+        if (s_prev_batt_state != BATT_STATE_UNKNOWN && batt.state != s_prev_batt_state && s_conn_dismissed && !ota_active) {
+            char val[44];
+            if (batt.state == BATT_STATE_CHARGING) {
+                if (batt.percent >= 0) snprintf(val, sizeof(val), "%d%%  •  %d.%02d V", batt.percent, batt.voltage_mv / 1000, (batt.voltage_mv % 1000) / 10);
+                else                   snprintf(val, sizeof(val), "USB Power  •  %d.%02d V", batt.voltage_mv / 1000, (batt.voltage_mv % 1000) / 10);
+                show_hud("CHARGING", val, 0x10B981, 2000);
+                haptic_play_effect(HAPTIC_LIGHT_TICK);
+            } else if (batt.state == BATT_STATE_CHARGED) {
+                snprintf(val, sizeof(val), "100%%  •  %d.%02d V", batt.voltage_mv / 1000, (batt.voltage_mv % 1000) / 10);
+                show_hud("BATTERY CHARGED", val, 0x10B981, 2000);
+                haptic_play_effect(HAPTIC_LIGHT_TICK);
+            } else if (batt.state == BATT_STATE_DISCHARGING && batt.percent >= 0) {
+                snprintf(val, sizeof(val), "%d%%  •  %d.%02d V", batt.percent, batt.voltage_mv / 1000, (batt.voltage_mv % 1000) / 10);
+                show_hud("ON BATTERY", val, batt.low_battery ? 0xF59E0B : 0x38BDF8, 2000);
+                haptic_play_effect(HAPTIC_LIGHT_TICK);
+            }
+        }
+        s_prev_batt_state = batt.state;
+
+        if (batt.state == BATT_STATE_DISCHARGING && batt.percent >= 0 && s_conn_dismissed && !ota_active) {
+            if (batt.percent <= 5 && !s_warned_crit5) {
+                s_warned_crit5 = true;
+                s_warned_low15 = true;
+                char val[40];
+                snprintf(val, sizeof(val), "%d%%  •  Connect USB-C", batt.percent);
+                show_hud("CRITICAL BATTERY", val, 0xEF4444, 3200);
+                haptic_play_effect(HAPTIC_DOUBLE_CLICK);
+            } else if (batt.percent <= 15 && !s_warned_low15) {
+                s_warned_low15 = true;
+                char val[40];
+                snprintf(val, sizeof(val), "%d%%  •  %d.%02d V", batt.percent, batt.voltage_mv / 1000, (batt.voltage_mv % 1000) / 10);
+                show_hud("LOW BATTERY", val, 0xF59E0B, 2600);
+                haptic_play_effect(HAPTIC_SHARP_CLICK);
+            }
+        }
+    }
+
+    // Update Player Screen Top Battery & Charge Pill:
+    // Show ONLY when actively charging (and not yet fully charged) OR when discharging strictly below 20%.
+    if (s_batt_pill) {
+        bool is_charging_now = (batt.state == BATT_STATE_CHARGING && batt.charging && !batt.charged);
+        bool is_low_batt_now = (batt.state == BATT_STATE_DISCHARGING && batt.percent >= 0 && batt.percent < 20);
+        bool show_batt_pill  = batt.valid && !batt.charged && (is_charging_now || is_low_batt_now);
+
+        if (!show_batt_pill) {
+            if (!lv_obj_has_flag(s_batt_pill, LV_OBJ_FLAG_HIDDEN)) {
+                lv_obj_add_flag(s_batt_pill, LV_OBJ_FLAG_HIDDEN);
+            }
+        } else {
+            if (lv_obj_has_flag(s_batt_pill, LV_OBJ_FLAG_HIDDEN)) {
+                lv_obj_clear_flag(s_batt_pill, LV_OBJ_FLAG_HIDDEN);
+            }
+            char home_batt_txt[28];
+            int fill_w = 14;
+            uint32_t fill_col = 0x10B981;
+            uint32_t text_col = 0xF8FAFC;
+            uint32_t pill_border = 0x1E293B;
+            uint32_t icon_border = 0xCBD5E1;
+
+            if (is_charging_now) {
+                int base_w = (batt.percent >= 0) ? ((batt.percent * 14 + 50) / 100) : 4;
+                if (base_w < 2) base_w = 2;
+                if (base_w > 12) base_w = 12;
+                int anim_step = (!wc_active && s_active_tab == TAB_NOW_PLAYING) ? (int)((now_ms / 850U) % 3U) : 1;
+                int span = 14 - base_w;
+                fill_w = base_w + ((span * (anim_step + 1)) / 3);
+                if (fill_w > 14) fill_w = 14;
+                fill_col = 0x10B981;
+                text_col = 0x34D399;
+                pill_border = 0x065F46;
+                icon_border = 0x34D399;
+                if (batt.percent >= 0) snprintf(home_batt_txt, sizeof(home_batt_txt), LV_SYMBOL_CHARGE " %d%%", batt.percent);
+                else                   snprintf(home_batt_txt, sizeof(home_batt_txt), LV_SYMBOL_CHARGE " CHG");
+            } else {
+                fill_w = (batt.percent * 14 + 50) / 100;
+                if (batt.percent > 0 && fill_w < 2) fill_w = 2;
+                if (batt.critical_battery) {
+                    fill_col = 0xEF4444;
+                    text_col = 0xF87171;
+                    pill_border = 0x7F1D1D;
+                    icon_border = 0xF87171;
+                } else {
+                    fill_col = 0xF59E0B;
+                    text_col = 0xFBBF24;
+                    pill_border = 0x78350F;
+                    icon_border = 0xFBBF24;
+                }
+                snprintf(home_batt_txt, sizeof(home_batt_txt), "%d%%", batt.percent);
+            }
+
+            static char s_prev_batt_txt[28] = {0};
+            static int s_prev_fill_w = -1;
+            static uint32_t s_prev_fill_col = 0;
+            static uint32_t s_prev_text_col = 0;
+            static uint32_t s_prev_pill_bdr = 0;
+            static uint32_t s_prev_icon_bdr = 0;
+
+            if (strcmp(home_batt_txt, s_prev_batt_txt) != 0) {
+                strncpy(s_prev_batt_txt, home_batt_txt, sizeof(s_prev_batt_txt) - 1);
+                lv_label_set_text(s_lbl_batt_home, home_batt_txt);
+                lv_obj_align(s_batt_pill, LV_ALIGN_TOP_MID, 0, 14);
+            }
+            if (fill_w != s_prev_fill_w) {
+                s_prev_fill_w = fill_w;
+                if (fill_w <= 0) {
+                    lv_obj_add_flag(s_batt_fill, LV_OBJ_FLAG_HIDDEN);
+                } else {
+                    lv_obj_clear_flag(s_batt_fill, LV_OBJ_FLAG_HIDDEN);
+                    lv_obj_set_width(s_batt_fill, fill_w);
+                }
+            }
+            if (fill_col != s_prev_fill_col) {
+                s_prev_fill_col = fill_col;
+                lv_obj_set_style_bg_color(s_batt_fill, hex_to_lv(fill_col), 0);
+            }
+            if (text_col != s_prev_text_col) {
+                s_prev_text_col = text_col;
+                lv_obj_set_style_text_color(s_lbl_batt_home, hex_to_lv(text_col), 0);
+            }
+            if (pill_border != s_prev_pill_bdr) {
+                s_prev_pill_bdr = pill_border;
+                lv_obj_set_style_border_color(s_batt_pill, hex_to_lv(pill_border), 0);
+            }
+            if (icon_border != s_prev_icon_bdr) {
+                s_prev_icon_bdr = icon_border;
+                lv_obj_set_style_border_color(s_batt_body, hex_to_lv(icon_border), 0);
+                lv_obj_set_style_bg_color(s_batt_cap, hex_to_lv(icon_border), 0);
+            }
+        }
     }
 
     // Animate Startup / Wi-Fi Connecting Screen (shows while connecting + 2.2s after link-up to display negotiated speed)
@@ -3038,9 +3380,11 @@ void knob_ui_tick(void) {
     // Refresh Speakers wheel automatically when background mDNS scan updates speakers
     static bool prev_spk_scanning = false;
     static int prev_spk_count = 1;
-    if ((prev_spk_scanning != spk_scanning) || (spk_count != prev_spk_count)) {
+    static uint32_t prev_spk_seq = 0;
+    if ((prev_spk_scanning != spk_scanning) || (spk_count != prev_spk_count) || (spk_list_seq != prev_spk_seq)) {
         prev_spk_scanning = spk_scanning;
         prev_spk_count = spk_count;
+        prev_spk_seq = spk_list_seq;
         for (int i = 0; i < WHEEL_SLOTS; i++) s_sp_cache[i].item_idx = -1;
         if (s_active_tab == TAB_SPEAKERS) {
             update_speaker_wheel(false);
@@ -3115,6 +3459,40 @@ void knob_ui_tick(void) {
             lv_label_set_text_fmt(s_lbl_wifi_ssid, LV_SYMBOL_WIFI " %s (Connecting...)", ssid[0] ? ssid : "Wi-Fi");
             lv_label_set_text(s_lbl_wifi_link, "Negotiating Wi-Fi Link...");
             lv_label_set_text(s_lbl_wifi_ip, "Waiting for DHCP IP...");
+        }
+
+        if (s_bar_batt && s_lbl_batt_set && s_lbl_batt_hdr) {
+            uint32_t bcol = 0x10B981;
+            int bpct = (batt.percent >= 0) ? batt.percent : 100;
+            int v_int = batt.voltage_mv / 1000;
+            int v_frac = (batt.voltage_mv % 1000) / 10;
+            if (batt.charging) {
+                bcol = 0x10B981;
+                lv_label_set_text(s_lbl_batt_hdr, "BATTERY");
+                if (batt.percent >= 0) {
+                    lv_label_set_text_fmt(s_lbl_batt_set, LV_SYMBOL_CHARGE " Charging • %d%% (%d.%02dV)", batt.percent, v_int, v_frac);
+                } else {
+                    lv_label_set_text_fmt(s_lbl_batt_set, LV_SYMBOL_CHARGE " Charging (%d.%02dV)", v_int, v_frac);
+                }
+            } else if (batt.charged) {
+                bcol = 0x10B981;
+                bpct = 100;
+                lv_label_set_text(s_lbl_batt_hdr, "BATTERY");
+                lv_label_set_text_fmt(s_lbl_batt_set, LV_SYMBOL_CHARGE " Charged • 100%% (%d.%02dV)", v_int, v_frac);
+            } else if (batt.state == BATT_STATE_DISCHARGING && batt.percent >= 0) {
+                bcol = batt.critical_battery ? 0xEF4444 : (batt.low_battery ? 0xF59E0B : 0x10B981);
+                lv_label_set_text(s_lbl_batt_hdr, "BATTERY");
+                lv_label_set_text_fmt(s_lbl_batt_set, "%s • %d%% (%d.%02dV)",
+                                      batt.low_battery ? "Low" : "On Battery", batt.percent, v_int, v_frac);
+            } else {
+                bcol = 0x38BDF8;
+                bpct = 100;
+                lv_label_set_text(s_lbl_batt_hdr, "POWER");
+                lv_label_set_text_fmt(s_lbl_batt_set, LV_SYMBOL_CHARGE " USB / Charging (%d.%02dV)", v_int, v_frac);
+            }
+            lv_bar_set_value(s_bar_batt, bpct, LV_ANIM_OFF);
+            lv_obj_set_style_bg_color(s_bar_batt, hex_to_lv(bcol), LV_PART_INDICATOR);
+            lv_obj_set_style_text_color(s_lbl_batt_set, hex_to_lv(bcol), 0);
         }
 
         int pcm_pct = ((int)pcm_kb * 100) / AudioBuffer::PCM_KIB;

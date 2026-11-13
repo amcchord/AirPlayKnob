@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include "app_state.h"
+#include "freertos/task.h"
 
 #define RAOP_CHUNK_FRAMES 352
 #define RAOP_SAMPLE_RATE  44100
@@ -152,10 +153,24 @@ private:
     uint16_t m_repair_cursor = 0;
     uint64_t m_last_repair_us = 0, m_last_reject_us = 0;
     uint32_t m_max_audio_gap_ms = 0, m_audio_gap_events = 0, m_max_control_write_ms = 0;
+    uint16_t m_unsent_seq = 0;
+    uint16_t m_unsent_len = 0;
+    uint64_t m_unsent_since_us = 0;
+    uint64_t m_unsent_last_try_us = 0;
+    uint32_t m_tx_ok_1s = 0;
+    uint32_t m_tx_retry_1s = 0;
+    uint32_t m_tx_drop_1s = 0;
+    int m_last_tx_errno = 0;
+    bool flushUnsentPacket();
+    void maybeLogRaop1s(uint64_t now_us);
     void sendPendingRepair();
 
     volatile bool m_timing_running;
+    volatile bool m_timing_alive;
+    volatile bool m_timing_busy;
     TaskHandle_t m_timing_task;
+    StackType_t *m_timing_stack;
+    StaticTask_t *m_timing_tcb;
 
     struct BacklogSlot {
         uint16_t seq;

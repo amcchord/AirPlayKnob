@@ -1,54 +1,19 @@
-# Current state — 2026-11-07
+# Current state — 2026-11-13 (`v1.1.0`)
 
-**Recovered after an accidental flash of another project.** The knob again
-runs `pcm512-20261107-r9`, source `7e4158e`, now in **app0**. Workshop Sonos
-Five is selected in smart/native mode, preset **19 (Fluid)**, current volume
-**8**, local monitoring and WhiteCap off. Sonos fetches audio directly;
-zero local PCM/MP3 is intentional. Album art is active.
+**AirPlayKnob `v1.1.0` shipped and verified on hardware.** Both the original and
+newly attached battery-equipped Waveshare ESP32-S3-Knob-Touch-LCD-1.8 units are
+supported by unified `v1.1.0` firmware on `main`:
 
-The foreign firmware replaced the bootloader/partition layout and erased the
-old AirPlayKnob settings area. Confirmed the S3 MAC 28:84:85:4b:e3:44 on
-`/dev/cu.usbmodem14201` before writing. Backed up the first 64 KiB privately.
-Restored the exact saved r9 bootloader/partition table, reconstructed NVS at
-0x9000, OTA initialization at 0xe000 and firmware at 0x10000. All five segment
-hash checks passed; generated NVS passed the official integrity check.
-The combined factory image was validated but not flashed over the settings.
-
-Reconstructed Wi-Fi from existing private project configuration and the last
-verified Workshop/Fluid settings. The cached 30 presets exactly match source
-defaults. The saved speaker record uses genuine previously verified discovery
-metadata, so it resumed native Sonos without a new discovery workaround or
-source seed. Original erased pairing identity cannot be preserved; firmware
-regenerates its controller identity normally. No firmware source change or
-rebuild. Other attached USB devices were left untouched.
-
-The initial restored volume was observed at 18, then set to last-known 24;
-it moved to 8 during verification. Kept the resulting current value instead
-of repeatedly forcing 24. An initial strict fixed-volume monitor stopped on
-that change; it was not a playback failure. The completed monitor then ran
-**66.47 seconds / 13 samples**, all receiver PLAYING, exact Fluid stream URI,
-receiver volume matching the knob, unmuted, zero new underruns or observed
-reset, and album art. Physical screen/listening confirmation was requested
-separately. Earlier smart Sonos playback had been user-confirmed steady.
-
-Exact firmware SHA-256:
-`215b77a783a4d05b01dbaf7deba78f65cb7f998930a6667e09ff7af06177d7b1`.
-Saved image/ELF/source validation: `artifacts/firmware/pcm512-2026-11-07-r9/`.
-Recovery manifests, private backup/settings, flash/integrity logs and native
-checks: `artifacts/firmware/accidental-reflash-2026-11-07/` (ignored, protected).
-Previously retained images and original-main worktree remain available.
-
-Generic AirPlay/HomePod reliability is still unresolved; both r9 and rebuilt
-original main failed five-minute HomePod tests. The source retains 512 KiB
-PCM / 256 KiB MP3 and revised startup/artwork thresholds for controller audio.
-No source changes required repeated host tests; this recovery reused the
-previously validated image and verified the actual flashed layout/settings.
-
-Root integration branch: `codex/workshop-audio`, published through
-[PR #1](https://github.com/amcchord/AirPlayKnob/pull/1), main unmerged.
-Broader transport/discovery work remains in
-[issue #2](https://github.com/amcchord/AirPlayKnob/issues/2).
-Next safe action: leave Workshop in smart Sonos mode. Before any future flash,
-recheck hardware identity, partition table and OTA selection; **app0 is now
-current**, and another project's layout requires recovery before application
-addresses from this project can be assumed.
+- **Sustained HomePod AirPlay 2 & HTTP Streaming**:
+  - Raw lwIP `IcyRawTcp` HTTP client (`16 × MSS = 22,976 B` receive window, `TF_SACK` cleared, immediate ACK, DNS cache, and multi-AP BSSID stall failover with NVS `pref_bssid`) keeps the 256 KiB MP3 and 512 KiB PCM buffers full (`~2,955 ms` PCM / `~252 KB` MP3) across both local 3.5mm DAC and AirPlay playback.
+  - Reclaimed `~92 KB` free Internal DMA SRAM (`~81.9 KB` largest contiguous block) and configured ESP-IDF Wi-Fi (`__wrap_esp_wifi_init`, `custom_cfg_err=0`) with `64` PSRAM `cache_tx_buf` staging slots + `48` dynamic MAC TX buffers, `802.11b/g/n` HT20 A-MPDU aggregation, and `IP_TOS = 0xA0` (`DSCP CS5` / `AC_VI`).
+  - Fixed `RaopClient::sendSyncPacket()` (`PT=0xD4`) to derive `sync_rtp_ts` monotonically from wall-clock `sync_ntp` (`ntp_to_ts(sync_ntp, 44100)` with `m_latency_frames = 88,200` on AirPlay 2) instead of `m_head_ts`, paired with lossless `flushUnsentPacket()` (`750 ms` hold), `4.0 ms` NACK repair pacing, and `20 ms` lock-free `raop_tx` state caching.
+  - Verified on **Workshop (HomePod)** (`AudioAccessory5,1`): `27,605 / 27,605` RTP originals accepted (`0` local/driver rejects, `0` retries, `0` audio gap events `> 50 ms`, `16 ms` max gap, `0` underruns), followed by multi-hour uninterrupted listening confirmed by the user.
+- **Battery & Charge State Telemetry**:
+  - Calibrated `GPIO 1` (`ADC1_CHANNEL_0`) LiPo SoC + `USB_SERIAL_JTAG` SOF and voltage-step/slope charge estimator (`src/bsp/battery_monitor.cpp`).
+  - Home player screen (`Tab 0`) keeps the artwork clean by displaying the top-center battery indicator only when actively charging or below `20%` (and hiding once full), while Settings (`Tab 3`), Web Portal, `/api/status`, and `BATTERY` CLI expose continuous telemetry.
+- **Full-LAN Alphabetical AirPlay Speaker Discovery**:
+  - Two-pass PSRAM mDNS scan (`_airplay._tcp` + `_raop._tcp`, up to 48 speakers) sorted case-insensitively (`A -> Z`, `Local 3.5mm Jack` last).
+- **Release & CI**:
+  - All five host test suites (`test_alac_packets.py`, `test_rtsp_responses.py`, `test_network_policy.py`, `test_pcm_buffer.py`, `test_battery_monitor.py`) and clean credential-free PlatformIO builds run in GitHub Actions.
+  - Clean credential-free `AirPlayKnob-v1.1.0-factory.bin` and `AirPlayKnob-v1.1.0-ota.bin` assets published on GitHub Releases (`v1.1.0`).

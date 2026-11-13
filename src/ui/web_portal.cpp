@@ -123,7 +123,10 @@ static const char WEB_UI_HTML[] PROGMEM = R"rawliteral(
         <div class="sub">Minimalist SomaFM Internet Radio to AirPlay Streamer</div>
       </div>
     </div>
-    <div class="wifi-pill" id="wifiBadge">Connecting...</div>
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+      <div class="wifi-pill" id="battBadge" style="color:#10b981;">⚡ Checking...</div>
+      <div class="wifi-pill" id="wifiBadge">Connecting...</div>
+    </div>
   </header>
 
   <section class="now-card">
@@ -219,6 +222,7 @@ static const char WEB_UI_HTML[] PROGMEM = R"rawliteral(
           <div class="panel-title">Live Buffers & Streaming Telemetry</div>
         </div>
         <div style="font-size:12px;color:var(--muted);display:flex;flex-direction:column;gap:8px;">
+          <div style="display:flex;justify-content:space-between;"><span>Battery & Power:</span><strong id="telBatt" style="color:#10b981;">—</strong></div>
           <div style="display:flex;justify-content:space-between;"><span>Wi-Fi Negotiated Link:</span><strong id="telWifi" style="color:#10b981;">—</strong></div>
           <div style="display:flex;justify-content:space-between;"><span>PCM Ringbuffer (2 MB PSRAM):</span><strong id="telPcm" style="color:#f8fafc;">—</strong></div>
           <div style="display:flex;justify-content:space-between;"><span>MP3 Stream Buffer (64 KB):</span><strong id="telMp3" style="color:#38bdf8;">—</strong></div>
@@ -299,6 +303,23 @@ async function refreshState() {
     }
     const modes = ['VOL', 'TUNE', 'SPKR'];
     document.getElementById('knobModeBtn').textContent = modes[s.knob_mode] || 'VOL';
+
+    const bv = ((s.battery_mv || 0) / 1000).toFixed(2);
+    const bpct = (typeof s.battery_pct === 'number' && s.battery_pct >= 0) ? `${s.battery_pct}%` : null;
+    const bstate = s.battery_state_text || 'Power';
+    let battCol = '#10b981';
+    let battIcon = '🔋';
+    if (s.battery_charging) { battIcon = '⚡'; battCol = '#10b981'; }
+    else if (s.battery_charged) { battIcon = '⚡'; battCol = '#10b981'; }
+    else if (s.battery_state === 'usb_power') { battIcon = '🔌'; battCol = '#38bdf8'; }
+    else if (s.battery_critical) { battIcon = '🪫'; battCol = '#ef4444'; }
+    else if (s.battery_low) { battIcon = '🪫'; battCol = '#f59e0b'; }
+    const battBadgeEl = document.getElementById('battBadge');
+    battBadgeEl.style.color = battCol;
+    battBadgeEl.textContent = bpct ? `${battIcon} ${bpct} • ${bstate}` : `${battIcon} ${bstate} (${bv}V)`;
+    const telBattEl = document.getElementById('telBatt');
+    telBattEl.style.color = battCol;
+    telBattEl.textContent = bpct ? `${bstate} • ${bpct} • ${bv} V${s.battery_usb_host ? ' (USB)' : ''}` : `${bstate} • ${bv} V`;
 
     document.getElementById('telWifi').textContent = `${s.wifi_speed_mbps || 72} Mbps • ${s.wifi_phy_mode || '802.11n'} • Ch ${s.wifi_channel || 1} (${s.wifi_rssi || -55} dBm)`;
     document.getElementById('telPcm').textContent = s.sonos_native && !s.local_monitor ? 'Audio buffered by Sonos' : `${s.pcm_buf_kb || 0} / ${s.pcm_capacity_kb || 512} KB (${((s.pcm_buf_ms || 0)/1000).toFixed(1)}s)`;
@@ -664,7 +685,7 @@ static void handle_status() {
         json_escape(g_app.wifi_phy_mode, esc1, sizeof(esc1));
         json += "\"wifi_phy_mode\":\""; json += esc1; json += "\",";
         json += "\"wifi_channel\":"; json += String(g_app.wifi_channel); json += ",";
-        json += "\"wifi_bssid\":\""; json += WiFi.BSSIDstr(); json += "\",";
+        json += "\"wifi_bssid\":\""; json += g_app.wifi_bssid; json += "\",";
         json += "\"pcm_capacity_bytes\":"; json += String(AudioBuffer::PCM_BYTES); json += ",";
         json += "\"pcm_capacity_kb\":"; json += String(AudioBuffer::PCM_KIB); json += ",";
         json += "\"pcm_capacity_ms\":"; json += String(AudioBuffer::PCM_USABLE_MS); json += ",";
@@ -692,6 +713,21 @@ static void handle_status() {
         json += "\"pin_prompt_active\":"; json += (g_app.pin_prompt_active ? "true" : "false"); json += ",";
         json_escape(g_app.pin_speaker_name, esc1, sizeof(esc1));
         json += "\"pin_speaker_name\":\""; json += esc1; json += "\",";
+        json += "\"battery_valid\":"; json += (g_app.battery.valid ? "true" : "false"); json += ",";
+        json += "\"battery_present\":"; json += (g_app.battery.battery_present ? "true" : "false"); json += ",";
+        json += "\"battery_usb_present\":"; json += (g_app.battery.usb_present ? "true" : "false"); json += ",";
+        json += "\"battery_usb_host\":"; json += (g_app.battery.usb_host ? "true" : "false"); json += ",";
+        json += "\"battery_charging\":"; json += (g_app.battery.charging ? "true" : "false"); json += ",";
+        json += "\"battery_charged\":"; json += (g_app.battery.charged ? "true" : "false"); json += ",";
+        json += "\"battery_low\":"; json += (g_app.battery.low_battery ? "true" : "false"); json += ",";
+        json += "\"battery_critical\":"; json += (g_app.battery.critical_battery ? "true" : "false"); json += ",";
+        json += "\"battery_pct\":"; json += String(g_app.battery.percent); json += ",";
+        json += "\"battery_mv\":"; json += String(g_app.battery.voltage_mv); json += ",";
+        json += "\"battery_raw_mv\":"; json += String(g_app.battery.raw_mv); json += ",";
+        json += "\"battery_raw_adc\":"; json += String(g_app.battery.raw_adc); json += ",";
+        json += "\"battery_slope_mv_min\":"; json += String(g_app.battery.slope_mv_per_min); json += ",";
+        json += "\"battery_state\":\""; json += battery_state_slug(g_app.battery.state); json += "\",";
+        json += "\"battery_state_text\":\""; json += battery_state_label(g_app.battery.state); json += "\",";
 
         json += "\"presets\":[";
         for (int i = 0; i < g_app.preset_count; i++) {

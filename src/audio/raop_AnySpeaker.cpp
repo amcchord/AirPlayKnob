@@ -349,7 +349,11 @@ RaopClient::RaopClient()
       m_ntp_replies(0),
       m_retransmits(0),
       m_timing_running(false),
+      m_timing_alive(true),
+      m_timing_busy(false),
       m_timing_task(NULL),
+      m_timing_stack(NULL),
+      m_timing_tcb(NULL),
       m_backlog(NULL),
       m_alac_buf(NULL),
       m_rtp_pkt(NULL) {
@@ -357,10 +361,23 @@ RaopClient::RaopClient()
     m_backlog  = (BacklogSlot *)heap_caps_calloc(BACKLOG_SIZE, sizeof(BacklogSlot), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     m_alac_buf = (uint8_t *)heap_caps_calloc(1424, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     m_rtp_pkt  = (uint8_t *)heap_caps_calloc(1484, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    m_timing_stack = (StackType_t *)heap_caps_malloc(4096, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    m_timing_tcb   = (StaticTask_t *)heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (m_timing_stack && m_timing_tcb) {
+        m_timing_task = xTaskCreateStaticPinnedToCore(
+            timingTaskTrampoline, "raop_ntp", 4096 / sizeof(StackType_t),
+            this, 5, m_timing_stack, m_timing_tcb, 0);
+    }
 }
 
 RaopClient::~RaopClient() {
     disconnect();
+    m_timing_alive = false;
+    for (int i = 0; i < 20 && m_timing_task != NULL; i++) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (m_timing_stack) { heap_caps_free(m_timing_stack); m_timing_stack = NULL; }
+    if (m_timing_tcb)   { heap_caps_free(m_timing_tcb);   m_timing_tcb   = NULL; }
     if (m_backlog)  { heap_caps_free(m_backlog);  m_backlog  = NULL; }
     if (m_alac_buf) { heap_caps_free(m_alac_buf); m_alac_buf = NULL; }
     if (m_rtp_pkt)  { heap_caps_free(m_rtp_pkt);  m_rtp_pkt  = NULL; }
@@ -401,6 +418,8 @@ bool RaopClient::connect(const AirPlaySpeaker &spk, int initial_volume_pct) {
     m_pending_repairs = 0; m_repair_cursor = 0;
     m_last_repair_us = 0; m_last_reject_us = 0;
     m_max_audio_gap_ms = 0; m_audio_gap_events = 0; m_max_control_write_ms = 0;
+    m_unsent_seq = 0; m_unsent_len = 0; m_unsent_since_us = 0; m_unsent_last_try_us = 0;
+    m_tx_ok_1s = 0; m_tx_retry_1s = 0; m_tx_drop_1s = 0; m_last_tx_errno = 0;
     if (m_backlog) memset(m_backlog, 0, BACKLOG_SIZE * sizeof(BacklogSlot));
     m_latency_frames = 44100;
 
@@ -491,17 +510,22 @@ bool RaopClient::connect(const AirPlaySpeaker &spk, int initial_volume_pct) {
         return false;
     }
 
-    // Map real-time audio and its timing/control packets to Wi-Fi's video
-    // access category (IP precedence 5), rather than the best-effort queue.
-    // This category retains aggregation without using the management/voice queue.
-    const int audio_tos = 0xB8;
+    // Map real-time audio and its timing/control packets to Wi-Fi's AC_VI video
+    // access category using DSCP CS5 (0xA0: precedence 5 / DSCP 40), which maps
+    // to AC_VI on both ESP-IDF and RFC 8325 / UniFi APs so 802.11n A-MPDU
+    // aggregation stays active across both wireless hops without hitting AC_VO.
+    const int audio_tos = 0xA0;
     setsockopt(m_audio_sock, IPPROTO_IP, IP_TOS, &audio_tos, sizeof(audio_tos));
     setsockopt(m_ctrl_sock, IPPROTO_IP, IP_TOS, &audio_tos, sizeof(audio_tos));
     setsockopt(m_time_sock, IPPROTO_IP, IP_TOS, &audio_tos, sizeof(audio_tos));
+    const int ctrl_rcvbuf = 16 * 1024;
+    setsockopt(m_ctrl_sock, SOL_SOCKET, SO_RCVBUF, &ctrl_rcvbuf, sizeof(ctrl_rcvbuf));
 
     m_remote_time_port = 0;
     m_timing_running = true;
-    xTaskCreatePinnedToCore(timingTaskTrampoline, "raop_ntp", 4096, this, 5, &m_timing_task, 0);
+    if (!m_timing_task) {
+        xTaskCreatePinnedToCore(timingTaskTrampoline, "raop_ntp", 4096, this, 5, &m_timing_task, 0);
+    }
 
     bool supports_transient = false;
     bool pin_required = spk.requires_pin;
@@ -664,12 +688,12 @@ bool RaopClient::connect(const AirPlaySpeaker &spk, int initial_volume_pct) {
 void RaopClient::disconnect() {
     bool was_connected = m_connected;
     m_connected = false;
+    m_unsent_len = 0;
     if (m_timing_running) {
         m_timing_running = false;
-        for (int i = 0; i < 25 && m_timing_task != NULL; i++) {
+        for (int i = 0; i < 15 && m_timing_busy; i++) {
             vTaskDelay(pdMS_TO_TICKS(10));
         }
-        m_timing_task = NULL;
     }
     if (m_event_sock >= 0) {
         close(m_event_sock);
@@ -2266,6 +2290,7 @@ bool RaopClient::setArtwork(const uint8_t *jpeg_data, size_t jpeg_len) {
 void RaopClient::resyncTimestamp() {
     m_head_ts = ntp_to_ts(get_ntp_now(NULL, NULL), RAOP_SAMPLE_RATE);
     m_first_pkt = true;
+    m_unsent_len = 0;
 }
 
 void RaopClient::sendSyncPacket(bool first) {
@@ -2282,14 +2307,18 @@ void RaopClient::sendSyncPacket(bool first) {
     } pkt;
 
     uint32_t ntp_sec = 0, ntp_frac = 0;
-    get_ntp_now(&ntp_sec, &ntp_frac);
+    uint64_t sync_ntp = get_ntp_now(&ntp_sec, &ntp_frac);
+    // Always derive the RTP sync reference directly from the monotonic NTP clock rather than m_head_ts:
+    // during temporary Wi-Fi TX queuing, m_head_ts lags wall clock while buffered audio drains, and
+    // sending a lagged m_head_ts in PT=0xD4 would tell HomePod to warp/resync its playout clock!
+    uint32_t sync_rtp_ts = (uint32_t)ntp_to_ts(sync_ntp, RAOP_SAMPLE_RATE);
     pkt.proto = 0x80 | (first ? 0x10 : 0x00);
     pkt.type = 0x54 | 0x80;
     pkt.seq = htons(7);
-    pkt.rtp_ts_latency = htonl((uint32_t)(m_head_ts - m_latency_frames));
+    pkt.rtp_ts_latency = htonl(sync_rtp_ts - m_latency_frames);
     pkt.ntp_sec = htonl(ntp_sec);
     pkt.ntp_frac = htonl(ntp_frac);
-    pkt.rtp_ts = htonl((uint32_t)m_head_ts);
+    pkt.rtp_ts = htonl(sync_rtp_ts);
 
     struct sockaddr_in dst = {};
     dst.sin_family = AF_INET;
@@ -2299,26 +2328,42 @@ void RaopClient::sendSyncPacket(bool first) {
 }
 
 bool RaopClient::acceptFrames() const {
-    if (!m_connected) return false;
+    if (!m_connected || m_unsent_len > 0) return false;
     if (m_first_pkt) return true;
     uint64_t now_us = esp_timer_get_time();
-    if (m_last_pkt_us > 0 && (now_us - m_last_pkt_us) < 2500ULL) {
-        return false; // Pace catch-up bursts to >= 2.5ms between packet starts (nominal is 7.98ms)
+    uint64_t min_gap_us = (m_last_reject_us && (now_us - m_last_reject_us) < 60000ULL) ? 7500ULL : 6000ULL;
+    if (m_last_pkt_us > 0 && (now_us - m_last_pkt_us) < min_gap_us) {
+        return false; // Pace catch-up smoothly (>= 6.0ms, or >= 7.5ms right after TX queue backpressure)
     }
     uint64_t now_ts = ntp_to_ts(get_ntp_now(NULL, NULL), RAOP_SAMPLE_RATE);
     return (now_ts >= m_head_ts + RAOP_CHUNK_FRAMES);
 }
 
+void RaopClient::maybeLogRaop1s(uint64_t now_us) {
+    if (now_us - m_last_sync_us >= 1000000ULL) {
+        sendSyncPacket(false);
+        m_last_sync_us = now_us;
+        Serial.printf("[RAOP-1S] seq=%u txOk=%lu retry=%lu drop=%lu errno=%d retr=%lu ntp=%lu heap=%u largest=%u\n",
+                      (unsigned)m_seq_num,
+                      (unsigned long)m_tx_ok_1s,
+                      (unsigned long)m_tx_retry_1s,
+                      (unsigned long)m_tx_drop_1s,
+                      m_last_tx_errno,
+                      (unsigned long)m_retransmits,
+                      (unsigned long)m_ntp_replies,
+                      (unsigned)ESP.getFreeHeap(),
+                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        m_tx_ok_1s = 0;
+        m_tx_retry_1s = 0;
+        m_tx_drop_1s = 0;
+    }
+}
+
 bool RaopClient::sendChunk(const int16_t *stereo_pcm_352) {
     if (!m_connected || m_audio_sock < 0 || !m_alac_buf || !m_rtp_pkt) return false;
+    if (m_unsent_len > 0 && !flushUnsentPacket()) return false;
 
     const uint64_t packet_start = esp_timer_get_time();
-    if (m_last_pkt_us) {
-        uint32_t gap_ms = (uint32_t)((packet_start - m_last_pkt_us) / 1000);
-        if (gap_ms > m_max_audio_gap_ms) m_max_audio_gap_ms = gap_ms;
-        if (gap_ms > 50) ++m_audio_gap_events;
-    }
-    m_last_pkt_us = packet_start;
     uint64_t now_ts = ntp_to_ts(get_ntp_now(NULL, NULL), RAOP_SAMPLE_RATE);
     // Only force a hard RTP timestamp resync on the first packet or if clock drifted by >1000ms (44100 frames);
     // smaller scheduling jitter is absorbed seamlessly by the speaker's 2000ms buffer via continuous m_head_ts!
@@ -2326,7 +2371,7 @@ bool RaopClient::sendChunk(const int16_t *stereo_pcm_352) {
     if (resync) {
         m_head_ts = now_ts;
         sendSyncPacket(true);
-        m_last_sync_us = m_last_pkt_us;
+        m_last_sync_us = packet_start;
     }
 
     uint8_t *alac_buf = m_alac_buf;
@@ -2392,60 +2437,117 @@ bool RaopClient::sendChunk(const int16_t *stereo_pcm_352) {
         memcpy(slot.data, rtp_pkt, total_len);
     }
 
-    static uint32_t s_tx_ok_1s = 0;
-    static uint32_t s_tx_retry_1s = 0;
-    static uint32_t s_tx_drop_1s = 0;
-    static int s_last_errno = 0;
-    if (m_pkts_sent == 0) {
-        s_tx_ok_1s = 0;
-        s_tx_retry_1s = 0;
-        s_tx_drop_1s = 0;
-        s_last_errno = 0;
-    }
+    m_head_ts += RAOP_CHUNK_FRAMES;
+    m_pkts_sent++;
 
     struct sockaddr_in dst = {};
     dst.sin_family = AF_INET;
     dst.sin_addr.s_addr = m_peer_ip_addr;
     dst.sin_port = htons(m_remote_audio_port);
     int sent = sendto(m_audio_sock, rtp_pkt, total_len, 0, (struct sockaddr *)&dst, sizeof(dst));
-    for (int retry = 0; sent < 0 && (errno == ENOMEM || errno == EAGAIN) && retry < 4; retry++) {
-        s_tx_retry_1s++;
+    if (sent < 0 && (errno == ENOMEM || errno == EAGAIN)) {
+        m_tx_retry_1s++;
         m_audio_tx.retries++;
-        s_last_errno = errno;
+        m_last_tx_errno = errno;
         vTaskDelay(pdMS_TO_TICKS(1));
         sent = sendto(m_audio_sock, rtp_pkt, total_len, 0, (struct sockaddr *)&dst, sizeof(dst));
     }
+    if (sent < 0 && (errno == ENOMEM || errno == EAGAIN) && m_backlog) {
+        // Hold this prepared RTP packet until a local Wi-Fi TX buffer frees up while keeping
+        // subsequent audio in the 3s PSRAM PCM ring so zero sequence numbers are dropped!
+        uint64_t rej_us = esp_timer_get_time();
+        m_tx_retry_1s++;
+        m_audio_tx.retries++;
+        m_last_tx_errno = errno;
+        m_last_reject_us = rej_us;
+        m_unsent_seq = m_seq_num;
+        m_unsent_len = (uint16_t)total_len;
+        m_unsent_since_us = rej_us;
+        m_unsent_last_try_us = rej_us;
+        maybeLogRaop1s(rej_us);
+        return false;
+    }
+
     const bool accepted = m_audio_tx.record(sent, total_len, sent < 0 ? errno : EIO);
+    uint64_t done_us = esp_timer_get_time();
     if (accepted) {
-        s_tx_ok_1s++;
+        if (m_last_pkt_us) {
+            uint32_t gap_ms = (uint32_t)((done_us - m_last_pkt_us) / 1000);
+            if (gap_ms > m_max_audio_gap_ms) m_max_audio_gap_ms = gap_ms;
+            if (gap_ms > 50) {
+                ++m_audio_gap_events;
+                Serial.printf("[RAOP-GAP] gap=%lums seq=%u retries=%lu retr=%lu heap=%u\n",
+                              (unsigned long)gap_ms, (unsigned)m_seq_num,
+                              (unsigned long)m_audio_tx.retries, (unsigned long)m_retransmits,
+                              (unsigned)ESP.getFreeHeap());
+            }
+        }
+        m_last_pkt_us = done_us;
+        m_tx_ok_1s++;
     } else {
-        s_tx_drop_1s++;
-        s_last_errno = m_audio_tx.last_error;
-        m_last_reject_us = esp_timer_get_time();
+        m_tx_drop_1s++;
+        m_last_tx_errno = m_audio_tx.last_error;
+        m_last_reject_us = done_us;
     }
-
-    m_head_ts += RAOP_CHUNK_FRAMES;
-    m_pkts_sent++;
-
-    uint64_t now_us = esp_timer_get_time();
-    if (now_us - m_last_sync_us >= 1000000ULL) {
-        sendSyncPacket(false);
-        m_last_sync_us = now_us;
-        Serial.printf("[RAOP-1S] seq=%u txOk=%lu retry=%lu drop=%lu errno=%d retr=%lu ntp=%lu heap=%u largest=%u\n",
-                      (unsigned)m_seq_num,
-                      (unsigned long)s_tx_ok_1s,
-                      (unsigned long)s_tx_retry_1s,
-                      (unsigned long)s_tx_drop_1s,
-                      s_last_errno,
-                      (unsigned long)m_retransmits,
-                      (unsigned long)m_ntp_replies,
-                      (unsigned)ESP.getFreeHeap(),
-                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-        s_tx_ok_1s = 0;
-        s_tx_retry_1s = 0;
-        s_tx_drop_1s = 0;
-    }
+    maybeLogRaop1s(done_us);
     return accepted;
+}
+
+bool RaopClient::flushUnsentPacket() {
+    if (m_unsent_len == 0) return true;
+    if (!m_connected || m_audio_sock < 0 || !m_backlog) {
+        m_unsent_len = 0;
+        return false;
+    }
+    uint64_t pre_us = esp_timer_get_time();
+    if (m_unsent_last_try_us && (pre_us - m_unsent_last_try_us) < 4000ULL) {
+        return false; // Rate-limit local TX queue probes to once every 4ms (~half an RTP frame)
+    }
+    m_unsent_last_try_us = pre_us;
+
+    BacklogSlot &slot = m_backlog[m_unsent_seq % BACKLOG_SIZE];
+    if (slot.seq != m_unsent_seq || slot.len != m_unsent_len) {
+        m_unsent_len = 0;
+        return false;
+    }
+
+    struct sockaddr_in dst = {};
+    dst.sin_family = AF_INET;
+    dst.sin_addr.s_addr = m_peer_ip_addr;
+    dst.sin_port = htons(m_remote_audio_port);
+    int sent = sendto(m_audio_sock, slot.data, m_unsent_len, 0, (struct sockaddr *)&dst, sizeof(dst));
+    uint64_t now_us = esp_timer_get_time();
+    if (sent == (int)m_unsent_len) {
+        m_audio_tx.record(sent, m_unsent_len, 0);
+        if (m_last_pkt_us) {
+            uint32_t gap_ms = (uint32_t)((now_us - m_last_pkt_us) / 1000);
+            if (gap_ms > m_max_audio_gap_ms) m_max_audio_gap_ms = gap_ms;
+            if (gap_ms > 50) ++m_audio_gap_events;
+        }
+        m_last_pkt_us = now_us;
+        m_tx_ok_1s++;
+        m_unsent_len = 0;
+        maybeLogRaop1s(now_us);
+        return true;
+    }
+
+    int err = sent < 0 ? errno : EIO;
+    if ((err == ENOMEM || err == EAGAIN) && (now_us - m_unsent_since_us) <= 750000ULL) {
+        m_tx_retry_1s++;
+        m_audio_tx.retries++;
+        m_last_tx_errno = err;
+        m_last_reject_us = now_us;
+        maybeLogRaop1s(now_us);
+        return false;
+    }
+
+    m_audio_tx.record(sent, m_unsent_len, err);
+    m_tx_drop_1s++;
+    m_last_tx_errno = m_audio_tx.last_error;
+    m_last_reject_us = now_us;
+    m_unsent_len = 0;
+    maybeLogRaop1s(now_us);
+    return false;
 }
 
 void RaopClient::handleControlSocket() {
@@ -2473,8 +2575,8 @@ void RaopClient::handleControlSocket() {
 void RaopClient::sendPendingRepair() {
     const uint64_t now = esp_timer_get_time();
     if (!m_pending_repairs || !m_backlog || !m_rtp_pkt ||
-        now - m_last_repair_us < 8000ULL ||
-        (m_last_pkt_us && now - m_last_pkt_us < 4000ULL) ||
+        now - m_last_repair_us < 4000ULL ||
+        (m_last_pkt_us && now - m_last_pkt_us < 2500ULL) ||
         (m_last_reject_us && now - m_last_reject_us < 20000ULL)) return;
     for (int i = 0; i < BACKLOG_SIZE; ++i) {
         BacklogSlot &slot = m_backlog[m_repair_cursor++ % BACKLOG_SIZE];
@@ -2507,8 +2609,9 @@ void RaopClient::sendPendingRepair() {
 
 void RaopClient::pollControlAndKeepalive(bool allow_repair) {
     if (!m_connected) return;
+    flushUnsentPacket();
     handleControlSocket();
-    if (allow_repair) sendPendingRepair();
+    if (allow_repair && m_unsent_len == 0) sendPendingRepair();
 
     uint64_t now_us = esp_timer_get_time();
     static uint64_t s_last_rtsp_poll_us = 0;
@@ -2556,18 +2659,28 @@ void RaopClient::timingTaskLoop() {
         uint32_t send_frac;
     } req, rsp;
 
-    while (m_timing_running && m_time_sock >= 0) {
-        struct timeval tv = {.tv_sec = 0, .tv_usec = 100000};
+    while (m_timing_alive) {
+        int sock = m_time_sock;
+        if (!m_timing_running || sock < 0) {
+            m_timing_busy = false;
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        m_timing_busy = true;
+        struct timeval tv = {.tv_sec = 0, .tv_usec = 50000};
         fd_set rfds;
         FD_ZERO(&rfds);
-        FD_SET(m_time_sock, &rfds);
-        int r = select(m_time_sock + 1, &rfds, NULL, NULL, &tv);
-        if (r <= 0 || !FD_ISSET(m_time_sock, &rfds)) continue;
+        FD_SET(sock, &rfds);
+        int r = select(sock + 1, &rfds, NULL, NULL, &tv);
+        if (r <= 0 || !FD_ISSET(sock, &rfds) || !m_timing_running) {
+            m_timing_busy = false;
+            continue;
+        }
 
         struct sockaddr_in client_in = {};
         socklen_t clen = sizeof(client_in);
-        int n = recvfrom(m_time_sock, &req, sizeof(req), 0, (struct sockaddr *)&client_in, &clen);
-        if (n >= (int)sizeof(req)) {
+        int n = recvfrom(sock, &req, sizeof(req), 0, (struct sockaddr *)&client_in, &clen);
+        if (n >= (int)sizeof(req) && m_timing_running) {
             uint32_t sec = 0, frac = 0;
             get_ntp_now(&sec, &frac);
             rsp = req;
@@ -2578,8 +2691,9 @@ void RaopClient::timingTaskLoop() {
             rsp.recv_frac = htonl(frac);
             rsp.send_sec = htonl(sec);
             rsp.send_frac = htonl(frac);
-            if (sendto(m_time_sock, &rsp, sizeof(rsp), 0, (struct sockaddr *)&client_in, clen) == sizeof(rsp))
+            if (sendto(sock, &rsp, sizeof(rsp), 0, (struct sockaddr *)&client_in, clen) == sizeof(rsp))
                 m_ntp_replies++;
         }
+        m_timing_busy = false;
     }
 }

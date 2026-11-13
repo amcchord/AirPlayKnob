@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches: [main, 'codex/**']
+    tags: ['v*']
 
 permissions:
   contents: read
@@ -31,6 +32,7 @@ jobs:
           python tests/test_rtsp_responses.py
           python tests/test_network_policy.py
           python tests/test_pcm_buffer.py
+          python tests/test_battery_monitor.py
       - name: Build firmware without private credentials
         run: pio run
       - name: Check whitespace

@@ -4,11 +4,12 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "somafm_presets.h"
+#include "battery_monitor.h"
 
 #define MAX_PRESETS        48
 #define MAX_SPEAKERS       48
 #define MAX_WIFI_SCAN      20
-#define AIRPLAYKNOB_BUILD_ID "pcm512-20261107-r9"
+#define AIRPLAYKNOB_BUILD_ID "v1.1.0"
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -47,6 +48,7 @@ struct AirPlaySpeaker {
     bool is_local_dac;
     bool is_ap2;
     bool requires_pin;
+    bool has_raop;
     uint32_t last_seen_ms;
 };
 
@@ -79,6 +81,7 @@ struct AppState {
     bool wifi_scan_deferred;
     uint32_t speaker_scan_count;
     uint32_t speaker_scan_last_ms;
+    uint32_t speaker_list_seq;
 
     // Playback & Volume
     bool playing;
@@ -141,6 +144,9 @@ struct AppState {
     // Knob mode
     KnobMode knob_mode;
 
+    // Battery & Power Management (GPIO1 / ADC1_CH0 + USB SOF)
+    BatteryTelemetry battery;
+
     // Wi-Fi
     char wifi_ssid[36];
     char wifi_pass[64];
@@ -149,6 +155,7 @@ struct AppState {
     int32_t wifi_rssi;
     int wifi_speed_mbps;
     char wifi_phy_mode[24];
+    char wifi_bssid[18];
     uint8_t wifi_channel;
     uint32_t wifi_connect_start_ms;
     uint32_t wifi_connected_since_ms;
@@ -162,6 +169,7 @@ struct AppState {
 };
 
 extern AppState g_app;
+extern volatile bool g_screenshot_dump_active;
 
 void app_state_init(void);
 void app_state_save_presets(void);
@@ -179,3 +187,5 @@ void app_notify_pin_toast(const char *title, const char *msg, uint32_t color);
 void app_get_ap2_client_identity(char id_out[37], uint8_t ltpk_out[32], uint8_t ltsk_out[64]);
 bool app_is_ap2_speaker_paired(const char *ip);
 void app_mark_ap2_speaker_paired(const char *ip);
+void app_report_wifi_stream_stall(void);
+void app_mark_wifi_stream_healthy(void);

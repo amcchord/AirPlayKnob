@@ -7,6 +7,7 @@
 #include <ArduinoOTA.h>
 #include <sodium.h>
 #include <esp_system.h>
+#include <ctype.h>
 #include <lvgl.h>
 
 #include "app_state.h"
@@ -18,6 +19,7 @@
 #include "radio_streamer.h"
 #include "artwork_fetcher.h"
 #include "network_diagnostics.h"
+#include "battery_monitor.h"
 #include "knob_ui.h"
 #include "web_portal.h"
 
@@ -36,6 +38,19 @@ static volatile bool s_save_playback_dirty = false;
 static volatile uint32_t s_save_playback_dirty_ms = 0;
 static volatile bool s_save_wifi_dirty = false;
 static volatile bool s_save_ap2_pair_dirty = false;
+static volatile bool s_save_pref_bssid_dirty = false;
+
+struct WifiBssidPenalty {
+    uint8_t bssid[6];
+    uint8_t strikes;
+    uint32_t last_stall_ms;
+};
+static WifiBssidPenalty s_bssid_penalties[8] = {};
+static uint8_t s_preferred_bssid[6] = {0};
+static char s_preferred_bssid_ssid[36] = {0};
+static bool s_has_preferred_bssid = false;
+static volatile bool s_wifi_bssid_failover_requested = false;
+static uint32_t s_last_bssid_failover_ms = 0;
 
 // In-memory AirPlay 2 Ed25519 Client Identity & Paired Speaker IPs
 static char s_ap2_client_id[37] = {0};
@@ -84,6 +99,10 @@ void app_state_save_wifi(const char *ssid, const char *pass) {
     if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
         strncpy(g_app.wifi_ssid, ssid, sizeof(g_app.wifi_ssid) - 1);
         strncpy(g_app.wifi_pass, pass, sizeof(g_app.wifi_pass) - 1);
+        if (s_has_preferred_bssid && strcasecmp(s_preferred_bssid_ssid, g_app.wifi_ssid) != 0) {
+            s_has_preferred_bssid = false;
+            s_save_pref_bssid_dirty = true;
+        }
         g_app.wifi_reconnect_requested = true;
         xSemaphoreGive(g_app.mutex);
     }
@@ -225,6 +244,113 @@ static void app_state_flush_prefs(void) {
         }
         ap2_prefs.putString("paired_ips", list_buf);
         ap2_prefs.end();
+    }
+
+    if (s_save_pref_bssid_dirty) {
+        s_save_pref_bssid_dirty = false;
+        uint8_t bssid_copy[6] = {0};
+        char ssid_copy[36] = {0};
+        bool has_pref = false;
+        if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            has_pref = s_has_preferred_bssid;
+            memcpy(bssid_copy, s_preferred_bssid, 6);
+            strncpy(ssid_copy, s_preferred_bssid_ssid, sizeof(ssid_copy) - 1);
+            xSemaphoreGive(g_app.mutex);
+        }
+        s_prefs.begin("airplayknob", false);
+        if (has_pref && ssid_copy[0] != '\0') {
+            s_prefs.putBytes("pref_bssid", bssid_copy, 6);
+            s_prefs.putString("pref_bssid_s", ssid_copy);
+        } else {
+            s_prefs.remove("pref_bssid");
+            s_prefs.remove("pref_bssid_s");
+        }
+        s_prefs.end();
+    }
+}
+
+void app_report_wifi_stream_stall(void) {
+    if (WiFi.status() != WL_CONNECTED) return;
+    const uint8_t *bp = WiFi.BSSID();
+    if (!bp) return;
+    uint8_t cur[6];
+    memcpy(cur, bp, 6);
+    uint8_t new_strikes = 1;
+    uint32_t now_ms = millis();
+    if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        int slot = -1;
+        int oldest_slot = 0;
+        uint32_t oldest_age = 0;
+        for (int i = 0; i < 8; i++) {
+            if (s_bssid_penalties[i].strikes > 0 &&
+                (now_ms - s_bssid_penalties[i].last_stall_ms) >= 1800000U) {
+                s_bssid_penalties[i].strikes = 0;
+            }
+            if (s_bssid_penalties[i].strikes > 0 &&
+                memcmp(s_bssid_penalties[i].bssid, cur, 6) == 0) {
+                slot = i;
+                break;
+            }
+            if (slot < 0 && s_bssid_penalties[i].strikes == 0) {
+                slot = i;
+            }
+            uint32_t age = now_ms - s_bssid_penalties[i].last_stall_ms;
+            if (age >= oldest_age) {
+                oldest_age = age;
+                oldest_slot = i;
+            }
+        }
+        if (slot < 0) slot = oldest_slot;
+        memcpy(s_bssid_penalties[slot].bssid, cur, 6);
+        if (s_bssid_penalties[slot].strikes < 3) {
+            s_bssid_penalties[slot].strikes++;
+        }
+        s_bssid_penalties[slot].last_stall_ms = now_ms;
+        new_strikes = s_bssid_penalties[slot].strikes;
+
+        if (s_has_preferred_bssid && memcmp(s_preferred_bssid, cur, 6) == 0) {
+            s_has_preferred_bssid = false;
+            s_save_pref_bssid_dirty = true;
+        }
+        s_wifi_bssid_failover_requested = true;
+        xSemaphoreGive(g_app.mutex);
+    }
+    Serial.printf("[WIFI] Stream stall strike %u recorded on BSSID=%02X:%02X:%02X:%02X:%02X:%02X\n",
+                  (unsigned)new_strikes, cur[0], cur[1], cur[2], cur[3], cur[4], cur[5]);
+}
+
+void app_mark_wifi_stream_healthy(void) {
+    if (WiFi.status() != WL_CONNECTED) return;
+    const uint8_t *bp = WiFi.BSSID();
+    if (!bp) return;
+    uint8_t cur[6];
+    memcpy(cur, bp, 6);
+    bool updated_pref = false;
+    char ssid_log[36] = {0};
+    if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        for (int i = 0; i < 8; i++) {
+            if (s_bssid_penalties[i].strikes > 0 &&
+                memcmp(s_bssid_penalties[i].bssid, cur, 6) == 0) {
+                s_bssid_penalties[i].strikes = 0;
+            }
+        }
+        if (g_app.wifi_ssid[0] != '\0' &&
+            (!s_has_preferred_bssid ||
+             memcmp(s_preferred_bssid, cur, 6) != 0 ||
+             strcasecmp(s_preferred_bssid_ssid, g_app.wifi_ssid) != 0)) {
+            memcpy(s_preferred_bssid, cur, 6);
+            strncpy(s_preferred_bssid_ssid, g_app.wifi_ssid, sizeof(s_preferred_bssid_ssid) - 1);
+            s_preferred_bssid_ssid[sizeof(s_preferred_bssid_ssid) - 1] = '\0';
+            s_has_preferred_bssid = true;
+            s_save_pref_bssid_dirty = true;
+            strncpy(ssid_log, g_app.wifi_ssid, sizeof(ssid_log) - 1);
+            updated_pref = true;
+        }
+        xSemaphoreGive(g_app.mutex);
+    }
+    if (updated_pref) {
+        Serial.printf("[WIFI] Marked BSSID=%02X:%02X:%02X:%02X:%02X:%02X verified-healthy for '%s'\n",
+                      cur[0], cur[1], cur[2], cur[3], cur[4], cur[5], ssid_log);
     }
 }
 
@@ -415,6 +541,11 @@ void app_state_init(void) {
     String spk_n  = s_prefs.getString("spk_name", "");
     String spk_ip = s_prefs.getString("spk_ip", "");
     bool use_loc_dac = s_prefs.getBool("use_loc_dac", false);
+    uint8_t pref_bssid_tmp[6] = {0};
+    String pref_bssid_s = s_prefs.getString("pref_bssid_s", "");
+    bool has_pref_bssid = (s_prefs.getBytesLength("pref_bssid") == 6 &&
+                           s_prefs.getBytes("pref_bssid", pref_bssid_tmp, 6) == 6 &&
+                           pref_bssid_s.length() > 0);
     AirPlaySpeaker saved_spk = {};
     bool has_saved_spk_struct = false;
     if (s_prefs.getBytesLength("saved_spk") == sizeof(AirPlaySpeaker)) {
@@ -435,6 +566,12 @@ void app_state_init(void) {
 
     strncpy(g_app.wifi_ssid, w_ssid.c_str(), sizeof(g_app.wifi_ssid) - 1);
     strncpy(g_app.wifi_pass, w_pass.c_str(), sizeof(g_app.wifi_pass) - 1);
+    if (has_pref_bssid && strcasecmp(pref_bssid_s.c_str(), g_app.wifi_ssid) == 0) {
+        memcpy(s_preferred_bssid, pref_bssid_tmp, 6);
+        strncpy(s_preferred_bssid_ssid, pref_bssid_s.c_str(), sizeof(s_preferred_bssid_ssid) - 1);
+        s_preferred_bssid_ssid[sizeof(s_preferred_bssid_ssid) - 1] = '\0';
+        s_has_preferred_bssid = true;
+    }
     strncpy(s_saved_speaker_name, spk_n.c_str(), sizeof(s_saved_speaker_name) - 1);
     strncpy(s_saved_speaker_ip, spk_ip.c_str(), sizeof(s_saved_speaker_ip) - 1);
     s_user_selected_local_dac = use_loc_dac || (strcasecmp(s_saved_speaker_name, "Local 3.5mm Jack") == 0);
@@ -531,124 +668,380 @@ void app_state_init(void) {
     strncpy(g_app.track_title, "SomaFM Internet Radio", sizeof(g_app.track_title));
 }
 
-static void ingest_mdns_results(mdns_result_t *results, AirPlaySpeaker *found, int *count_inout, uint32_t now_ms) {
+struct PendingMdnsEntry {
+    char instance[72];
+    char hostname[64];
+    char service_type[12]; // "_raop" or "_airplay"
+    uint16_t port;
+    bool is_raop;
+    bool has_txt;
+    size_t txt_count;
+    char et[24];
+    char cn[24];
+    char md[24];
+    char am[32];
+    bool req_pin_pw;
+    uint32_t sf_flags;
+    bool has_sf_flags;
+};
+
+static constexpr int MAX_PENDING_MDNS = 72;
+
+struct MdnsScanScratch {
+    AirPlaySpeaker found[MAX_SPEAKERS];
+    PendingMdnsEntry pending[MAX_PENDING_MDNS];
+};
+
+static void strip_trailing_local(const char *src, char *dst, size_t dst_sz) {
+    if (!dst || dst_sz == 0) return;
+    dst[0] = '\0';
+    if (!src || !src[0]) return;
+    strncpy(dst, src, dst_sz - 1);
+    dst[dst_sz - 1] = '\0';
+    size_t len = strlen(dst);
+    while (len > 0 && dst[len - 1] == '.') {
+        dst[--len] = '\0';
+    }
+    if (len > 6 && strcasecmp(dst + len - 6, ".local") == 0) {
+        dst[len - 6] = '\0';
+    }
+}
+
+static int score_lan_ipv4(const esp_ip4_addr_t &ip4, const IPAddress &my_ip) {
+    uint8_t a = esp_ip4_addr1_16(&ip4);
+    uint8_t b = esp_ip4_addr2_16(&ip4);
+    uint8_t c = esp_ip4_addr3_16(&ip4);
+    uint8_t d = esp_ip4_addr4_16(&ip4);
+    if (a == 0 || a == 127 || d == 0 || d == 255) return -1;
+    if (a == 169 && b == 254) return 1; // Link-local fallback only
+    if (my_ip[0] != 0 && a == my_ip[0] && b == my_ip[1] && c == my_ip[2]) return 100;
+    if (my_ip[0] != 0 && a == my_ip[0] && b == my_ip[1]) return 80;
+    if (a == 192 && b == 168) return 60;
+    if (a == 10) return 55;
+    if (a == 172 && b >= 16 && b <= 31) return 50;
+    return 20;
+}
+
+static int extract_best_ipv4(const mdns_ip_addr_t *addr_list, const IPAddress &my_ip, char *out_ip, size_t out_sz) {
+    int best_score = -1;
+    for (const mdns_ip_addr_t *a = addr_list; a != NULL; a = a->next) {
+        if (a->addr.type != ESP_IPADDR_TYPE_V4) continue;
+        int sc = score_lan_ipv4(a->addr.u_addr.ip4, my_ip);
+        if (sc > best_score) {
+            best_score = sc;
+            snprintf(out_ip, out_sz, IPSTR, IP2STR(&(a->addr.u_addr.ip4)));
+        }
+    }
+    return best_score;
+}
+
+static void parse_airplay_txt_items(const mdns_txt_item_t *txt, size_t txt_count,
+                                    char *et, size_t et_sz,
+                                    char *cn, size_t cn_sz,
+                                    char *md, size_t md_sz,
+                                    char *am, size_t am_sz,
+                                    bool *req_pin_pw,
+                                    uint32_t *sf_flags,
+                                    bool *has_sf_flags) {
+    for (size_t t = 0; t < txt_count && txt != NULL; t++) {
+        const char *k = txt[t].key;
+        const char *v = txt[t].value ? txt[t].value : "";
+        if (!k) continue;
+        if (strcasecmp(k, "et") == 0 && v[0]) strncpy(et, v, et_sz - 1);
+        else if (strcasecmp(k, "cn") == 0 && v[0]) strncpy(cn, v, cn_sz - 1);
+        else if (strcasecmp(k, "md") == 0 && v[0]) strncpy(md, v, md_sz - 1);
+        else if ((strcasecmp(k, "am") == 0 || strcasecmp(k, "model") == 0) && v[0]) strncpy(am, v, am_sz - 1);
+        else if (strcasecmp(k, "pw") == 0 && (strcasecmp(v, "true") == 0 || strcmp(v, "1") == 0)) {
+            *req_pin_pw = true;
+        } else if (strcasecmp(k, "sf") == 0 || strcasecmp(k, "flags") == 0) {
+            *sf_flags = (uint32_t)strtoul(v, NULL, 0);
+            *has_sf_flags = true;
+        } else if (strcasecmp(k, "ft") == 0 || strcasecmp(k, "features") == 0) {
+            unsigned long long low = 0, high = 0;
+            if (sscanf(v, "%llx,%llx", &low, &high) == 2 && (high & 0x11C040ULL) != 0) {
+                if (et[0] == '\0') {
+                    strncpy(et, "0,4", et_sz - 1);
+                } else if (strchr(et, '4') == NULL && strchr(et, '5') == NULL) {
+                    strncat(et, ",4", et_sz - strlen(et) - 1);
+                }
+            }
+        }
+    }
+}
+
+static void clean_airplay_display_name(const char *raw_inst, const char *am, char *sp_name, size_t sp_name_sz) {
+    const char *inst = (raw_inst && raw_inst[0]) ? raw_inst : "AirPlay Speaker";
+    const char *at = strchr(inst, '@');
+    strncpy(sp_name, (at && *(at + 1)) ? (at + 1) : inst, sp_name_sz - 1);
+    sp_name[sp_name_sz - 1] = '\0';
+
+    // Trim trailing whitespace
+    size_t len = strlen(sp_name);
+    while (len > 0 && sp_name[len - 1] == ' ') {
+        sp_name[--len] = '\0';
+    }
+
+    // Strip Bonjour collision suffix like " (2)" .. " (9)" when Apple/HomePod devices re-register
+    if (len >= 4 && sp_name[len - 4] == ' ' && sp_name[len - 3] == '(' &&
+        sp_name[len - 2] >= '2' && sp_name[len - 2] <= '9' && sp_name[len - 1] == ')') {
+        sp_name[len - 4] = '\0';
+    }
+
+    if (am && strcasestr(am, "AudioAccessory") != NULL &&
+        strcasestr(sp_name, "HomePod") == NULL &&
+        strcasestr(sp_name, "Home Pod") == NULL) {
+        strncat(sp_name, " (HomePod)", sp_name_sz - strlen(sp_name) - 1);
+    }
+}
+
+static void upsert_discovered_speaker(AirPlaySpeaker *found, int *count_inout,
+                                      const char *ip_str, uint16_t port,
+                                      const char *clean_host, const char *raw_inst,
+                                      bool is_raop, size_t txt_count,
+                                      const char *et, const char *cn, const char *md, const char *am,
+                                      bool req_pin_pw, uint32_t sf_flags, bool has_sf_flags,
+                                      uint32_t now_ms) {
+    if (!ip_str || ip_str[0] == '\0' || strcmp(ip_str, "0.0.0.0") == 0) return;
     int count = *count_inout;
-    for (mdns_result_t *r = results; r != NULL && count < MAX_SPEAKERS - 1; r = r->next) {
-        char ip_str[20] = {0};
-        for (mdns_ip_addr_t *a = r->addr; a != NULL; a = a->next) {
-            if (a->addr.type == ESP_IPADDR_TYPE_V4) {
-                snprintf(ip_str, sizeof(ip_str), IPSTR, IP2STR(&(a->addr.u_addr.ip4)));
-                break;
-            }
+
+    int existing_idx = -1;
+    for (int i = 0; i < count; i++) {
+        if (!found[i].is_local_dac && found[i].ip[0] != '\0' && strcmp(found[i].ip, ip_str) == 0) {
+            existing_idx = i;
+            break;
         }
-        if (ip_str[0] == '\0' || strcmp(ip_str, "0.0.0.0") == 0) continue;
+    }
 
-        uint16_t port = r->port ? r->port : 7000;
-        const char *inst = r->instance_name ? r->instance_name : "AirPlay Speaker";
-        const char *at = strchr(inst, '@');
-        char sp_name[48] = {0};
-        strncpy(sp_name, (at && *(at + 1)) ? (at + 1) : inst, sizeof(sp_name) - 1);
+    const char *eff_am = (am && am[0]) ? am : ((existing_idx >= 0) ? found[existing_idx].am : "");
+    char sp_name[48] = {0};
+    clean_airplay_display_name(raw_inst, eff_am, sp_name, sizeof(sp_name));
 
-        char et[24] = {0};
-        char cn[24] = {0};
-        char md[24] = {0};
-        char am[32] = {0};
-        bool req_pin = false;
-
-        for (size_t t = 0; t < r->txt_count; t++) {
-            const char *k = r->txt[t].key;
-            const char *v = r->txt[t].value ? r->txt[t].value : "";
-            if (!k) continue;
-            if (strcasecmp(k, "et") == 0 && v[0]) strncpy(et, v, sizeof(et) - 1);
-            else if (strcasecmp(k, "cn") == 0 && v[0]) strncpy(cn, v, sizeof(cn) - 1);
-            else if (strcasecmp(k, "md") == 0 && v[0]) strncpy(md, v, sizeof(md) - 1);
-            else if ((strcasecmp(k, "am") == 0 || strcasecmp(k, "model") == 0) && v[0]) strncpy(am, v, sizeof(am) - 1);
-            else if (strcasecmp(k, "pw") == 0 && (strcasecmp(v, "true") == 0 || strcmp(v, "1") == 0)) {
-                req_pin = true;
-            } else if (strcasecmp(k, "sf") == 0 || strcasecmp(k, "flags") == 0) {
-                uint32_t sf = (uint32_t)strtoul(v, NULL, 0);
-                if ((sf & 0x08U) != 0) {
-                    req_pin = true;
-                } else if ((sf & 0x200U) != 0 && !app_is_ap2_speaker_paired(ip_str)) {
-                    req_pin = true;
-                }
-            } else if (strcasecmp(k, "ft") == 0 || strcasecmp(k, "features") == 0) {
-                unsigned long long low = 0, high = 0;
-                if (sscanf(v, "%llx,%llx", &low, &high) == 2 && (high & 0x11C040ULL) != 0) {
-                    if (et[0] == '\0') {
-                        strncpy(et, "0,4", sizeof(et) - 1);
-                    } else if (strchr(et, '4') == NULL && strchr(et, '5') == NULL) {
-                        strncat(et, ",4", sizeof(et) - strlen(et) - 1);
-                    }
-                }
-            }
-        }
-
-        if (strcasestr(am, "AudioAccessory") != NULL &&
-            strcasestr(sp_name, "HomePod") == NULL &&
-            strcasestr(sp_name, "Home Pod") == NULL) {
-            strncat(sp_name, " (HomePod)", sizeof(sp_name) - strlen(sp_name) - 1);
-        }
-
-        int existing_idx = -1;
+    if (existing_idx < 0 && clean_host && clean_host[0]) {
+        char full_host[64];
+        snprintf(full_host, sizeof(full_host), "%s.local", clean_host);
         for (int i = 0; i < count; i++) {
-            if (found[i].ip[0] != '\0' && strcmp(found[i].ip, ip_str) == 0) {
+            if (!found[i].is_local_dac && found[i].host[0] != '\0' &&
+                strcasecmp(found[i].host, full_host) == 0) {
                 existing_idx = i;
                 break;
             }
         }
-        if (existing_idx < 0) {
-            // Also match pre-populated saved speaker whose IP was empty or updated via DHCP
-            for (int i = 0; i < count; i++) {
-                if (!found[i].is_local_dac && strcasecmp(found[i].name, sp_name) == 0 &&
-                    (found[i].ip[0] == '\0' || (am[0] && strcasecmp(found[i].am, am) == 0))) {
-                    existing_idx = i;
-                    break;
+    }
+    if (existing_idx < 0) {
+        for (int i = 0; i < count; i++) {
+            if (!found[i].is_local_dac && strcasecmp(found[i].name, sp_name) == 0 &&
+                (found[i].ip[0] == '\0' || (eff_am[0] && strcasecmp(found[i].am, eff_am) == 0))) {
+                existing_idx = i;
+                break;
+            }
+        }
+    }
+
+    bool req_pin = req_pin_pw;
+    if (has_sf_flags) {
+        if ((sf_flags & 0x08U) != 0) {
+            req_pin = true;
+        } else if ((sf_flags & 0x200U) != 0 && !app_is_ap2_speaker_paired(ip_str)) {
+            req_pin = true;
+        }
+    }
+
+    if (existing_idx >= 0) {
+        AirPlaySpeaker &sp = found[existing_idx];
+        sp.last_seen_ms = now_ms;
+        strncpy(sp.ip, ip_str, sizeof(sp.ip) - 1);
+        if (is_raop) {
+            if (port > 0) sp.port = port;
+            sp.has_raop = true;
+        } else if (!sp.has_raop || sp.port == 0) {
+            sp.port = port ? port : 7000;
+        }
+        if (clean_host && clean_host[0]) {
+            snprintf(sp.host, sizeof(sp.host), "%s.local", clean_host);
+        }
+        if (sp_name[0] && strcmp(sp_name, "AirPlay Speaker") != 0) {
+            if (is_raop || !sp.has_raop || sp.name[0] == '\0' || strcmp(sp.name, "AirPlay Speaker") == 0) {
+                strncpy(sp.name, sp_name, sizeof(sp.name) - 1);
+            } else if (strcasestr(eff_am, "AudioAccessory") != NULL &&
+                       strcasestr(sp.name, "HomePod") == NULL &&
+                       strcasestr(sp.name, "Home Pod") == NULL) {
+                strncat(sp.name, " (HomePod)", sizeof(sp.name) - strlen(sp.name) - 1);
+            }
+        }
+        if (txt_count > 0) {
+            if (et && et[0]) strncpy(sp.et, et, sizeof(sp.et) - 1);
+            if (cn && cn[0]) strncpy(sp.cn, cn, sizeof(sp.cn) - 1);
+            if (md && md[0]) strncpy(sp.md, md, sizeof(sp.md) - 1);
+            if (am && am[0]) {
+                strncpy(sp.am, am, sizeof(sp.am) - 1);
+                if (strcasestr(sp.am, "AudioAccessory") != NULL &&
+                    strcasestr(sp.name, "HomePod") == NULL &&
+                    strcasestr(sp.name, "Home Pod") == NULL) {
+                    strncat(sp.name, " (HomePod)", sizeof(sp.name) - strlen(sp.name) - 1);
                 }
             }
         }
+        if (req_pin) sp.requires_pin = true;
+        sp.is_ap2 = speaker_should_use_ap2(sp.am, sp.et);
+        return;
+    }
 
-        if (existing_idx >= 0) {
-            AirPlaySpeaker &sp = found[existing_idx];
-            sp.last_seen_ms = now_ms;
-            sp.port = port;
-            strncpy(sp.ip, ip_str, sizeof(sp.ip) - 1);
-            if (r->hostname && r->hostname[0]) {
-                snprintf(sp.host, sizeof(sp.host), "%s.local", r->hostname);
-            }
-            if (sp_name[0] && strcmp(sp_name, "AirPlay Speaker") != 0) {
-                strncpy(sp.name, sp_name, sizeof(sp.name) - 1);
-            }
-            if (r->txt_count > 0) {
-                if (et[0]) strncpy(sp.et, et, sizeof(sp.et) - 1);
-                if (cn[0]) strncpy(sp.cn, cn, sizeof(sp.cn) - 1);
-                if (md[0]) strncpy(sp.md, md, sizeof(sp.md) - 1);
-                if (am[0]) strncpy(sp.am, am, sizeof(sp.am) - 1);
-            }
-            if (req_pin) sp.requires_pin = true;
-            sp.is_ap2 = speaker_should_use_ap2(sp.am, sp.et);
+    if (count >= MAX_SPEAKERS - 1) return;
+
+    AirPlaySpeaker &sp = found[count];
+    memset(&sp, 0, sizeof(sp));
+    sp.port = port ? port : 7000;
+    sp.has_raop = is_raop;
+    sp.last_seen_ms = now_ms;
+    strncpy(sp.ip, ip_str, sizeof(sp.ip) - 1);
+    if (clean_host && clean_host[0]) {
+        snprintf(sp.host, sizeof(sp.host), "%s.local", clean_host);
+    }
+    strncpy(sp.name, sp_name, sizeof(sp.name) - 1);
+    strncpy(sp.et, (et && et[0]) ? et : "0,1", sizeof(sp.et) - 1);
+    strncpy(sp.cn, (cn && cn[0]) ? cn : "0,1", sizeof(sp.cn) - 1);
+    if (md && md[0]) strncpy(sp.md, md, sizeof(sp.md) - 1);
+    if (am && am[0]) strncpy(sp.am, am, sizeof(sp.am) - 1);
+    sp.requires_pin = req_pin;
+    sp.is_ap2 = speaker_should_use_ap2(sp.am, sp.et);
+    *count_inout = count + 1;
+}
+
+static void collect_mdns_results(mdns_result_t *results, bool is_raop, const IPAddress &my_ip,
+                                 MdnsScanScratch *scratch, int *count_inout, int *pending_inout,
+                                 uint32_t now_ms) {
+    const char *svc_name = is_raop ? "_raop" : "_airplay";
+    for (mdns_result_t *r = results; r != NULL; r = r->next) {
+        char clean_host[64] = {0};
+        strip_trailing_local(r->hostname, clean_host, sizeof(clean_host));
+
+        char ip_str[20] = {0};
+        int ip_score = extract_best_ipv4(r->addr, my_ip, ip_str, sizeof(ip_str));
+
+        char et[24] = {0}, cn[24] = {0}, md[24] = {0}, am[32] = {0};
+        bool req_pin_pw = false;
+        uint32_t sf_flags = 0;
+        bool has_sf_flags = false;
+        parse_airplay_txt_items(r->txt, r->txt_count, et, sizeof(et), cn, sizeof(cn),
+                                md, sizeof(md), am, sizeof(am),
+                                &req_pin_pw, &sf_flags, &has_sf_flags);
+
+        const char *inst = r->instance_name ? r->instance_name : "";
+        bool has_good_ip = (ip_score >= 20 && ip_str[0] != '\0');
+        bool has_srv = (r->port > 0 || clean_host[0] != '\0');
+        bool has_txt = (r->txt_count > 0);
+
+        if (has_good_ip && has_srv && has_txt) {
+            upsert_discovered_speaker(scratch->found, count_inout,
+                                      ip_str, r->port ? r->port : 7000,
+                                      clean_host, inst, is_raop, r->txt_count,
+                                      et, cn, md, am, req_pin_pw, sf_flags, has_sf_flags, now_ms);
             continue;
         }
 
-        AirPlaySpeaker &sp = found[count];
-        memset(&sp, 0, sizeof(sp));
-        sp.port = port;
-        sp.last_seen_ms = now_ms;
-        strncpy(sp.ip, ip_str, sizeof(sp.ip) - 1);
-        if (r->hostname) {
-            snprintf(sp.host, sizeof(sp.host), "%s.local", r->hostname);
+        // Queue incomplete PTR/SRV/TXT/A record for targeted unicast/multicast resolution
+        if (!inst[0] && !clean_host[0]) continue;
+        int p_idx = -1;
+        for (int i = 0; i < *pending_inout; i++) {
+            PendingMdnsEntry &pe = scratch->pending[i];
+            if (pe.is_raop == is_raop &&
+                ((inst[0] && strcasecmp(pe.instance, inst) == 0) ||
+                 (!inst[0] && clean_host[0] && strcasecmp(pe.hostname, clean_host) == 0))) {
+                p_idx = i;
+                break;
+            }
         }
-        strncpy(sp.name, sp_name, sizeof(sp.name) - 1);
-        strncpy(sp.et, et[0] ? et : "0,1", sizeof(sp.et) - 1);
-        strncpy(sp.cn, cn[0] ? cn : "0,1", sizeof(sp.cn) - 1);
-        strncpy(sp.md, md, sizeof(sp.md) - 1);
-        strncpy(sp.am, am, sizeof(sp.am) - 1);
-        sp.requires_pin = req_pin;
-        sp.is_ap2 = speaker_should_use_ap2(sp.am, sp.et);
+        if (p_idx < 0) {
+            if (*pending_inout >= MAX_PENDING_MDNS) {
+                if (ip_score > 0 && ip_str[0] != '\0') {
+                    upsert_discovered_speaker(scratch->found, count_inout,
+                                              ip_str, r->port ? r->port : 7000,
+                                              clean_host, inst, is_raop, r->txt_count,
+                                              et, cn, md, am, req_pin_pw, sf_flags, has_sf_flags, now_ms);
+                }
+                continue;
+            }
+            p_idx = (*pending_inout)++;
+            memset(&scratch->pending[p_idx], 0, sizeof(PendingMdnsEntry));
+            scratch->pending[p_idx].is_raop = is_raop;
+            strncpy(scratch->pending[p_idx].service_type, svc_name, sizeof(scratch->pending[p_idx].service_type) - 1);
+            if (inst[0]) strncpy(scratch->pending[p_idx].instance, inst, sizeof(scratch->pending[p_idx].instance) - 1);
+        }
 
-        count++;
+        PendingMdnsEntry &pe = scratch->pending[p_idx];
+        if (clean_host[0] && !pe.hostname[0]) {
+            strncpy(pe.hostname, clean_host, sizeof(pe.hostname) - 1);
+        }
+        if (r->port > 0 && pe.port == 0) {
+            pe.port = r->port;
+        }
+        if (r->txt_count > 0 && !pe.has_txt) {
+            pe.has_txt = true;
+            pe.txt_count = r->txt_count;
+            strncpy(pe.et, et, sizeof(pe.et) - 1);
+            strncpy(pe.cn, cn, sizeof(pe.cn) - 1);
+            strncpy(pe.md, md, sizeof(pe.md) - 1);
+            strncpy(pe.am, am, sizeof(pe.am) - 1);
+            pe.req_pin_pw = req_pin_pw;
+            pe.sf_flags = sf_flags;
+            pe.has_sf_flags = has_sf_flags;
+        }
+        if (has_good_ip && pe.has_txt && (pe.port > 0 || pe.hostname[0])) {
+            upsert_discovered_speaker(scratch->found, count_inout,
+                                      ip_str, pe.port ? pe.port : 7000,
+                                      pe.hostname, pe.instance, pe.is_raop, pe.txt_count,
+                                      pe.et, pe.cn, pe.md, pe.am, pe.req_pin_pw, pe.sf_flags, pe.has_sf_flags, now_ms);
+        }
     }
-    *count_inout = count;
+}
+
+static int compare_speaker_names_alpha(const char *a, const char *b) {
+    const unsigned char *pa = (const unsigned char *)(a ? a : "");
+    const unsigned char *pb = (const unsigned char *)(b ? b : "");
+    while (*pa && *pb) {
+        // Normalize UTF-8 curly apostrophes (\xE2\x80\x98 / \xE2\x80\x99) to ASCII '\''
+        unsigned char ca = *pa;
+        if (ca == 0xE2 && pa[1] == 0x80 && (pa[2] == 0x98 || pa[2] == 0x99)) {
+            ca = '\'';
+            pa += 3;
+        } else {
+            pa++;
+        }
+        unsigned char cb = *pb;
+        if (cb == 0xE2 && pb[1] == 0x80 && (pb[2] == 0x98 || pb[2] == 0x99)) {
+            cb = '\'';
+            pb += 3;
+        } else {
+            pb++;
+        }
+        int la = tolower((int)ca);
+        int lb = tolower((int)cb);
+        if (la != lb) return la - lb;
+    }
+    if (*pa != *pb) return (int)(*pa) - (int)(*pb);
+    return strcmp(a ? a : "", b ? b : "");
+}
+
+static int find_matching_speaker_idx(const AirPlaySpeaker *list, int count,
+                                     bool want_local_dac, const char *want_ip, const char *want_name) {
+    if (count <= 0) return -1;
+    if (want_local_dac) {
+        for (int i = 0; i < count; i++) {
+            if (list[i].is_local_dac) return i;
+        }
+        return count - 1;
+    }
+    if (want_ip && want_ip[0] != '\0') {
+        for (int i = 0; i < count; i++) {
+            if (!list[i].is_local_dac && strcmp(list[i].ip, want_ip) == 0) return i;
+        }
+    }
+    if (want_name && want_name[0] != '\0') {
+        for (int i = 0; i < count; i++) {
+            if (!list[i].is_local_dac && strcasecmp(list[i].name, want_name) == 0) return i;
+        }
+    }
+    return -1;
 }
 
 static void discover_airplay_speakers(bool manual_scan) {
@@ -659,28 +1052,33 @@ static void discover_airplay_speakers(bool manual_scan) {
         xSemaphoreGive(g_app.mutex);
     } else return;
 
-    uint32_t now_ms = millis();
-    mdns_result_t *raop_results = NULL;
-    mdns_result_t *ap_results = NULL;
-    mdns_query_ptr("_raop", "_tcp", manual_scan ? 1400 : 1000, 48, &raop_results);
-    if (manual_scan || !raop_results) {
-        mdns_query_ptr("_airplay", "_tcp", 600, 48, &ap_results);
-    }
-
-    AirPlaySpeaker *found = (AirPlaySpeaker *)heap_caps_calloc(MAX_SPEAKERS, sizeof(AirPlaySpeaker), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!found) {
-        if (raop_results) mdns_query_results_free(raop_results);
-        if (ap_results) mdns_query_results_free(ap_results);
+    MdnsScanScratch *scratch = (MdnsScanScratch *)heap_caps_calloc(1, sizeof(MdnsScanScratch), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!scratch) {
         if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
             g_app.speaker_scanning = false;
             xSemaphoreGive(g_app.mutex);
         }
         return;
     }
-    int count = 0;
 
-    // Seed with existing speakers so speaker list order & indices stay stable, and NEVER drop
-    // previously discovered speakers or the active/saved speaker if they miss a multicast mDNS query!
+    // Temporarily raise ESP-IDF's "mdns" task (default priority 1 on CPU 0) above radio_http (priority 4)
+    // during active discovery so simultaneous responses from 15-30 LAN speakers never overflow mdns's 16-item queue!
+    TaskHandle_t mdns_task = xTaskGetHandle("mdns");
+    UBaseType_t orig_mdns_prio = 1;
+    if (mdns_task) {
+        orig_mdns_prio = uxTaskPriorityGet(mdns_task);
+        if (orig_mdns_prio < 5) {
+            vTaskPrioritySet(mdns_task, 5);
+        }
+    }
+
+    uint32_t now_ms = millis();
+    IPAddress my_ip = WiFi.localIP();
+    int count = 0;
+    int pending_count = 0;
+
+    // Seed with existing speakers so previously discovered speakers and the active/saved speaker
+    // remain available even if a battery-powered speaker briefly misses a multicast query.
     if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
         for (int i = 0; i < g_app.speaker_count && count < MAX_SPEAKERS - 1; i++) {
             const AirPlaySpeaker &old_sp = g_app.speakers[i];
@@ -690,24 +1088,180 @@ static void discover_airplay_speakers(bool manual_scan) {
                 (s_saved_speaker_ip[0] != '\0' && strcmp(old_sp.ip, s_saved_speaker_ip) == 0) ||
                 (s_saved_speaker_name[0] != '\0' && strcasecmp(old_sp.name, s_saved_speaker_name) == 0);
             if (is_active_or_saved || old_sp.ip[0] != '\0') {
-                found[count++] = old_sp;
+                scratch->found[count++] = old_sp;
             }
         }
         xSemaphoreGive(g_app.mutex);
     }
 
-    ingest_mdns_results(raop_results, found, &count, now_ms);
-    if (ap_results) {
-        ingest_mdns_results(ap_results, found, &count, now_ms);
+    struct QueryPass {
+        const char *service;
+        mdns_query_transmission_type_t tx_type;
+        uint32_t timeout_ms;
+        bool is_raop;
+    };
+    const QueryPass passes[] = {
+        { "_raop",    MDNS_QUERY_UNICAST,   manual_scan ? 700U : 550U, true  },
+        { "_airplay", MDNS_QUERY_UNICAST,   manual_scan ? 550U : 450U, false },
+        { "_raop",    MDNS_QUERY_MULTICAST, manual_scan ? 950U : 800U, true  },
+        { "_airplay", MDNS_QUERY_MULTICAST, manual_scan ? 750U : 600U, false },
+    };
+
+    for (size_t p = 0; p < sizeof(passes) / sizeof(passes[0]); p++) {
+        mdns_result_t *res = NULL;
+        if (mdns_query_generic(NULL, passes[p].service, "_tcp", MDNS_TYPE_PTR,
+                               passes[p].tx_type, passes[p].timeout_ms, 64, &res) == ESP_OK && res != NULL) {
+            collect_mdns_results(res, passes[p].is_raop, my_ip, scratch, &count, &pending_count, now_ms);
+            mdns_query_results_free(res);
+        }
+        vTaskDelay(pdMS_TO_TICKS(15));
     }
 
-    if (raop_results) mdns_query_results_free(raop_results);
-    if (ap_results) mdns_query_results_free(ap_results);
+    // Pass 2: Resolve split-packet mDNS speakers where PTR arrived without inline SRV, A, or TXT records
+    struct HostIpCache {
+        char host[64];
+        char ip[20];
+        bool attempted;
+    };
+    HostIpCache host_cache[28] = {};
+    int host_cache_cnt = 0;
+
+    for (int i = 0; i < pending_count && count < MAX_SPEAKERS - 1; i++) {
+        PendingMdnsEntry &pe = scratch->pending[i];
+
+        // Skip redundant resolution if an earlier pass already resolved this speaker cleanly
+        if (pe.hostname[0] != '\0') {
+            char full_host[64];
+            snprintf(full_host, sizeof(full_host), "%s.local", pe.hostname);
+            bool already_complete = false;
+            for (int k = 0; k < count; k++) {
+                const AirPlaySpeaker &sp = scratch->found[k];
+                if (!sp.is_local_dac && sp.ip[0] != '\0' && strcasecmp(sp.host, full_host) == 0 &&
+                    (!pe.is_raop || sp.has_raop) && sp.am[0] != '\0') {
+                    already_complete = true;
+                    break;
+                }
+            }
+            if (already_complete) continue;
+        }
+
+        if ((pe.hostname[0] == '\0' || pe.port == 0) && pe.instance[0] != '\0') {
+            mdns_result_t *srv_res = NULL;
+            if (mdns_query_srv(pe.instance, pe.service_type, "_tcp", 260, &srv_res) == ESP_OK && srv_res != NULL) {
+                if (srv_res->hostname && srv_res->hostname[0]) {
+                    strip_trailing_local(srv_res->hostname, pe.hostname, sizeof(pe.hostname));
+                }
+                if (srv_res->port > 0) {
+                    pe.port = srv_res->port;
+                }
+                char inline_ip[20] = {0};
+                if (extract_best_ipv4(srv_res->addr, my_ip, inline_ip, sizeof(inline_ip)) >= 20 && host_cache_cnt < 28) {
+                    strncpy(host_cache[host_cache_cnt].host, pe.hostname, sizeof(host_cache[0].host) - 1);
+                    strncpy(host_cache[host_cache_cnt].ip, inline_ip, sizeof(host_cache[0].ip) - 1);
+                    host_cache[host_cache_cnt].attempted = true;
+                    host_cache_cnt++;
+                }
+                mdns_query_results_free(srv_res);
+            }
+        }
+        if (pe.hostname[0] == '\0') continue;
+
+        // Look up or resolve IPv4 address for pe.hostname (cached per host so _raop + _airplay share 1 lookup)
+        char resolved_ip[20] = {0};
+        bool host_known = false;
+        for (int k = 0; k < count; k++) {
+            char clean_existing[64] = {0};
+            strip_trailing_local(scratch->found[k].host, clean_existing, sizeof(clean_existing));
+            if (!scratch->found[k].is_local_dac && scratch->found[k].ip[0] != '\0' &&
+                clean_existing[0] != '\0' && strcasecmp(clean_existing, pe.hostname) == 0) {
+                strncpy(resolved_ip, scratch->found[k].ip, sizeof(resolved_ip) - 1);
+                host_known = true;
+                break;
+            }
+        }
+        if (!host_known) {
+            for (int c = 0; c < host_cache_cnt; c++) {
+                if (strcasecmp(host_cache[c].host, pe.hostname) == 0) {
+                    strncpy(resolved_ip, host_cache[c].ip, sizeof(resolved_ip) - 1);
+                    host_known = host_cache[c].attempted;
+                    break;
+                }
+            }
+        }
+        if (!host_known) {
+            esp_ip4_addr_t addr4 = {};
+            int sc = -1;
+            if (mdns_query_a(pe.hostname, 260, &addr4) == ESP_OK) {
+                sc = score_lan_ipv4(addr4, my_ip);
+                if (sc >= 20) {
+                    snprintf(resolved_ip, sizeof(resolved_ip), IPSTR, IP2STR(&addr4));
+                }
+            }
+            if (sc < 20) {
+                mdns_result_t *a_res = NULL;
+                if (mdns_query_generic(pe.hostname, NULL, NULL, MDNS_TYPE_A,
+                                       MDNS_QUERY_MULTICAST, 280, 8, &a_res) == ESP_OK && a_res != NULL) {
+                    for (mdns_result_t *ar = a_res; ar != NULL; ar = ar->next) {
+                        char cand_ip[20] = {0};
+                        int csc = extract_best_ipv4(ar->addr, my_ip, cand_ip, sizeof(cand_ip));
+                        if (csc > sc) {
+                            sc = csc;
+                            strncpy(resolved_ip, cand_ip, sizeof(resolved_ip) - 1);
+                        }
+                    }
+                    mdns_query_results_free(a_res);
+                } else if (sc > 0 && resolved_ip[0] == '\0') {
+                    snprintf(resolved_ip, sizeof(resolved_ip), IPSTR, IP2STR(&addr4));
+                }
+            }
+            if (host_cache_cnt < 28) {
+                strncpy(host_cache[host_cache_cnt].host, pe.hostname, sizeof(host_cache[0].host) - 1);
+                strncpy(host_cache[host_cache_cnt].ip, resolved_ip, sizeof(host_cache[0].ip) - 1);
+                host_cache[host_cache_cnt].attempted = true;
+                host_cache_cnt++;
+            }
+        }
+        if (resolved_ip[0] == '\0') continue;
+
+        if (!pe.has_txt && pe.instance[0] != '\0') {
+            mdns_result_t *txt_res = NULL;
+            if (mdns_query_txt(pe.instance, pe.service_type, "_tcp", 240, &txt_res) == ESP_OK && txt_res != NULL) {
+                parse_airplay_txt_items(txt_res->txt, txt_res->txt_count,
+                                        pe.et, sizeof(pe.et), pe.cn, sizeof(pe.cn),
+                                        pe.md, sizeof(pe.md), pe.am, sizeof(pe.am),
+                                        &pe.req_pin_pw, &pe.sf_flags, &pe.has_sf_flags);
+                pe.txt_count = txt_res->txt_count;
+                pe.has_txt = (txt_res->txt_count > 0);
+                mdns_query_results_free(txt_res);
+            }
+        }
+
+        upsert_discovered_speaker(scratch->found, &count,
+                                  resolved_ip, pe.port ? pe.port : 7000,
+                                  pe.hostname, pe.instance, pe.is_raop, pe.txt_count,
+                                  pe.et, pe.cn, pe.md, pe.am,
+                                  pe.req_pin_pw, pe.sf_flags, pe.has_sf_flags, now_ms);
+    }
+
+    if (mdns_task && orig_mdns_prio < 5) {
+        vTaskPrioritySet(mdns_task, orig_mdns_prio);
+    }
+
+    // Sort discovered AirPlay speakers alphabetically A -> Z (case-insensitive)
+    for (int i = 1; i < count; i++) {
+        AirPlaySpeaker key = scratch->found[i];
+        int j = i - 1;
+        while (j >= 0 && compare_speaker_names_alpha(scratch->found[j].name, key.name) > 0) {
+            scratch->found[j + 1] = scratch->found[j];
+            j--;
+        }
+        scratch->found[j + 1] = key;
+    }
 
     bool need_save_resolved_spk = false;
     if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         // Always append Local 3.5mm Audio Jack as the final option
-        AirPlaySpeaker &local_sp = found[count++];
+        AirPlaySpeaker &local_sp = scratch->found[count++];
         memset(&local_sp, 0, sizeof(local_sp));
         strncpy(local_sp.name, "Local 3.5mm Jack", sizeof(local_sp.name) - 1);
         local_sp.is_local_dac = true;
@@ -722,50 +1276,31 @@ static void discover_airplay_speakers(bool manual_scan) {
             prev_was_local_dac = g_app.speakers[g_app.current_speaker].is_local_dac;
         }
 
-        memcpy(g_app.speakers, found, sizeof(AirPlaySpeaker) * count);
+        char prev_preview_name[48] = {0};
+        char prev_preview_ip[20] = {0};
+        bool prev_preview_local = false;
+        bool had_preview = (g_app.preview_speaker >= 0 && g_app.preview_speaker < g_app.speaker_count);
+        if (had_preview) {
+            strncpy(prev_preview_name, g_app.speakers[g_app.preview_speaker].name, sizeof(prev_preview_name) - 1);
+            strncpy(prev_preview_ip, g_app.speakers[g_app.preview_speaker].ip, sizeof(prev_preview_ip) - 1);
+            prev_preview_local = g_app.speakers[g_app.preview_speaker].is_local_dac;
+        }
+
+        memcpy(g_app.speakers, scratch->found, sizeof(AirPlaySpeaker) * count);
         g_app.speaker_count = count;
+        g_app.speaker_list_seq++;
 
         int new_sel = -1;
-        // 1. Preserve current active AirPlay speaker by exact IP first, then exact name
+        // 1. Preserve current active speaker across alphabetical re-sorts
         if (s_initial_speaker_autoselected && (!prev_was_local_dac || s_user_selected_local_dac)) {
-            if (!prev_was_local_dac && prev_selected_ip[0] != '\0') {
-                for (int i = 0; i < count; i++) {
-                    if (!g_app.speakers[i].is_local_dac && strcmp(g_app.speakers[i].ip, prev_selected_ip) == 0) {
-                        new_sel = i;
-                        break;
-                    }
-                }
-            }
-            if (new_sel < 0 && prev_selected_name[0] != '\0') {
-                for (int i = 0; i < count; i++) {
-                    if (strcasecmp(g_app.speakers[i].name, prev_selected_name) == 0) {
-                        new_sel = i;
-                        break;
-                    }
-                }
-            }
+            new_sel = find_matching_speaker_idx(g_app.speakers, count, prev_was_local_dac, prev_selected_ip, prev_selected_name);
         }
         // 2. Match saved speaker from NVS (exact IP -> exact name -> substring fallback)
         if (new_sel < 0 && !s_user_selected_local_dac) {
-            if (s_saved_speaker_ip[0] != '\0') {
-                for (int i = 0; i < count; i++) {
-                    if (!g_app.speakers[i].is_local_dac && strcmp(g_app.speakers[i].ip, s_saved_speaker_ip) == 0) {
-                        new_sel = i;
-                        s_initial_speaker_autoselected = true;
-                        break;
-                    }
-                }
-            }
-            if (new_sel < 0 && s_saved_speaker_name[0] != '\0') {
-                for (int i = 0; i < count; i++) {
-                    if (strcasecmp(g_app.speakers[i].name, s_saved_speaker_name) == 0) {
-                        new_sel = i;
-                        s_initial_speaker_autoselected = true;
-                        break;
-                    }
-                }
-            }
-            if (new_sel < 0 && s_saved_speaker_name[0] != '\0') {
+            new_sel = find_matching_speaker_idx(g_app.speakers, count, false, s_saved_speaker_ip, s_saved_speaker_name);
+            if (new_sel >= 0) {
+                s_initial_speaker_autoselected = true;
+            } else if (s_saved_speaker_name[0] != '\0') {
                 for (int i = 0; i < count; i++) {
                     if (!g_app.speakers[i].is_local_dac &&
                         strcasestr(g_app.speakers[i].name, s_saved_speaker_name) != NULL) {
@@ -782,9 +1317,13 @@ static void discover_airplay_speakers(bool manual_scan) {
         }
 
         g_app.current_speaker = new_sel;
-        if (g_app.preview_timestamp_ms == 0) {
+        if (g_app.preview_timestamp_ms != 0 && had_preview) {
+            int mapped_prev = find_matching_speaker_idx(g_app.speakers, count, prev_preview_local, prev_preview_ip, prev_preview_name);
+            g_app.preview_speaker = (mapped_prev >= 0) ? mapped_prev : new_sel;
+        } else {
             g_app.preview_speaker = new_sel;
         }
+
         if (new_sel >= 0 && new_sel < count && !g_app.speakers[new_sel].is_local_dac &&
             g_app.speakers[new_sel].ip[0] != '\0') {
             if (strcmp(s_saved_speaker_ip, g_app.speakers[new_sel].ip) != 0) {
@@ -795,10 +1334,11 @@ static void discover_airplay_speakers(bool manual_scan) {
         g_app.speaker_scanning = false;
         xSemaphoreGive(g_app.mutex);
     }
+    Serial.printf("[MDNS] Speaker discovery complete: %d AirPlay speakers (+ Local 3.5mm Jack)\n", count > 0 ? count - 1 : 0);
     if (need_save_resolved_spk) {
         app_state_save_playback();
     }
-    heap_caps_free(found);
+    heap_caps_free(scratch);
 }
 
 static void update_wifi_negotiated_link_info(void) {
@@ -862,25 +1402,54 @@ static void update_wifi_negotiated_link_info(void) {
     }
 
     if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        IPAddress ip = WiFi.localIP();
+        snprintf(g_app.wifi_ip, sizeof(g_app.wifi_ip), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
         g_app.wifi_rssi = rssi;
         g_app.wifi_channel = chan;
         g_app.wifi_speed_mbps = speed_mbps;
         strncpy(g_app.wifi_phy_mode, phy_str, sizeof(g_app.wifi_phy_mode) - 1);
+        g_app.wifi_phy_mode[sizeof(g_app.wifi_phy_mode) - 1] = '\0';
+        if (got_ap) {
+            snprintf(g_app.wifi_bssid, sizeof(g_app.wifi_bssid), "%02X:%02X:%02X:%02X:%02X:%02X",
+                     ap_info.bssid[0], ap_info.bssid[1], ap_info.bssid[2],
+                     ap_info.bssid[3], ap_info.bssid[4], ap_info.bssid[5]);
+        }
         xSemaphoreGive(g_app.mutex);
     }
 }
 
-static void connect_best_wifi_ap(const char *ssid, const char *pass) {
-    if (!ssid || ssid[0] == '\0') return;
-    Serial.printf("[WIFI] Scanning for best BSSID on SSID '%s'...\n", ssid);
+static bool connect_best_wifi_ap(const char *ssid, const char *pass,
+                                 const uint8_t *avoid_bssid = NULL, bool require_alternate = false) {
+    if (!ssid || ssid[0] == '\0') return false;
+    Serial.printf("[WIFI] Scanning for best BSSID on SSID '%s'%s...\n",
+                  ssid, require_alternate ? " (failover scan)" : "");
+
+    WifiBssidPenalty penalties[8] = {};
+    uint8_t pref_bssid[6] = {0};
+    char pref_ssid[36] = {0};
+    bool has_pref = false;
+    if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        memcpy(penalties, s_bssid_penalties, sizeof(penalties));
+        has_pref = s_has_preferred_bssid;
+        memcpy(pref_bssid, s_preferred_bssid, 6);
+        strncpy(pref_ssid, s_preferred_bssid_ssid, sizeof(pref_ssid) - 1);
+        xSemaphoreGive(g_app.mutex);
+    }
+
     WiFi.scanDelete();
 
     // Full all-channel scan (250ms/ch) so we see all candidate APs and avoid overlapping non-standard channels (like Ch 2 / Ch 10)
     int n = WiFi.scanNetworks(false, false, false, 250);
+    uint32_t now_ms = millis();
     int best_idx = -1;
     int best_score = -1000;
     for (int i = 0; i < n; i++) {
         if (strcasecmp(WiFi.SSID(i).c_str(), ssid) != 0) continue;
+        const uint8_t *cand_bssid = WiFi.BSSID(i);
+        if (!cand_bssid) continue;
+        if (require_alternate && avoid_bssid && memcmp(cand_bssid, avoid_bssid, 6) == 0) {
+            continue;
+        }
         int32_t rssi_i = WiFi.RSSI(i);
         int32_t ch_i = WiFi.channel(i);
         int score = (int)rssi_i;
@@ -900,12 +1469,38 @@ static void connect_best_wifi_ap(const char *ssid, const char *pass) {
                 score -= 2;
             }
         }
-        Serial.printf("[WIFI]   Candidate AP [%d]: BSSID=%s Ch=%ld RSSI=%ld dBm Score=%d\n",
-                      i, WiFi.BSSIDstr(i).c_str(), (long)ch_i, (long)rssi_i, score);
-        if (rssi_i >= -75 && score > best_score) {
+        int pen = 0;
+        for (int p = 0; p < 8; p++) {
+            if (penalties[p].strikes > 0 &&
+                (now_ms - penalties[p].last_stall_ms) < 1800000U &&
+                memcmp(penalties[p].bssid, cand_bssid, 6) == 0) {
+                pen = (int)penalties[p].strikes * 28;
+                break;
+            }
+        }
+        if (avoid_bssid && memcmp(cand_bssid, avoid_bssid, 6) == 0 && pen < 28) {
+            pen = 28;
+        }
+        score -= pen;
+
+        bool is_pref = has_pref && (pen == 0) && (rssi_i >= -76) &&
+                       (strcasecmp(pref_ssid, ssid) == 0) &&
+                       (memcmp(pref_bssid, cand_bssid, 6) == 0);
+        if (is_pref) {
+            score += 14;
+        }
+
+        Serial.printf("[WIFI]   Candidate AP [%d]: BSSID=%s Ch=%ld RSSI=%ld dBm Pen=%d Pref=%d Score=%d\n",
+                      i, WiFi.BSSIDstr(i).c_str(), (long)ch_i, (long)rssi_i, pen, (int)is_pref, score);
+        if (rssi_i >= -78 && score > best_score) {
             best_score = score;
             best_idx = i;
         }
+    }
+    if (require_alternate && best_idx < 0) {
+        WiFi.scanDelete();
+        Serial.printf("[WIFI] No alternate BSSID >= -78 dBm found for '%s'; keeping existing link.\n", ssid);
+        return false;
     }
     if (best_idx >= 0) {
         uint8_t target_bssid[6];
@@ -924,6 +1519,7 @@ static void connect_best_wifi_ap(const char *ssid, const char *pass) {
         vTaskDelay(pdMS_TO_TICKS(50));
         WiFi.begin(ssid, pass);
     }
+    return true;
 }
 
 static void network_manager_task(void *arg) {
@@ -933,6 +1529,9 @@ static void network_manager_task(void *arg) {
     WiFi.persistent(false);
     WiFi.setAutoReconnect(true);
     WiFi.mode(WIFI_STA);
+    // Enable 802.11b/g/n (HT20 A-MPDU TX aggregation) so 125.3 pkt/s AirPlay 2 RTP streams
+    // aggregate cleanly across Knob -> AP -> HomePod without CSMA/CA TX queue starvation.
+    esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
     WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
     WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
     WiFi.setSleep(false); // Disable Wi-Fi power save for low-jitter audio & AirPlay streaming
@@ -994,12 +1593,15 @@ static void network_manager_task(void *arg) {
     uint32_t last_wifi_attempt_ms = millis();
 
     uint32_t last_mdns_scan_ms = 0;
+    uint32_t last_link_info_ms = 0;
+    bool post_connect_followup_done = false;
 
     for (;;) {
         wl_status_t st = WiFi.status();
         bool connected = (st == WL_CONNECTED);
 
         bool do_reconnect = false;
+        bool do_bssid_failover = false;
         bool do_wifi_scan = false;
         bool do_spk_scan = false;
         bool just_connected = false;
@@ -1010,18 +1612,24 @@ static void network_manager_task(void *arg) {
             bool was_connected = g_app.wifi_connected;
             g_app.wifi_connected = connected;
             if (connected) {
-                IPAddress ip = WiFi.localIP();
-                snprintf(g_app.wifi_ip, sizeof(g_app.wifi_ip), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
-                g_app.wifi_rssi = WiFi.RSSI();
                 if (!was_connected) {
+                    IPAddress ip = WiFi.localIP();
+                    snprintf(g_app.wifi_ip, sizeof(g_app.wifi_ip), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
                     g_app.wifi_connected_since_ms = millis();
                     just_connected = true;
                 }
             } else {
                 g_app.wifi_connected_since_ms = 0;
+                g_app.wifi_bssid[0] = '\0';
             }
             do_reconnect = g_app.wifi_reconnect_requested;
             g_app.wifi_reconnect_requested = false;
+            if (s_wifi_bssid_failover_requested) {
+                s_wifi_bssid_failover_requested = false;
+                if (connected && !g_app.ota_in_progress && !g_app.wifi_modal_open && !g_app.pin_prompt_active) {
+                    do_bssid_failover = true;
+                }
+            }
 
             do_wifi_scan = g_app.wifi_scan_requested;
             g_app.wifi_scan_requested = false;
@@ -1037,7 +1645,12 @@ static void network_manager_task(void *arg) {
                             !g_app.speakers[g_app.current_speaker].ip[0];
             bool native_only = g_app.prefer_sonos_native && g_app.sonos_native &&
                                !g_app.also_local_dac && !g_app.whitecap_active;
-            bool defer = connected && discovery_must_wait(g_app.playing, native_only, needs_ip,
+            bool local_dac_cushioned = g_app.current_speaker >= 0 && g_app.current_speaker < g_app.speaker_count &&
+                                       g_app.speakers[g_app.current_speaker].is_local_dac &&
+                                       !g_app.raop_connected &&
+                                       g_app.status != STREAM_CONNECTING_AIRPLAY &&
+                                       g_app.pcm_buf_ms >= 1800;
+            bool defer = connected && discovery_must_wait(g_app.playing, native_only || local_dac_cushioned, needs_ip,
                                              last_mdns_scan_ms == 0, g_app.raop_connected,
                                              g_app.status == STREAM_CONNECTING_AIRPLAY);
             defer_discovery = defer;
@@ -1064,6 +1677,7 @@ static void network_manager_task(void *arg) {
                 fb_idx = 0;
                 g_app.wifi_connect_start_ms = millis();
                 g_app.wifi_connected_since_ms = 0;
+                last_mdns_scan_ms = 0;
             }
             xSemaphoreGive(g_app.mutex);
         } else {
@@ -1072,17 +1686,27 @@ static void network_manager_task(void *arg) {
         }
 
         if (connected) {
-            last_wifi_attempt_ms = millis();
-            update_wifi_negotiated_link_info();
+            uint32_t now_link_ms = millis();
+            last_wifi_attempt_ms = now_link_ms;
+            if (just_connected || last_link_info_ms == 0 || (uint32_t)(now_link_ms - last_link_info_ms) >= 3000U) {
+                update_wifi_negotiated_link_info();
+                last_link_info_ms = now_link_ms;
+            }
             if (just_connected) {
                 esp_wifi_set_ps(WIFI_PS_NONE);
+                esp_wifi_set_max_tx_power(72); // 18.0 dBm balances strong ACK SNR with clean EVM inside aluminum bezel
                 if (fb_idx == 0) {
                     s_save_wifi_dirty = true;
                 }
-                last_mdns_scan_ms = 0;
-                Serial.printf("[WIFI] Link up: %s (%d Mbps, %s, Ch %u, RSSI %ld dBm, IP %s)\n",
+                // Only force an immediate multicast mDNS scan if we have not yet populated LAN speakers;
+                // avoids blasting a 2.5s multicast storm during a brief mid-playback Wi-Fi reassociation.
+                if (g_app.speaker_count <= 2) {
+                    last_mdns_scan_ms = 0;
+                    post_connect_followup_done = false;
+                }
+                Serial.printf("[WIFI] Link up: %s (%d Mbps, %s, Ch %u, BSSID %s, RSSI %ld dBm, IP %s)\n",
                               ssid, g_app.wifi_speed_mbps, g_app.wifi_phy_mode,
-                              g_app.wifi_channel, (long)g_app.wifi_rssi, g_app.wifi_ip);
+                              g_app.wifi_channel, g_app.wifi_bssid, (long)g_app.wifi_rssi, g_app.wifi_ip);
             }
         }
 
@@ -1146,6 +1770,17 @@ static void network_manager_task(void *arg) {
         }
 
         uint32_t wait_elapsed = millis() - last_wifi_attempt_ms;
+        if (do_bssid_failover && !do_reconnect && connected && ssid[0] != '\0' &&
+            (s_last_bssid_failover_ms == 0 || (uint32_t)(millis() - s_last_bssid_failover_ms) >= 25000U)) {
+            uint8_t cur_bssid[6] = {0};
+            const uint8_t *bp = WiFi.BSSID();
+            if (bp) memcpy(cur_bssid, bp, 6);
+            s_last_bssid_failover_ms = millis();
+            if (connect_best_wifi_ap(ssid, pass, bp ? cur_bssid : NULL, true)) {
+                last_wifi_attempt_ms = millis();
+                connected = false;
+            }
+        }
         if (do_reconnect) {
             Serial.printf("[WIFI] Reconnecting to %s...\n", ssid);
             WiFi.setAutoReconnect(true);
@@ -1178,6 +1813,7 @@ static void network_manager_task(void *arg) {
                 mdns_instance_name_set("AirPlayKnob Radio Streamer");
                 mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
                 mdns_service_add(NULL, "_arduino", "_tcp", 3232, NULL, 0);
+                vTaskDelay(pdMS_TO_TICKS(150)); // Let IGMP multicast membership settle before first PTR query
             }
             ArduinoOTA.setHostname("airplayknob");
             ArduinoOTA.setMdnsEnabled(false); // Prevent ArduinoOTA from re-initializing ESP-IDF mdns
@@ -1216,9 +1852,8 @@ static void network_manager_task(void *arg) {
         }
 
         // Run initial mDNS speaker scan immediately upon Wi-Fi connect (before HTTP stream starts),
-        // and thereafter ONLY scan when safe, paused, or if
-        // the selected speaker still needs its IP resolved. Never blast 48-device multicast mDNS
-        // queries while streaming audio on the Now Playing screen!
+        // one quiet follow-up scan ~12s later (when safe / non-AirPlay) to catch sleepy battery speakers,
+        // and thereafter ONLY scan when safe, paused, or if the selected speaker still needs its IP resolved.
         uint32_t scan_interval_ms = 30000;
         bool active_spk_needs_ip =
             (g_app.current_speaker >= 0 && g_app.current_speaker < g_app.speaker_count &&
@@ -1226,13 +1861,25 @@ static void network_manager_task(void *arg) {
              g_app.speakers[g_app.current_speaker].ip[0] == '\0');
         bool discovery_needed = active_spk_needs_ip || !g_app.playing;
         bool initial_scan_due = (last_mdns_scan_ms == 0);
+        bool followup_window_reached = !post_connect_followup_done && (last_mdns_scan_ms > 0) &&
+                                       (g_app.wifi_connected_since_ms > 0) &&
+                                       (millis() - g_app.wifi_connected_since_ms >= 12000U);
+        if (followup_window_reached && g_app.speaker_count > 2) {
+            post_connect_followup_done = true;
+        }
+        bool followup_scan_due = followup_window_reached && !post_connect_followup_done &&
+                                 (g_app.speaker_count <= 2) &&
+                                 (g_app.status != STREAM_CONNECTING_AIRPLAY);
         bool periodic_scan_due = (last_mdns_scan_ms > 0) &&
                                  (millis() - last_mdns_scan_ms >= scan_interval_ms) &&
                                  discovery_needed &&
                                  (g_app.status != STREAM_CONNECTING_AIRPLAY);
         if (connected && !defer_discovery && !g_app.ota_in_progress && !g_app.pin_prompt_active &&
-            (do_spk_scan || initial_scan_due || periodic_scan_due)) {
-            discover_airplay_speakers(do_spk_scan);
+            (do_spk_scan || initial_scan_due || followup_scan_due || periodic_scan_due)) {
+            if (followup_scan_due || do_spk_scan) {
+                post_connect_followup_done = true;
+            }
+            discover_airplay_speakers(do_spk_scan || followup_scan_due);
             last_mdns_scan_ms = millis();
         }
 
@@ -1240,18 +1887,26 @@ static void network_manager_task(void *arg) {
     }
 }
 
+static int s_wifi_custom_init_err = -1;
+
 extern "C" esp_err_t __real_esp_wifi_init(const wifi_init_config_t *config);
 extern "C" esp_err_t __wrap_esp_wifi_init(const wifi_init_config_t *config) {
     wifi_init_config_t cfg = *config;
-    cfg.static_rx_buf_num = 10;
-    cfg.dynamic_rx_buf_num = 32;
-    cfg.rx_ba_win = 4;            // Must be < static_rx_buf_num so 802.11n AMPDU RX BA reorder never wedges RX DMA
+    cfg.static_rx_buf_num = 16;
+    cfg.dynamic_rx_buf_num = 64;
+    cfg.rx_ba_win = 12;           // < static_rx_buf_num; 12-slot 802.11n AMPDU reorder window prevents BA drops
     cfg.tx_buf_type = 1;          // DYNAMIC_TX_BUFFER (required when CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=1)
     cfg.static_tx_buf_num = 0;
-    // Preserve working memory for the UI and connection recovery under load.
-    cfg.dynamic_tx_buf_num = 16;
-    cfg.cache_tx_buf_num = 8;
-    return __real_esp_wifi_init(&cfg);
+    cfg.dynamic_tx_buf_num = 48;  // On-demand Internal DMA SRAM TX buffers (~90KB free Internal SRAM headroom)
+    cfg.cache_tx_buf_num = 64;    // 64 PSRAM->MAC staging slots (~500ms cushion for PSRAM lwIP pbufs, 0B Internal SRAM)
+    cfg.feature_caps |= CONFIG_FEATURE_CACHE_TX_BUF_BIT;
+    cfg.csi_enable = 0;
+    esp_err_t err = __real_esp_wifi_init(&cfg);
+    s_wifi_custom_init_err = (int)err;
+    if (err != ESP_OK) {
+        return __real_esp_wifi_init(config);
+    }
+    return err;
 }
 
 void setup() {
@@ -1267,6 +1922,7 @@ void setup() {
     Serial.printf("[BOOT] Build=%s reset_reason=%d\n", AIRPLAYKNOB_BUILD_ID, (int)esp_reset_reason());
 
     app_state_init();
+    battery_monitor_init();
 
     Serial.printf("[BOOT] Free Internal Heap: %u bytes, Free PSRAM: %u bytes\n",
                   (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
@@ -1276,10 +1932,16 @@ void setup() {
     WiFi.persistent(false);
     WiFi.setAutoReconnect(true);
     WiFi.mode(WIFI_STA);
+    Serial.printf("[WIFI-INIT] custom_cfg_err=%d free_heap=%u free_psram=%u\n",
+                  s_wifi_custom_init_err, (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
+    // Enable 802.11b/g/n (HT20 A-MPDU TX aggregation) so 125.3 pkt/s AirPlay 2 RTP streams
+    // aggregate cleanly across Knob -> AP -> HomePod without CSMA/CA TX queue starvation.
+    esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
     WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
     WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
     WiFi.setSleep(false);
     esp_wifi_set_ps(WIFI_PS_NONE);
+    esp_wifi_set_max_tx_power(72); // 18.0 dBm ceiling balances strong ACK SNR with clean EVM inside CNC aluminum ring
 
     // Initialize Touch + DRV2605 Haptics + 360x360 QSPI Display (with backlight still OFF)
     Touch_Init();
@@ -1315,12 +1977,16 @@ void setup() {
     radio_streamer_start();
 }
 
+volatile bool g_screenshot_dump_active = false;
+
 static void dump_serial_screenshot(void) {
     const uint16_t *fb = bsp_get_screen_fb();
     if (!fb) {
         Serial.println("[DBG] No screen framebuffer");
         return;
     }
+    g_screenshot_dump_active = true;
+    delay(5);
     static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     // Stream 180x180 downsampled RGB565 (big-endian) in base64 over USB-Serial/JTAG
     Serial.println("\n===SCREENSHOT_BEGIN 180 180===");
@@ -1345,6 +2011,7 @@ static void dump_serial_screenshot(void) {
         Serial.println(b64_line);
     }
     Serial.println("===SCREENSHOT_END===");
+    g_screenshot_dump_active = false;
 }
 
 static void poll_serial_debug(void) {
@@ -1400,6 +2067,51 @@ static void poll_serial_debug(void) {
                         xSemaphoreGive(g_app.mutex);
                     }
                     Serial.println("[DBG] Requested speaker scan");
+                } else if (strcasecmp(s_cmd, "BATTERY") == 0 || strcasecmp(s_cmd, "BATT") == 0) {
+                    BatteryTelemetry bt = battery_monitor_snapshot();
+                    Serial.printf("[BATT] state=%s (%s) pct=%d%% mv=%d raw_mv=%d raw_adc=%d slope=%d mV/min present=%d usb=%d usb_host=%d chg=%d full=%d low=%d crit=%d\n",
+                                  battery_state_slug(bt.state), battery_state_label(bt.state),
+                                  bt.percent, bt.voltage_mv, bt.raw_mv, bt.raw_adc, bt.slope_mv_per_min,
+                                  (int)bt.battery_present, (int)bt.usb_present, (int)bt.usb_host,
+                                  (int)bt.charging, (int)bt.charged, (int)bt.low_battery, (int)bt.critical_battery);
+                } else if (strncasecmp(s_cmd, "TXPWR ", 6) == 0) {
+                    int pwr = atoi(s_cmd + 6);
+                    if (pwr < 8) pwr = 8;
+                    if (pwr > 84) pwr = 84;
+                    esp_err_t e = esp_wifi_set_max_tx_power((int8_t)pwr);
+                    int8_t actual = 0;
+                    esp_wifi_get_max_tx_power(&actual);
+                    Serial.printf("[DBG] Set TX power=%d -> actual=%d (%.2f dBm) err=%d\n",
+                                  pwr, (int)actual, (float)actual * 0.25f, (int)e);
+                } else if (strncasecmp(s_cmd, "PROTO ", 6) == 0) {
+                    const char *arg = s_cmd + 6;
+                    uint8_t mask = (strcasecmp(arg, "bg") == 0)
+                                       ? (WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G)
+                                       : (WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+                    esp_err_t e = esp_wifi_set_protocol(WIFI_IF_STA, mask);
+                    Serial.printf("[DBG] Set Wi-Fi protocol mask=0x%02x err=%d\n", (unsigned)mask, (int)e);
+                } else if (strncasecmp(s_cmd, "BSSID ", 6) == 0) {
+                    unsigned int b[6] = {0};
+                    int ch = 0;
+                    int parsed = sscanf(s_cmd + 6, "%x:%x:%x:%x:%x:%x %d",
+                                        &b[0], &b[1], &b[2], &b[3], &b[4], &b[5], &ch);
+                    if (parsed >= 6) {
+                        uint8_t target_bssid[6] = {
+                            (uint8_t)b[0], (uint8_t)b[1], (uint8_t)b[2],
+                            (uint8_t)b[3], (uint8_t)b[4], (uint8_t)b[5]
+                        };
+                        char cur_ssid[36] = {0}, cur_pass[64] = {0};
+                        if (xSemaphoreTake(g_app.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                            strncpy(cur_ssid, g_app.wifi_ssid, sizeof(cur_ssid) - 1);
+                            strncpy(cur_pass, g_app.wifi_pass, sizeof(cur_pass) - 1);
+                            xSemaphoreGive(g_app.mutex);
+                        }
+                        Serial.printf("[DBG] Reconnecting '%s' pinned to BSSID %02X:%02X:%02X:%02X:%02X:%02X ch=%d\n",
+                                      cur_ssid, b[0], b[1], b[2], b[3], b[4], b[5], ch);
+                        WiFi.disconnect(false);
+                        delay(60);
+                        WiFi.begin(cur_ssid, cur_pass, ch, target_bssid, true);
+                    }
                 } else if (strcasecmp(s_cmd, "REBOOT") == 0) {
                     app_state_flush_prefs();
                     Serial.println("[DBG] Rebooting...");
@@ -1419,8 +2131,17 @@ static void poll_serial_debug(void) {
                                   (unsigned)g_app.raop_retransmits,
                                   g_app.status_text,
                                   (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
-                    Serial.printf("[DBG] Build=%s Uptime=%lu Reset=%d Sonos=%d\n", AIRPLAYKNOB_BUILD_ID,
-                                  (unsigned long)millis(), (int)esp_reset_reason(), (int)g_app.sonos_native);
+                    BatteryTelemetry bt = battery_monitor_snapshot();
+                    NetworkTxSnapshot tx = network_tx_snapshot();
+                    int8_t tx_qdbm = 0;
+                    esp_wifi_get_max_tx_power(&tx_qdbm);
+                    Serial.printf("[DBG] Build=%s Uptime=%lu Reset=%d Sonos=%d Batt=%d%% (%dmV, %s, usb_host=%d) TxPwr=%.1fdBm TxSub=%lu TxAcc=%lu TxRej=%lu TxErr=%ld\n",
+                                  AIRPLAYKNOB_BUILD_ID, (unsigned long)millis(), (int)esp_reset_reason(),
+                                  (int)g_app.sonos_native, bt.percent, bt.voltage_mv,
+                                  battery_state_slug(bt.state), (int)bt.usb_host,
+                                  (float)tx_qdbm * 0.25f,
+                                  (unsigned long)tx.submitted, (unsigned long)tx.accepted,
+                                  (unsigned long)tx.rejected, (long)tx.last_error);
                     if (bsp_lvgl_lock(5)) {
                         lv_mem_monitor_t mem = {};
                         lv_mem_monitor(&mem);
@@ -1458,6 +2179,7 @@ void loop() {
     }
 
     poll_serial_debug();
+    battery_monitor_poll();
     app_state_flush_prefs();
     knob_ui_tick();
     web_portal_poll();

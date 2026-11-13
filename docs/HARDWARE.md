@@ -21,13 +21,14 @@ AirPlayKnob is built for the **[Waveshare ESP32-S3-Knob-Touch-LCD-1.8](https://w
 | | | `TP_RST` | `GPIO 10` | Active-low touch reset |
 | | | `TP_INT` | `GPIO 9` | Touch interrupt |
 | **Haptic Motor Driver** | DRV2605 (`0x5A`) | `I2C_SDA` | `GPIO 11` | Shared `I2C_NUM_0` with CST816S |
-| | | `I2C_SCL` | `GPIO 12` | ERM Library B waveform effects |
+| | | `I2C_SCL` | `GPIO 12` | ERM ROM Library 1 waveform effects |
 | **Rotary Encoder Ring** | SSCM110100 | `KNOB_ECA` | `GPIO 8` | Quadrature Channel A (Internal pull-up) |
 | | | `KNOB_ECB` | `GPIO 7` | Quadrature Channel B (Internal pull-up) |
 | **Stereo Audio DAC** | PCM5100A + CH445P | `I2S_BCLK` | `GPIO 39` | I2S Bit Clock (44.1 kHz stereo) |
 | | | `I2S_WS` | `GPIO 40` | I2S Word Select (LRCLK) |
 | | | `I2S_DOUT` | `GPIO 41` | I2S Serial Data Out |
 | | | `PA_MUX_SEL` | `GPIO 0` | Set `HIGH` to route PCM5100A to 3.5mm jack |
+| **Battery / Power Rail** | `ADC1_CHANNEL_0` (`R62`/`R63`) | `BATT_ADC` | `GPIO 1` | `10K` / `10K` (`2:1`) divider + `USB_SERIAL_JTAG` SOF |
 
 ---
 
@@ -47,10 +48,10 @@ So the USB-C power/programming cable exits cleanly from the **top (12 o'clock)**
 
 ## 3. DRV2605 Tactile Haptic Effects
 
-The onboard `DRV2605` haptic controller (`0x5A` on `I2C_NUM_0`) is initialized at boot (`src/bsp/cst816.cpp`) and triggered via `haptic_play_effect()` to give physical feedback for every interaction:
-- **`HAPTIC_SHARP_CLICK` (Effect `1`)**: Crisp mechanical click when stepping volume or toggling Play/Pause.
-- **`HAPTIC_LIGHT_TICK` (Effect `17`)**: Subtle detent tick when scrolling through the 30 SomaFM stations or AirPlay speakers.
-- **`HAPTIC_DOUBLE_CLICK` (Effect `10`)**: Confirmation pulse when locking in a new station, switching AirPlay speakers, or entering the WhiteCap 3D visualizer.
+The onboard `DRV2605` haptic controller (`0x5A` on `I2C_NUM_0`) is initialized at boot (`src/bsp/cst816.cpp`) using ERM ROM Library 1 (`src/bsp/lcd_config.h`) and triggered via `haptic_play_effect()` to give physical feedback for every interaction:
+- **`HAPTIC_STRONG_CLICK` (Effect `1`) / `HAPTIC_SHARP_CLICK` (Effect `4`)**: Crisp mechanical click when stepping volume, toggling Play/Pause, or plugging into USB power.
+- **`HAPTIC_LIGHT_TICK` (Effect `6`) / `HAPTIC_SOFT_BUMP` (Effect `7`)**: Subtle detent tick when scrolling through the 30 SomaFM stations or AirPlay speakers, or unplugging from USB power.
+- **`HAPTIC_DOUBLE_CLICK` (Effect `10`) / `HAPTIC_TRIPLE_CLICK` (Effect `12`)**: Confirmation pulse when locking in a station/speaker or entering WhiteCap (`10`), and low/critical battery alerts (`10` at `15%`, `12` at `5%`).
 
 ---
 
@@ -59,3 +60,11 @@ The onboard `DRV2605` haptic controller (`0x5A` on `I2C_NUM_0`) is initialized a
 In addition to streaming over Wi-Fi to AirPlay speakers, the board includes a **TI PCM5100A** 32-bit I2S stereo DAC connected to the 3.5mm TRS audio jack through a **CH445P** analog multiplexer (`src/bsp/local_dac.c`):
 - Driving `GPIO 0` `HIGH` switches the `CH445P` analog mux to connect the `PCM5100A` outputs to the 3.5mm jack.
 - Can be used simultaneously alongside AirPlay streaming (via the *"Also output audio to onboard 3.5mm stereo jack"* toggle in the Web UI) or selected as the primary output (`Local 3.5mm Jack` in the Speakers wheel).
+
+---
+
+## 5. Battery & Charge Telemetry (`GPIO 1` / `ADC1_CHANNEL_0`)
+
+Units equipped with the rear 3.7V LiPo battery connect the main battery/power rail (`CN1` Pin 1) to **`GPIO 1` (`ADC1_CHANNEL_0`)** through precision `R62 = 10K` / `R63 = 10K` (`2:1`) voltage-divider resistors (`src/bsp/battery_monitor.cpp`, `include/battery_monitor.h`):
+- **Calibrated ADC Sampling**: Uses ESP-IDF `adc_oneshot` (`ADC_ATTEN_DB_12`, 12-bit) with eFuse curve-fitting calibration (`adc_cali_create_scheme_curve_fitting`) and trimmed-mean bursts (`12` samples at boot, `6` samples every `1000 ms` at runtime to minimize `SARADC` airtime during Wi-Fi streaming).
+- **Charge & Unplug Detection**: Because the 10-pin `CN1` sub-board connector has no dedicated charger-status pin, firmware combines non-blocking `USB_SERIAL_JTAG` 1 kHz Start-of-Frame (`sof_frame_index`) host tracking with sliding 4-second step and 60-second slope detection (for dumb USB wall bricks), CC/CV charge-lift compensation, and constant-voltage (`>= 4.175V` flat or VBUS load-release step) full-charge termination. On the Home player screen (`Tab 0`), the battery indicator is hidden unless actively charging or strictly below `20%` (and hides once fully charged), while Settings (`Tab 3`) and the Web Portal show full telemetry continuously.

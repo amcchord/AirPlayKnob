@@ -15,11 +15,11 @@
 #define EXAMPLE_PIN_NUM_LCD_RST        21
 #define EXAMPLE_PIN_NUM_BK_LIGHT       47
 
-#define EXAMPLE_LVGL_BUF_HEIGHT        24
+#define EXAMPLE_LVGL_BUF_HEIGHT        16
 #define EXAMPLE_LVGL_TICK_PERIOD_MS    2
 #define EXAMPLE_LVGL_TASK_MAX_DELAY_MS 1
 #define EXAMPLE_LVGL_TASK_MIN_DELAY_MS 1
-#define EXAMPLE_LVGL_TASK_STACK_SIZE   (8 * 1024)
+#define EXAMPLE_LVGL_TASK_STACK_SIZE   (6 * 1024)
 #define EXAMPLE_LVGL_TASK_PRIORITY     5
 
 #define EXAMPLE_TOUCH_ADDR             0x15
@@ -38,6 +38,9 @@
 #define EXAMPLE_I2S_BCLK_PIN           39
 #define EXAMPLE_I2S_WS_PIN             40
 #define EXAMPLE_I2S_DOUT_PIN           41
+
+// Battery / System Rail Voltage Divider (R62=10K / R63=10K -> GPIO1 / ADC1_CH0)
+#define EXAMPLE_PIN_NUM_BATT_ADC       1
 
 // Haptic waveform presets (DRV2605 ROM Library 1)
 #define HAPTIC_STRONG_CLICK            1

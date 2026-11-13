@@ -1,6 +1,6 @@
 # Device diagnostics and deployment
 
-Validated on 2026-11-06 with the attached ESP32-S3 knob. Read
+Updated on 2026-11-13 for **AirPlayKnob v1.1.0**. Read
 [the current state](../progress/CURRENT.md) before deploying again.
 
 ## Build and verify
@@ -11,15 +11,18 @@ Validated on 2026-11-06 with the attached ESP32-S3 knob. Read
 /Users/austinmcchord/.platformio/penv/bin/python tests/test_rtsp_responses.py
 /Users/austinmcchord/.platformio/penv/bin/python tests/test_network_policy.py
 /Users/austinmcchord/.platformio/penv/bin/python tests/test_pcm_buffer.py
+/Users/austinmcchord/.platformio/penv/bin/python tests/test_battery_monitor.py
 git diff --check
 ```
 
 The decoder regression check requires FFmpeg and a host C++ compiler.
 The RTSP check runs 16 cases against the actual firmware transaction method.
-GitHub Actions runs protocol, network-policy and PCM-ring checks plus a firmware build without private credentials.
+The battery monitor suite validates LiPo SoC curve interpolation, hysteresis, CC/CV charge-lift compensation, USB host SOF vs. wall-brick slope/step detection, full-charge termination, and Home screen (`Tab 0`) visibility rules.
+GitHub Actions runs all five host regression suites plus a clean firmware build without private credentials on pushes, PRs, and `v*` release tags.
 Build dependencies are pinned in `platformio.ini`.
-`STATUS\n` over the USB serial port at 115200 baud reports the active speaker,
-packet and retransmission counters, PCM cushion, underruns, and available heap.
+`STATUS\n` and `BATTERY\n` over the USB serial port at 115200 baud report the active speaker,
+battery/charge telemetry, packet and retransmission counters, PCM/MP3 cushions, underruns, and available heap.
+Note: opening `/dev/cu.usbmodem*` with default DTR/RTS signaling on ESP32-S3 `USB_SERIAL_JTAG` can trigger a hardware reset; prefer HTTP `GET /api/status` and `POST /api/control` (`{"preset": 0}` or `{"toggle_play": true}`) during uninterrupted streaming soaks.
 The `RAOP-1S` diagnostics distinguish accepted sends, retries, and drops;
 `Pkts` counts attempted original packets, and is not proof of delivery.
 
@@ -255,3 +258,28 @@ requested station/volume, receiver PLAYING/URI/volume/mute and artwork. Allow
 normal volume adjustments during monitoring; compare receiver volume with
 the knob's current request. This recovery passed 13 samples over 66.47 seconds
 with zero new underruns/reset, exact Fluid URI and current volume 8.
+
+---
+
+## Building clean credential-free GitHub Release binaries (`v1.1.0+`)
+
+Because local development checkouts may contain a gitignored `include/secrets.h`
+(automatically picked up via `#if __has_include("secrets.h")` in `include/app_state.h`),
+**never** upload `.pio/build/waveshare_knob_s3/firmware*.bin` built inside a working
+tree that contains `include/secrets.h` to a public GitHub Release.
+
+Always build public release assets from an isolated `git worktree` checked out at
+the target tag/commit:
+
+```sh
+git worktree add scratch/release-build v1.1.0
+test ! -f scratch/release-build/include/secrets.h
+/Users/austinmcchord/.platformio/penv/bin/pio run -d scratch/release-build
+cp scratch/release-build/.pio/build/waveshare_knob_s3/firmware.factory.bin scratch/release-build/AirPlayKnob-v1.1.0-factory.bin
+cp scratch/release-build/.pio/build/waveshare_knob_s3/firmware.bin scratch/release-build/AirPlayKnob-v1.1.0-ota.bin
+(cd scratch/release-build && shasum -a 256 AirPlayKnob-v1.1.0-factory.bin AirPlayKnob-v1.1.0-ota.bin > SHA256SUMS.txt)
+git worktree remove scratch/release-build
+```
+
+- **`AirPlayKnob-<version>-factory.bin`**: Combined bootloader (`0x0`), partition table (`0x8000`), `boot_app0` (`0xe000`), and `app0` (`0x10000`) image for fresh ESP32-S3 boards (`esptool --chip esp32s3 --baud 921600 --no-stub write-flash 0x0 AirPlayKnob-<version>-factory.bin`).
+- **`AirPlayKnob-<version>-ota.bin`**: Application-only image for wireless browser OTA (`POST /api/ota` at `http://airplayknob.local/`) or active-slot USB updates that preserve existing NVS Wi-Fi credentials, station presets, and AirPlay pairings.
